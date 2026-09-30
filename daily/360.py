@@ -15,6 +15,20 @@ import requests
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"\n===== {title} =====\n{content}")
+
+
+def _safe_notify(title, content):
+    """发送通知；任何异常都被隔离，不影响业务结论与退出码。"""
+    try:
+        send(title, content)
+    except Exception as e:
+        print(f"[通知] 发送异常已隔离: {type(e).__name__}: {e}")
+
 SIGN_PAGE = "https://bbs.360.cn/dsu_paulsign-sign.html"
 SIGN_API = "https://bbs.360.cn/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
 
@@ -120,30 +134,44 @@ class BBS360Checkin:
 def main():
     # 青龙面板专用：从环境变量获取Cookie
     cookie = os.getenv("BBS360_COOKIE", "").strip()
-    
+    title = "360社区签到"
+
     if not cookie:
         print("❌ 未设置环境变量 BBS360_COOKIE")
         print("💡 请在青龙面板 → 环境变量 → 添加以下内容：")
         print("   KEY: BBS360_COOKIE")
         print("   VALUE: 从浏览器复制的完整Cookie（包含__cfduid, uid等）")
+        _safe_notify(title, "❌ 配置缺失：未设置环境变量 BBS360_COOKIE")
         return
-    
+
     # 青龙面板特殊处理：检测Cookie是否包含必要字段
     if "__cfduid" not in cookie or "uid" not in cookie:
         print("❌ Cookie无效：缺少必要字段（需包含__cfduid和uid）")
         print("💡 请重新复制Cookie：")
         print("   1. 登录 bbs.360.cn → F12 → Application → Cookies")
         print("   2. 复制 bbs.360.cn 下的所有Cookie字段")
+        _safe_notify(title, "❌ 配置无效：BBS360_COOKIE 缺少 __cfduid/uid 字段")
         return
-    
+
     client = BBS360Checkin(cookie=cookie, timeout=20)
-    result = client.run()
+    try:
+        result = client.run()
+    except Exception as e:
+        # 网络/请求异常穿透 main：纳入失败摘要并通知；随后重新抛出，
+        # 保留原非零退出行为（不吞成成功）。摘要只含异常类型与脱敏简述。
+        brief = str(e).strip().replace("\n", " ")[:200]
+        msg = f"❌ 360签到异常 | {type(e).__name__}: {brief}"
+        print(msg)
+        _safe_notify(title, msg)
+        raise
 
     # 青龙面板专用输出格式
     if result.ok:
         print(f"✅ 360签到成功 | {result.status} | {result.detail}")
+        _safe_notify(title, f"✅ 360签到成功 | {result.status} | {result.detail}")
     else:
         print(f"❌ 360签到失败 | {result.status} | {result.detail}")
+        _safe_notify(title, f"❌ 360签到失败 | {result.status} | {result.detail}")
 
 if __name__ == "__main__":
     main()

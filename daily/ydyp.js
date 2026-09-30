@@ -4061,66 +4061,280 @@ class Ut {
 			return t.length >= 7 ? `${t.slice(0,3)}****${t.slice(7)}` : t
 		}(this.account), this.cookies.sensors_stay_time = String(Date.now())
 	}
-	log(e) {
+		log(e) {
 		this.reporter.line(`[${this.maskedAccount}] ${e}`)
 	}
-	async run() {
+
+	formatStepError(e) {
+		const t = Number(e?.response?.status || e?.status || 0),
+			r = e?.config?.url ||
+				e?.response?.config?.url ||
+				e?.request?.url ||
+				"";
+
+		let o = "";
+
 		try {
-			if (!await this.jwt()) return void this.reporter.invalid.push(this.maskedAccount);
-			await this.signinStatus(), await this.clickTask(), await this.processTaskList("sign_in_3", "cloud_app"), await this.cloudGame(), await this.wxSign(), await this.shake(), await this.surplusNum(), await this.backupCloud(), await this.openSend(), await this.processTaskList("newsign_139mail", "email_app"), await this.receive(), this.config.uploadEnabled && await this.uploadLargeFile(), this.config.shareEnabled && await this.shareFile()
+			const e = new URL(r);
+			o = `${e.origin}${e.pathname}`
 		} catch (e) {
-			this.reporter.errors.push(`${this.maskedAccount}: ${e.message||String(e)}`), this.log(`执行异常: ${function(e){if(e instanceof Error)return`${e.name}: ${e.message}`;try{return JSON.stringify(e)}catch(t){return String(e)}}(e)}`)
+			o = String(r || "").split("?")[0]
+		}
+
+		const n = e?.message || String(e || "未知错误");
+
+		return [
+			t ? `HTTP ${t}` : "",
+			n,
+			o ? `接口 ${o}` : ""
+		].filter(Boolean).join(" | ")
+	}
+
+	// 服务端部分边缘活动接口已下线（统一回 HTTP 404，如云朵大作战 hecheng1T、
+	// 通知奖励 msgPushOn、领取云朵 signin/page/receive）。这些不影响主签到/任务，
+	// 属可预期的“活动下线”，只记录提示、不计入失败错误，避免被当作执行失败通知。
+	isRetiredEndpointError(r) {
+		const s = String(r == null ? "" : r);
+		return /HTTP 404|status code 404|\b404\b/.test(s) &&
+			/caiyun\.feixin\.10086\.cn|hecheng1T|msgPushOn|signin\/page\/receive/.test(s);
+	}
+	async runStep(e, t) {
+		try {
+			return await t(), !0
+		} catch (t) {
+			const r = this.formatStepError(t);
+
+			if (this.isRetiredEndpointError(r)) {
+				return this.log(
+					`${e}活动接口已下线(HTTP 404)，不影响主签到，跳过: ${r}`
+				), !0
+			}
+
+			return this.reporter.errors.push(
+				`${this.maskedAccount} [${e}]: ${r}`
+			), this.log(
+				`${e}异常，继续后续步骤: ${r}`
+			), !1
 		}
 	}
+
+	async run() {
+		// 登录仍是当前账号所有任务的前置条件
+		try {
+			if (!await this.jwt()) {
+				return void this.reporter.invalid.push(
+					this.maskedAccount
+				)
+			}
+		} catch (e) {
+			const t = this.formatStepError(e);
+
+			return this.reporter.errors.push(
+				`${this.maskedAccount} [登录]: ${t}`
+			), this.log(
+				`登录异常，终止当前账号: ${t}`
+			), void this.reporter.invalid.push(
+				this.maskedAccount
+			)
+		}
+
+		// 登录成功后，各业务模块独立执行。
+		// 任一模块失败只记录错误，不阻断后续模块。
+		const e = [
+			["签到", () => this.signinStatus()],
+			["戳一下", () => this.clickTask()],
+			[
+				"云盘任务",
+				() => this.processTaskList(
+					"sign_in_3",
+					"cloud_app"
+				)
+			],
+			["云朵大作战", () => this.cloudGame()],
+			["公众号签到", () => this.wxSign()],
+			["摇一摇", () => this.shake()],
+			["抽奖", () => this.surplusNum()],
+			["备份奖励", () => this.backupCloud()],
+			["通知奖励", () => this.openSend()],
+			[
+				"邮箱任务",
+				() => this.processTaskList(
+					"newsign_139mail",
+					"email_app"
+				)
+			],
+			["领取云朵", () => this.receive()]
+		];
+
+		if (this.config.uploadEnabled) {
+			e.push([
+				"大文件上传",
+				() => this.uploadLargeFile()
+			])
+		}
+
+		if (this.config.shareEnabled) {
+			e.push([
+				"文件分享",
+				() => this.shareFile()
+			])
+		}
+
+		for (const [t, r] of e) {
+			await this.runStep(t, r)
+		}
+	}
+
 	async request(e, t = 3) {
 		return this.requester.request(e, t)
 	}
+
 	async requestJson(e, t = 3) {
 		return this.requester.requestJson(e, t)
 	}
+
 	async requestText(e, t = 3) {
 		return this.requester.requestText(e, t)
 	}
+
 	async ssoForMCloud() {
 		return this.api.ssoForMCloud()
 	}
+
 	async ssoForPortal() {
 		return this.api.ssoForPortal()
 	}
+
 	async jwt() {
-		const e = await this.ssoForMCloud() || await this.ssoForPortal();
-		if (!e) return this.log("获取 ssoToken 失败"), !1;
+		const e =
+			await this.ssoForMCloud() ||
+			await this.ssoForPortal();
+
+		if (!e) {
+			this.log("获取 ssoToken 失败");
+			return !1
+		}
+
 		const t = await this.api.fetchJwt(e);
-		return t && 0 === t.code ? (this.jwtHeaders.jwtToken = t.result.token, this.cookies.jwtToken = t.result.token, this.log("jwtToken 获取成功"), !0) : (this.log(`获取 jwtToken 失败: ${t?.msg||"未知错误"}`), !1)
+
+		return t && 0 === t.code
+			? (
+				this.jwtHeaders.jwtToken = t.result.token,
+				this.cookies.jwtToken = t.result.token,
+				this.log("jwtToken 获取成功"),
+				!0
+			)
+			: (
+				this.log(
+					`获取 jwtToken 失败: ${
+						t?.msg || "未知错误"
+					}`
+				),
+				!1
+			)
 	}
+
 	async signinStatus() {
 		await this.sleep();
+
 		const e = await this.api.getSigninStatus();
+
 		if ("success" !== e?.msg) {
-			this.log(`签到状态查询接口已失效(服务端 404，需重新抓包更新)，跳过状态判断直接尝试签到`);
+			this.log(
+				"签到状态查询接口已失效" +
+				"(服务端 404，需重新抓包更新)，" +
+				"跳过状态判断直接尝试签到"
+			);
+
 			const r = await this.api.doSignin();
-			return void this.log("success" === r?.msg ? "签到完成(未经状态校验)" : `签到失败: ${r?.msg||"未知错误"}`)
+
+			return void this.log(
+				"success" === r?.msg
+					? "签到完成(未经状态校验)"
+					: `签到失败: ${
+						r?.msg || "未知错误"
+					}`
+			)
 		}
-		if (e.result?.todaySignIn) return void this.log("今日已签到");
+
+		if (e.result?.todaySignIn) {
+			return void this.log("今日已签到")
+		}
+
 		const t = await this.api.doSignin();
-		this.log("success" === t?.msg ? "签到成功" : `签到失败: ${t?.msg||"未知错误"}`)
+
+		this.log(
+			"success" === t?.msg
+				? "签到成功"
+				: `签到失败: ${t?.msg || "未知错误"}`
+		)
 	}
+
 	async clickTask() {
 		let e = 0;
-		for (let t = 0; t < this.clickNum; t += 1) try {
-			const t = await this.api.clickTask(319);
-			t?.result && (e += 1), await i(200)
-		} catch (e) {}
-		this.log(e > 0 ? `戳一下成功 ${e} 次` : `戳一下未获得奖励 x ${this.clickNum}`)
+
+		for (let t = 0; t < this.clickNum; t += 1) {
+			try {
+				const t = await this.api.clickTask(319);
+				t?.result && (e += 1);
+				await i(200)
+			} catch (e) {}
+		}
+
+		this.log(
+			e > 0
+				? `戳一下成功 ${e} 次`
+				: `戳一下未获得奖励 x ${this.clickNum}`
+		)
 	}
+
 	async processTaskList(e, t) {
 		const r = await this.api.getTaskList(e);
+
 		await this.sleep();
+
 		const o = r?.result || {};
-		for (const e of Object.keys(o))
-			if (!["new", "hidden", "hiddenabc"].includes(e))
-				for (const r of o[e]) ot(t, e, r.id) || ("FINISH" !== r.state ? (this.log(`去完成任务: ${r.name}`), await this.doTask(r.id, e, t), await i(2e3)) : this.log(`已完成任务: ${r.name}`))
+
+		for (const e of Object.keys(o)) {
+			if (
+				["new", "hidden", "hiddenabc"].includes(e)
+			) {
+				continue
+			}
+
+			for (const r of o[e]) {
+				if (ot(t, e, r.id)) {
+					continue
+				}
+
+				if ("FINISH" === r.state) {
+					this.log(`已完成任务: ${r.name}`);
+					continue
+				}
+
+				this.log(`去完成任务: ${r.name}`);
+
+				try {
+					await this.doTask(r.id, e, t)
+				} catch (e) {
+					const t = this.formatStepError(e);
+
+					this.reporter.errors.push(
+						`${this.maskedAccount} ` +
+						`[任务:${r.name}]: ${t}`
+					);
+
+					this.log(
+						`任务异常，继续下一个: ` +
+						`${r.name} | ${t}`
+					)
+				}
+
+				await i(2e3)
+			}
+		}
 	}
+
 	async doTask(e, t, r) {
 		if (await this.sleep(), await this.api.clickTask(e, {
 				throwHttpErrors: !1
@@ -4276,12 +4490,34 @@ const Vt = c.displayName,
 		runStart: Gt,
 		runFailed: Qt
 	} = l;
+let __ydypSummary = "执行完成", __ydypStatus = "ok";
 !async function() {
 	try {
-		t.log(`\n${Vt} ${Gt}`), await Kt(ct())
+		t.log(`\n${Vt} ${Gt}`);
+		const __r = await Kt(ct());
+		if (__r && __r.summary) __ydypSummary = __r.summary;
 	} catch (e) {
+		__ydypStatus = "failed";
+		__ydypSummary = `${Vt} ${Qt}: ${e?.message||String(e)}`;
 		t.log(`${Vt} ${Qt}: ${e?.message||String(e)}`), t.error(e instanceof Error ? e : new Error(String(e)))
 	} finally {
+		// 【通知治理】Node 平台统一推送：成功/失败/缺配置均生成摘要；复用 tools/sendNotify.js
+		// 通知所有权显式规则：批量入口(qlall)注入 QL_SUPPRESS_NOTIFY=1 时，本子脚本不得单发，
+		// 最终汇总由批量入口独占；本层在此显式判断，不依赖 sendNotify.js 内部实现。
+		// 通知异常隔离，不改变业务结论或退出码。
+		try {
+			if ("Node.js" === e) {
+				if (process.env.QL_SUPPRESS_NOTIFY === "1" || process.env.QL_SUPPRESS_NOTIFY === "true") {
+					console.log("[notify] 批量子任务，通知所有权归 qlall，ydyp 本层跳过单发");
+				} else {
+					const __path = require("node:path");
+					const { sendNotify } = require(__path.join(__dirname, "..", "tools", "sendNotify.js"));
+					await sendNotify(`【${Vt}】${__ydypStatus === "failed" ? "执行失败" : "执行完成"}`, __ydypSummary);
+				}
+			}
+		} catch (__ne) {
+			console.log("[notify] ydyp 通知发送异常，已隔离(不影响退出码): " + ((__ne && __ne.message) ? __ne.message : __ne));
+		}
 		! function(n = {}) {
 			switch (e) {
 				case "Surge":

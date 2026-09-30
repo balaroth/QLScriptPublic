@@ -14,6 +14,24 @@ import sys
 import time
 from pathlib import Path
 
+# 统一通知器 notify.py 位于仓库根；本脚本在 wxapp/ 子目录运行，sys.path 默认只含 wxapp/，
+# 需把仓库根加入搜索路径，否则会退化为 print 兜底而不真正发通知。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"\n===== {title} =====\n{content}")
+
+
+def _safe_notify(title, content):
+    """发送通知；任何异常都被隔离，不影响业务结论与退出码。"""
+    try:
+        send(title, content)
+    except Exception as e:
+        print(f"[通知] 发送异常已隔离: {type(e).__name__}: {e}")
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -354,9 +372,11 @@ if __name__ == "__main__":
 
     # 从环境变量读取 wx_server 账号标识/openid
     accounts = [item.strip() for item in os.getenv("BREO", "").replace("&", "\n").splitlines() if item.strip()]
+    report_lines = []
 
     if not accounts:
         print("❌ 未检测到 账号信息，退出脚本。")
+        report_lines.append("❌ 配置缺失：未检测到 BREO 账号信息")
     else:
         skip_community = os.getenv("BREO_SKIP_COMMUNITY", "").lower() in ("1", "true", "yes")
         print("=============== 开始执行任务 ===============")
@@ -366,8 +386,10 @@ if __name__ == "__main__":
                 token = get_token_for_account(account, i)
             except Exception as e:
                 print(f"❌ 账号 {i} 登录失败: {e}")
+                report_lines.append(f"❌ 账号{i} 登录失败: {type(e).__name__}: {e}")
                 continue
 
+            report_lines.append(f"✅ 账号{i} 登录成功，已执行签到/社区/浏览流程（明细见日志）")
             print("🚀 正在签到...")
             punch_in(token)
 
@@ -391,3 +413,5 @@ if __name__ == "__main__":
             print(f"-------------- 账号 {i} 结束 --------------")
 
         print("\n=============== 所有任务执行完毕 ===============")
+
+    _safe_notify("BREO 每日任务", "\n".join(report_lines) if report_lines else "ℹ️ 无账号执行")

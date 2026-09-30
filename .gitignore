@@ -6,3 +6,10 @@ package*.json
 Tools/
 wxapp/*_token_cache.json
 daily/*_token_cache.json
+**/__pycache__/
+*.pyc
+*.bak*
+*.before_*
+.notify_backup_*/
+**/.backup-*/
+wxapp/*_cache.json

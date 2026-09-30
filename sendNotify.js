@@ -1502,6 +1502,11 @@ function formatBodyFun(contentType, body) {
  * @returns {Promise<unknown>}
  */
 async function sendNotify(text, desp, params = {}) {
+  // 统一执行器/qlrun 子任务模式：最终通知由上层独占，子脚本不得单发。
+  if (["1", "true", "yes"].includes(String(process.env.QL_SUPPRESS_NOTIFY || "").toLowerCase())) {
+    console.log(`[notify] QL_SUPPRESS_NOTIFY=1，已抑制子任务通知（标题：${text}）`);
+    return;
+  }
   // 根据标题跳过一些消息推送，环境变量：SKIP_PUSH_TITLE 用回车分隔
   let skipTitle = process.env.SKIP_PUSH_TITLE;
   if (skipTitle) {

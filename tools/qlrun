@@ -1,11 +1,12 @@
-#!/system/bin/sh
+#!/usr/bin/env sh
 # qlrun - 单脚本手动执行包装器：全局串行、业务失败最多重试3次、仅最终失败发送一封邮件。
 # 子脚本每次尝试均注入 QL_SUPPRESS_NOTIFY=1；通知所有权由本层独占。
 
 FILE="$1"
 [ -z "$FILE" ] && { echo "qlrun: missing file"; exit 1; }
 
-LOCKD="/data/adb/qinglong-data/.qlrun"
+DATA="${QL_DATA_DIR:-/ql/data}"
+LOCKD="$DATA/.qlrun"
 LOCKDIR="$LOCKD/global.lock.d"
 QUEUELOG="$LOCKD/queue.log"
 MAX_WAIT=7200
@@ -90,10 +91,13 @@ send_final_notice() {
     TITLE="【qlrun】${NAME} ${STATUS}"
     BODY="脚本：${FILE}\n结果：${STATUS}\n执行次数：${ATT}/${ATTEMPTS}\n退出码：${RC}"
     [ -n "$REASON" ] && BODY="$BODY\n关键原因：\n$REASON"
+    NODE_BIN=$(command -v node 2>/dev/null || true)
+    [ -z "$NODE_BIN" ] && NODE_BIN="/usr/bin/node"
     QLRUN_TITLE="$TITLE" QLRUN_BODY="$BODY" QL_SUPPRESS_NOTIFY= \
-      /data/adb/qinglong/runtime/bin/node -e '
+      "$NODE_BIN" -e '
         const path=require("path");
-        const repo="/data/adb/qinglong-data/scripts/smallfawn_QLScriptPublic";
+        const data=process.env.QL_DATA_DIR || "/ql/data";
+        const repo=path.join(data,"scripts","smallfawn_QLScriptPublic");
         const {sendNotify}=require(path.join(repo,"tools","sendNotify.js"));
         Promise.resolve(sendNotify(process.env.QLRUN_TITLE, process.env.QLRUN_BODY, {}))
           .then(()=>process.exit(0)).catch(e=>{console.log("[qlrun] 最终通知失败: "+(e&&e.message?e.message:String(e)));process.exit(0)});

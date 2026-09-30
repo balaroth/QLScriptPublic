@@ -102,19 +102,26 @@ class ALiYun:
         return msg
 
 # ==================== 通知逻辑 ====================
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"\n===== {title} =====\n{content}")
+
+
 def send_notify(title, content):
-    """简易通知，如果有 notify.py 则尝试调用"""
+    """统一通知入口：发送异常必须被隔离，不能改变业务结论或退出码。"""
     try:
-        from notify import send
-        print(title, content)
-    except ImportError:
-        logger.info("\n--- 通知预览 ---\n" + title + "\n" + content)
+        send(title, content)
+    except Exception as e:
+        logger.error(f"[通知] 发送异常已隔离: {type(e).__name__}: {e}")
 
 # ==================== 主入口 ====================
 def main():
     raw_conf = os.getenv("ALIYUN_ACCOUNTS", "")
     if not raw_conf:
         logger.error("未找到环境变量 ALIYUN_ACCOUNTS")
+        send_notify("阿里云盘签到", "❌ 配置缺失：未找到环境变量 ALIYUN_ACCOUNTS")
         return
 
     # 按 & 或 换行 分隔账号
@@ -147,6 +154,9 @@ def main():
 
     if final_reports:
         print("阿里云盘签到报告", "\n" + "="*20 + "\n" + "\n\n".join(final_reports))
+        send_notify("阿里云盘签到", "\n\n".join(final_reports))
+    else:
+        send_notify("阿里云盘签到", "ℹ️ 无有效账号执行（账号配置缺失或全部跳过）")
 
 if __name__ == "__main__":
     main()

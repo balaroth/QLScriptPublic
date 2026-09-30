@@ -185,6 +185,11 @@ if (process.env.NOTIFY_SHOWNAMETYPE) {
     ShowRemarkType = process.env.NOTIFY_SHOWNAMETYPE;
 }
 async function sendNotify(text, desp, params = {}, author = "\n================================\n好物推荐：https://u.jd.com/WLEVYTM",strsummary="") {
+    // 统一执行器/qlrun 子任务模式：最终通知由上层独占，子脚本不得单发。
+    if (["1", "true", "yes"].includes(String(process.env.QL_SUPPRESS_NOTIFY || "").toLowerCase())) {
+        console.log(`[notify] QL_SUPPRESS_NOTIFY=1，已抑制子任务通知（标题：${text}）`);
+        return;
+    }
     console.log(`开始发送通知...`); 
 	
 	//NOTIFY_FILTERBYFILE代码来自Ca11back.

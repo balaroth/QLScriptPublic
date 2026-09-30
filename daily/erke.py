@@ -22,6 +22,20 @@ import logging
 from typing import Dict
 from datetime import datetime, timedelta, timezone
 
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"\n===== {title} =====\n{content}")
+
+
+def _safe_notify(title, content):
+    """发送通知；任何异常都被隔离，不影响业务结论与退出码。"""
+    try:
+        send(title, content)
+    except Exception as e:
+        print(f"[通知] 发送异常已隔离: {type(e).__name__}: {e}")
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("ErkeCheckIn")
@@ -147,6 +161,7 @@ def main():
     conf_str = os.getenv("ERKE_CONF", "")
     if not conf_str:
         logger.error("未找到环境变量 ERKE_CONF，请检查配置！")
+        _safe_notify("鸿星尔克签到", "❌ 配置缺失：未找到环境变量 ERKE_CONF")
         return
     # 处理多账号，支持换行或 & 分隔
     accounts_raw = conf_str.replace("&", "\n").splitlines()
@@ -179,9 +194,8 @@ def main():
     print("      鸿星尔克任务简报")
     print("="*30)
     print("\n".join(summary))
-    
-    # 如果有通知推送逻辑，可以在此处调用
-    # send_notification("鸿星尔克签到", "\n".join(summary))
+
+    _safe_notify("鸿星尔克签到", "\n".join(summary) if summary else "ℹ️ 无有效账号执行")
 
 if __name__ == "__main__":
     main()

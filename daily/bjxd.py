@@ -80,11 +80,24 @@ class BeiJingHyundai:
         self.log_content += content + "\n"
 
     def push_notification(self) -> None:
-        """推送通知"""
+        """推送通知：统一走 notify.py（异常隔离，不影响业务结论/退出码）。"""
+        title = self.NAME
+        content = (self.log_content or "").strip() or "（无日志内容）"
+        # 1) 统一 Python SMTP 通知器
         try:
-            QLAPI.notify(self.NAME, self.log_content)
-        except NameError:
-            print(f"\n\n🚀 推送通知\n\n{self.NAME}\n\n{self.log_content}")
+            from notify import send as _send
+            try:
+                _send(title, content)
+            except Exception as e:
+                print(f"[通知] notify.py 发送异常已隔离: {type(e).__name__}: {e}")
+        except Exception:
+            # 2) 兼容青龙 QLAPI
+            try:
+                QLAPI.notify(title, content)
+            except NameError:
+                print(f"\n\n🚀 推送通知\n\n{title}\n\n{content}")
+            except Exception as e:
+                print(f"[通知] QLAPI.notify 异常已隔离: {type(e).__name__}: {e}")
 
     def make_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
         """

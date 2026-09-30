@@ -5,6 +5,20 @@ from bs4 import BeautifulSoup
 import time
 import os
 
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"\n===== {title} =====\n{content}")
+
+
+def _safe_notify(title, content):
+    """发送通知；任何异常都被隔离，不影响业务结论与退出码。"""
+    try:
+        send(title, content)
+    except Exception as e:
+        print(f"[通知] 发送异常已隔离: {type(e).__name__}: {e}")
+
 def login_to_51daili():
     # 从环境变量读取账号和密码
     username = os.getenv('dali51user')
@@ -136,11 +150,16 @@ def login_to_51daili():
 if __name__ == "__main__":
     print("51代理登录示例")
     print("=" * 30)
-    
+
     session = login_to_51daili()
-    
+
     if session:
         print("登录流程完成")
         # 这里可以继续使用session进行后续操作
+        _safe_notify("51代理签到", "✅ 登录成功并访问签到页（明细见日志）")
     else:
         print("登录失败")
+        if not (os.getenv('dali51user') and os.getenv('daili51pass')):
+            _safe_notify("51代理签到", "❌ 配置缺失：未设置环境变量 dali51user/daili51pass")
+        else:
+            _safe_notify("51代理签到", "❌ 登录失败（明细见日志）")

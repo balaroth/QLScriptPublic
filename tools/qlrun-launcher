@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+set -eu
+DATA="${QL_DATA_DIR:-/ql/data}"
+exec sh "$DATA/scripts/smallfawn_QLScriptPublic/tools/qlrun" "$@"

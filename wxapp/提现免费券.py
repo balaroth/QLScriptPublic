@@ -13,6 +13,24 @@ import requests
 
 urllib3.disable_warnings()
 
+# 统一通知器 notify.py 位于仓库根；本脚本在 wxapp/ 子目录运行，sys.path 默认只含 wxapp/，
+# 需把仓库根加入搜索路径，否则会退化为 print 兜底而不真正发通知。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"\n===== {title} =====\n{content}")
+
+
+def _safe_notify(title, content):
+    """发送通知；任何异常都被隔离，不影响业务结论与退出码。"""
+    try:
+        send(title, content)
+    except Exception as e:
+        print(f"[通知] 发送异常已隔离: {type(e).__name__}: {e}")
+
 
 # ── 账号 & 鉴权 ──
 APPID = "wxdb3c0e388702f785"
@@ -75,19 +93,24 @@ def main() -> int:
     openids = [item.strip() for item in OPENID.split("&") if item.strip()]
     if not openids:
         print("未提供有效的 openid")
+        _safe_notify("微信支付提现免费券", "❌ 配置缺失：未提供有效的 openid(wxtxopenids)")
         return 1
 
     ok_count = 0
+    digest = []
     for index, openid in enumerate(openids, start=1):
         prefix = f"🌸 账号[{index}]"
         try:
             result = run_account(openid)
             print_success(prefix, openid, result)
             ok_count += 1
+            digest.append(f"账号[{index}] {mask_openid(openid)}：" + _summarize_result(result))
         except Exception as err:
             print(f"{prefix} ❌ 处理失败（{mask_openid(openid)}）")
             print(f"{prefix} 错误：{err}")
+            digest.append(f"账号[{index}] {mask_openid(openid)}：❌ {err}")
 
+    _safe_notify("微信支付提现免费券", "\n".join(digest) if digest else "ℹ️ 无账号执行")
     return 0 if ok_count == len(openids) else 1
 
 
@@ -322,6 +345,22 @@ def coupon_amount(coupon: dict[str, Any]) -> str:
 
 def mask_openid(openid: str) -> str:
     return openid if len(openid) <= 12 else f"{openid[:6]}...{openid[-4:]}"
+
+
+def _summarize_result(result: dict[str, Any]) -> str:
+    """把单账号执行结果压缩成一行摘要（用于通知，不含敏感标识）。"""
+    coupon = result.get("coupon")
+    status = result.get("status")
+    if isinstance(coupon, dict):
+        name = coupon_name(coupon)
+        amount = coupon_amount(coupon)
+    else:
+        name, amount = "无每日额度", ""
+    if status == "claimed":
+        return f"✅ 领取成功：{name}（{amount}）"
+    if status == "already_claimed":
+        return f"ℹ️ 今日已领取：{name}（{amount}）"
+    return "ℹ️ 未查询到每日额度"
 
 
 if __name__ == "__main__":

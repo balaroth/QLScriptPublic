@@ -23,6 +23,20 @@ from threading import Lock
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"\n===== {title} =====\n{content}")
+
+
+def _safe_notify(title, content):
+    """发送通知；任何异常都被隔离，不影响业务结论与退出码。"""
+    try:
+        send(title, content)
+    except Exception as e:
+        print(f"[通知] 发送异常已隔离: {type(e).__name__}: {e}")
+
 # 禁用SSL警告
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -1113,6 +1127,7 @@ def main():
     env_value = os.getenv(config.ENV_NAME)
     if not env_value:
         print(f"❌ 未找到环境变量 {config.ENV_NAME}，请检查配置")
+        _safe_notify("顺丰速运日常任务", f"❌ 配置缺失：未找到环境变量 {config.ENV_NAME}")
         return
 
     account_urls = [url.strip() for url in env_value.split('&') if url.strip()]
@@ -1192,7 +1207,22 @@ def main():
     print("-" * 80)
     print(f"{'汇总':<6} {'账号总数: ' + str(len(all_results)):<15} {'今日总获得: ' + str(total_earned):<15} {'':<15} {'成功: ' + str(success_count):<10}")
     print("=" * 80)
-    
+
+    # 构建逐账号摘要并发送通知（异常隔离，不影响退出码）
+    digest_lines = []
+    for result in all_results:
+        idx = result['index'] + 1
+        phone = result['phone'][:3] + "****" + result['phone'][7:] if result['phone'] else "未登录"
+        if result['success']:
+            digest_lines.append(
+                f"✅ 账号{idx} {phone}：今日+{result['points_earned']}，总积分{result['points_after']}"
+            )
+        else:
+            err = result.get('error', '登录/执行失败')
+            digest_lines.append(f"❌ 账号{idx} {phone}：失败 - {err}")
+    digest_lines.append(f"—— 汇总：共{len(all_results)}账号，成功{success_count}，失败{fail_count}，今日总获得{total_earned}")
+    _safe_notify("顺丰速运日常任务", "\n".join(digest_lines) if digest_lines else "ℹ️ 无账号执行")
+
     print("\n🎊 所有账号任务执行完成!")
 
 

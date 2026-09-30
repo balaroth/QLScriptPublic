@@ -110,6 +110,8 @@ push_config = {
     'SMTP_EMAIL': '',                   # SMTP 收发件邮箱，通知将会由自己发给自己
     'SMTP_PASSWORD': '',                # SMTP 登录密码，也可能为特殊口令，视具体邮件服务商说明而定
     'SMTP_NAME': '',                    # SMTP 收发件人姓名，可随意填写
+    'SMTP_SERVICE': '',                # 兼容 Node 口径：邮箱服务名（QQ/163/Gmail 等），配置后由服务名推导服务端
+    'SMTP_TO': '',                      # 兼容 Node 口径：收件邮箱，多个用 ; 分隔，缺省发给发件人自己
 
     'PUSHME_KEY': '',                   # PushMe 的 PUSHME_KEY
     'PUSHME_URL': '',                   # PushMe 的 PUSHME_URL
@@ -676,53 +678,105 @@ def aibotk(title: str, content: str) -> None:
         print(f'智能微秘书 推送失败！{response["error"]}')
 
 
+# nodemailer well-known 服务名 -> (host, port, use_ssl)
+# 用于兼容 Node 口径：仅配置 SMTP_SERVICE 时推导服务端连接参数。
+_SMTP_SERVICE_MAP = {
+    "qq": ("smtp.qq.com", 465, True),
+    "163": ("smtp.163.com", 465, True),
+    "126": ("smtp.126.com", 465, True),
+    "gmail": ("smtp.gmail.com", 465, True),
+    "exmail": ("smtp.exmail.qq.com", 465, True),
+    "outlook": ("smtp.office365.com", 587, False),
+    "hotmail": ("smtp.office365.com", 587, False),
+    "sina": ("smtp.sina.com", 465, True),
+    "sohu": ("smtp.sohu.com", 465, True),
+}
+
+
+def _smtp_endpoint():
+    """
+    推导 SMTP 服务端连接参数。
+    优先使用原 Python 口径 SMTP_SERVER(:port) + SMTP_SSL；
+    若未配置 SMTP_SERVER，则按 Node 口径 SMTP_SERVICE 推导。
+    返回 (host, port, use_ssl) 或 None（配置不足/无法识别）。
+    """
+    server = (push_config.get("SMTP_SERVER") or "").strip()
+    if server:
+        if ":" in server:
+            host, _, port_s = server.rpartition(":")
+            try:
+                port = int(port_s)
+            except ValueError:
+                host = server
+                port = 465 if (push_config.get("SMTP_SSL") == "true") else 25
+        else:
+            host = server
+            port = 465 if (push_config.get("SMTP_SSL") == "true") else 25
+        return host, port, (push_config.get("SMTP_SSL") == "true")
+
+    service = (push_config.get("SMTP_SERVICE") or "").strip().lower()
+    if service and service in _SMTP_SERVICE_MAP:
+        return _SMTP_SERVICE_MAP[service]
+    return None
+
+
+def _smtp_configured() -> bool:
+    """SMTP 是否可用：双口径任一满足即可。不依赖 SMTP_NAME 强制必填。"""
+    email = (push_config.get("SMTP_EMAIL") or "").strip()
+    password = push_config.get("SMTP_PASSWORD") or ""
+    if not email or not password:
+        return False
+    if (push_config.get("SMTP_SERVER") or "").strip():
+        return True
+    service = (push_config.get("SMTP_SERVICE") or "").strip().lower()
+    return bool(service and service in _SMTP_SERVICE_MAP)
+
+
 def smtp(title: str, content: str) -> None:
     """
     使用 SMTP 邮件 推送消息。
+    同时兼容：
+      - 原 Python 口径：SMTP_SERVER、SMTP_SSL、SMTP_EMAIL、SMTP_PASSWORD、SMTP_NAME
+      - Node 口径：SMTP_SERVICE、SMTP_EMAIL、SMTP_PASSWORD、SMTP_NAME、SMTP_TO
+    不打印任何凭据（密码/令牌）。
     """
-    if (
-        not push_config.get("SMTP_SERVER")
-        or not push_config.get("SMTP_SSL")
-        or not push_config.get("SMTP_EMAIL")
-        or not push_config.get("SMTP_PASSWORD")
-        or not push_config.get("SMTP_NAME")
-    ):
+    email = (push_config.get("SMTP_EMAIL") or "").strip()
+    password = push_config.get("SMTP_PASSWORD") or ""
+    name = (push_config.get("SMTP_NAME") or "").strip() or email
+    endpoint = _smtp_endpoint()
+    if not email or not password or endpoint is None:
         return
+
+    # 收件人：Node 口径 SMTP_TO（多个用 ; 或 , 分隔）优先；缺省发给发件人自己
+    to_raw = (push_config.get("SMTP_TO") or "").strip()
+    if to_raw:
+        receivers = [x.strip() for x in to_raw.replace(",", ";").split(";") if x.strip()]
+    else:
+        receivers = []
+    if not receivers:
+        receivers = [email]
+
+    host, port, use_ssl = endpoint
     print("SMTP 邮件 服务启动")
 
     message = MIMEText(content, "plain", "utf-8")
-    message["From"] = formataddr(
-        (
-            Header(push_config.get("SMTP_NAME"), "utf-8").encode(),
-            push_config.get("SMTP_EMAIL"),
-        )
-    )
-    message["To"] = formataddr(
-        (
-            Header(push_config.get("SMTP_NAME"), "utf-8").encode(),
-            push_config.get("SMTP_EMAIL"),
-        )
-    )
+    message["From"] = formataddr((Header(name, "utf-8").encode(), email))
+    message["To"] = ", ".join(receivers)
     message["Subject"] = Header(title, "utf-8")
 
     try:
-        smtp_server = (
-            smtplib.SMTP_SSL(push_config.get("SMTP_SERVER"))
-            if push_config.get("SMTP_SSL") == "true"
-            else smtplib.SMTP(push_config.get("SMTP_SERVER"))
-        )
-        smtp_server.login(
-            push_config.get("SMTP_EMAIL"), push_config.get("SMTP_PASSWORD")
-        )
-        smtp_server.sendmail(
-            push_config.get("SMTP_EMAIL"),
-            push_config.get("SMTP_EMAIL"),
-            message.as_bytes(),
-        )
-        smtp_server.close()
+        if use_ssl:
+            smtp_server = smtplib.SMTP_SSL(host, port, timeout=20)
+        else:
+            smtp_server = smtplib.SMTP(host, port, timeout=20)
+            smtp_server.starttls()
+        smtp_server.login(email, password)
+        smtp_server.sendmail(email, receivers, message.as_bytes())
+        smtp_server.quit()
         print("SMTP 邮件 推送成功！")
     except Exception as e:
-        print(f"SMTP 邮件 推送失败！{e}")
+        # 仅打印异常类型与简短信息，不打印密码/令牌
+        print(f"SMTP 邮件 推送失败！{type(e).__name__}: {e}")
 
 
 def pushme(title: str, content: str) -> None:
@@ -1039,13 +1093,7 @@ def add_notify_function():
         and push_config.get("AIBOTK_NAME")
     ):
         notify_function.append(aibotk)
-    if (
-        push_config.get("SMTP_SERVER")
-        and push_config.get("SMTP_SSL")
-        and push_config.get("SMTP_EMAIL")
-        and push_config.get("SMTP_PASSWORD")
-        and push_config.get("SMTP_NAME")
-    ):
+    if _smtp_configured():
         notify_function.append(smtp)
     if push_config.get("PUSHME_KEY"):
         notify_function.append(pushme)
@@ -1069,6 +1117,12 @@ def add_notify_function():
 
 
 def send(title: str, content: str, ignore_default_config: bool = False, **kwargs):
+    # 批量（qlall）模式：上级入口已统一汇总并发送一封，抑制本子进程逐脚本邮件，避免重复。
+    # 仅静默通知、不抛错、不改变业务结论与退出码；只打印标题，不打印正文/凭据。
+    if os.getenv("QL_SUPPRESS_NOTIFY") in ("1", "true", "True", "yes"):
+        print(f"[notify] QL_SUPPRESS_NOTIFY=1，已抑制本子进程通知（标题：{title}）")
+        return
+
     if kwargs:
         global push_config
         if ignore_default_config:
@@ -1088,7 +1142,12 @@ def send(title: str, content: str, ignore_default_config: bool = False, **kwargs
             return
 
     hitokoto = push_config.get("HITOKOTO")
-    content += "\n\n" + one() if hitokoto != "false" else ""
+    if hitokoto != "false":
+        try:
+            content += "\n\n" + one()
+        except Exception as e:
+            # 一言失败不得阻断后续通知渠道（尤其 SMTP 邮件）
+            print(f"一言获取失败，已跳过（不影响其他渠道）: {type(e).__name__}: {e}")
 
     notify_function = add_notify_function()
     ts = [

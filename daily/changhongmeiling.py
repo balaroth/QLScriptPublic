@@ -7,10 +7,27 @@
 import os
 import requests
 
+try:
+    from notify import send
+except Exception:
+    def send(title, content):
+        print(f"\n===== {title} =====\n{content}")
+
+
+def _safe_notify(title, content):
+    """发送通知；任何异常都被隔离，不影响业务结论与退出码。"""
+    try:
+        send(title, content)
+    except Exception as e:
+        print(f"[通知] 发送异常已隔离: {type(e).__name__}: {e}")
+
+
 accounts = os.getenv("chmlck", "").splitlines()
 print("☞☞☞ 长虹美菱每日签到 ☜☜☜\n")
+report_lines = []
 if not accounts:
     print("未找到任何账号信息。")
+    report_lines.append("❌ 配置缺失：未找到任何 chmlck 账号信息")
 else:
     for account in accounts:
         if not account.strip():
@@ -19,7 +36,9 @@ else:
             token, note = account.split("#")
         except ValueError:
             print(f"格式错误: {account}")
+            report_lines.append(f"❌ 账号配置格式错误（应为 token#备注）: {account}")
             continue
+        note = note.strip()
 
         url = "https://hongke.changhong.com/gw/applet/aggr/signin"
         params = {'aggrId': "608"}
@@ -33,10 +52,16 @@ else:
         try:
             response = requests.post(url, params=params, headers=headers)
             if response.status_code == 200:
-                print(f"{note.strip()}：签到成功")
+                print(f"{note}：签到成功")
+                report_lines.append(f"✅ {note}：签到成功")
             elif response.status_code == 400:
-                print(f"{note.strip()}：请勿重复签到")
+                print(f"{note}：请勿重复签到")
+                report_lines.append(f"ℹ️ {note}：请勿重复签到")
             else:
-                print(f"{note.strip()}：响应状态码 {response.status_code} - {response.text}")
+                print(f"{note}：响应状态码 {response.status_code} - {response.text}")
+                report_lines.append(f"❌ {note}：签到失败 HTTP {response.status_code}")
         except requests.RequestException as e:
-            print(f"{note.strip()}：请求失败 - {e}")
+            print(f"{note}：请求失败 - {e}")
+            report_lines.append(f"❌ {note}：请求失败 - {type(e).__name__}")
+
+_safe_notify("长虹美菱每日签到", "\n".join(report_lines) if report_lines else "无账号执行")

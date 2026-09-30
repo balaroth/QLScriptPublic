@@ -6,6 +6,10 @@ REPO="${QL_SCRIPT_REPO:-$DATA/scripts/smallfawn_QLScriptPublic}"
 UPSTREAM="${QL_UPSTREAM_REMOTE:-upstream}"
 UPSTREAM_URL="${QL_UPSTREAM_URL:-https://github.com/smallfawn/QLScriptPublic.git}"
 BRANCH="${QL_UPSTREAM_BRANCH:-main}"
+GIT_KEY="${QL_GIT_SSH_KEY:-$DATA/.ssh/qlscript_deploy}"
+if [ -f "$GIT_KEY" ]; then
+  export GIT_SSH_COMMAND="ssh -i $GIT_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$DATA/.ssh/known_hosts"
+fi
 LOG_DIR="$DATA/log/update-smallfawn"
 LOCK_DIR="$DATA/.qlrun/update-smallfawn.lock.d"
 mkdir -p "$LOG_DIR" "$DATA/.qlrun"

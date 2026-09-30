@@ -13,3 +13,4 @@ daily/*_token_cache.json
 .notify_backup_*/
 **/.backup-*/
 wxapp/*_cache.json
+jd/fruit_helpcode_new

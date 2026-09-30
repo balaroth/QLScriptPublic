@@ -88,7 +88,7 @@ function runOnce(rel, taskId) {
 // 这样 QLScriptPublic 更新新增脚本后，下次 qlall 运行即自动出现在面板（手动），并被统一执行器覆盖。
 function ensureCrontabs(rels) {
     try {
-        const Sqlite3 = require("/data/adb/qinglong/versions/2.20.2/node_modules/sqlite3");
+        const Sqlite3 = require("sqlite3");
         const Database = Sqlite3.Database || Sqlite3.verbose().Database;
         const db = new Database(DB_PATH);
         const q = (sql, p = []) => new Promise((res, rej) => db.all(sql, p, (e, r) => (e ? rej(e) : res(r))));
@@ -162,7 +162,7 @@ async function markSubState(taskId, state) {
 let MASTER_ID = 291;
 async function detectMasterId() {
     try {
-        const Sqlite3 = require("/data/adb/qinglong/versions/2.20.2/node_modules/sqlite3");
+        const Sqlite3 = require("sqlite3");
         const Ctor = Sqlite3.Database || Sqlite3.verbose().Database;
         const db = new Ctor(DB_PATH);
         const rows = await new Promise((res, rej) => db.all("SELECT id FROM Crontabs WHERE command='qlall' AND isDisabled=0 LIMIT 1", (e, r) => (e ? rej(e) : res(r))));

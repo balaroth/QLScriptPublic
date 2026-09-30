@@ -1048,6 +1048,17 @@ async function smtpNotify(text, desp) {
         return;
     }
 
+    const maskAddress = (value) => String(value || '')
+        .split(/[;,]/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((item) => {
+            const plain = item.replace(/^.*<([^>]+)>.*$/, '$1');
+            const parts = plain.split('@');
+            return parts.length === 2 ? `${parts[0].slice(0, 2)}***@${parts[1]}` : '***';
+        })
+        .join(';');
+
     try {
         const nodemailer = require('nodemailer');
         const transporter = nodemailer.createTransport({
@@ -1059,22 +1070,29 @@ async function smtpNotify(text, desp) {
         });
 
         const addr = SMTP_NAME ? `"${SMTP_NAME}" <${SMTP_EMAIL}>` : SMTP_EMAIL;
+        const recipients = SMTP_TO ? SMTP_TO.split(';').map((v) => v.trim()).filter(Boolean) : [SMTP_EMAIL];
         const info = await transporter.sendMail({
             from: addr,
-            to: SMTP_TO ? SMTP_TO.split(';') : addr,
+            to: recipients,
             subject: text,
             html: `${desp.replace(/\n/g, '<br/>')}`,
         });
 
         transporter.close();
 
-        if (info.messageId) {
-            console.log('SMTP 发送通知消息成功🎉\n');
-            return true;
+        const accepted = Array.isArray(info.accepted) ? info.accepted : [];
+        const rejected = Array.isArray(info.rejected) ? info.rejected : [];
+        const relayAccepted = accepted.length > 0 && rejected.length === 0;
+        console.log(`[SMTP] to=${maskAddress(recipients.join(';'))} accepted=${maskAddress(accepted.join(';')) || '-'} rejected=${maskAddress(rejected.join(';')) || '-'} response=${String(info.response || '-').replace(/[\r\n]+/g, ' ').slice(0, 240)} messageId=${String(info.messageId || '-').slice(0, 160)}`);
+        if (info.messageId && relayAccepted) {
+            console.log('SMTP 服务器已接受通知邮件（不等同于已进入收件箱）\n');
+            return { ok: true, stage: 'relay-accepted', accepted, rejected, response: info.response, messageId: info.messageId };
         }
-        console.log('SMTP 发送通知消息失败😞\n');
+        console.log('SMTP 服务器未确认接受通知邮件\n');
+        return { ok: false, stage: 'relay-rejected', accepted, rejected, response: info.response, messageId: info.messageId };
     } catch (e) {
-        console.log('SMTP 发送通知消息出现异常😞\n', e);
+        console.log('SMTP 发送通知消息出现异常\n', e);
+        return { ok: false, stage: 'exception', error: e?.message || String(e) };
     }
 }
 
@@ -1498,6 +1516,11 @@ function formatBodyFun(contentType, body) {
  * @returns {Promise<unknown>}
  */
 async function sendNotify(text, desp, params = {}) {
+    // 统一执行器/qlrun 子任务模式：最终通知由上层独占，子脚本不得单发。
+    if (["1", "true", "yes"].includes(String(process.env.QL_SUPPRESS_NOTIFY || "").toLowerCase())) {
+        console.log(`[notify] QL_SUPPRESS_NOTIFY=1，已抑制子任务通知（标题：${text}）`);
+        return;
+    }
     // 根据标题跳过一些消息推送，环境变量：SKIP_PUSH_TITLE 用回车分隔
     let skipTitle = process.env.SKIP_PUSH_TITLE;
     if (skipTitle) {
@@ -1508,33 +1531,45 @@ async function sendNotify(text, desp, params = {}) {
     }
 
     if (push_config.HITOKOTO !== 'false') {
-        desp += '\n\n' + (await one());
+        try {
+            desp += '\n\n' + (await one());
+        } catch (e) {
+            // 一言获取失败不得阻断后续渠道（尤其 SMTP 邮件）；仅记录非敏感诊断信息
+            console.log('[notify] 一言获取失败，已跳过（不影响邮件等其他通知渠道）: ' + ((e && e.message) ? e.message : e));
+        }
     }
 
-    await Promise.all([
-        serverNotify(text, desp), // 微信server酱
-        pushPlusNotify(text, desp), // pushplus
-        wePlusBotNotify(text, desp), // 微加机器人
-        barkNotify(text, desp, params), // iOS Bark APP
-        tgBotNotify(text, desp), // telegram 机器人
-        ddBotNotify(text, desp), // 钉钉机器人
-        qywxBotNotify(text, desp), // 企业微信机器人
-        qywxamNotify(text, desp), // 企业微信应用消息推送
-        iGotNotify(text, desp, params), // iGot
-        gobotNotify(text, desp), // go-cqhttp
-        gotifyNotify(text, desp), // gotify
-        chatNotify(text, desp), // synolog chat
-        pushDeerNotify(text, desp), // PushDeer
-        aibotkNotify(text, desp), // 智能微秘书
-        fsBotNotify(text, desp), // 飞书机器人
-        smtpNotify(text, desp), // SMTP 邮件
-        pushMeNotify(text, desp, params), // PushMe
-        chronocatNotify(text, desp), // Chronocat
-        webhookNotify(text, desp), // 自定义通知
-        qmsgNotify(text, desp), // 自定义通知
-        ntfyNotify(text, desp), // Ntfy
-        wxPusherNotify(text, desp), // wxpusher
-    ]);
+    // 各渠道并发发送：任一渠道（含一言之外的其他渠道）同步异常或 reject 都必须被隔离，
+    // 不得阻断其余渠道，SMTP 邮件必须始终被尝试发送。每个渠道独立捕获异常，只记录非敏感诊断信息。
+    const channelList = [
+        ['server酱', () => serverNotify(text, desp)],
+        ['pushplus', () => pushPlusNotify(text, desp)],
+        ['微加机器人', () => wePlusBotNotify(text, desp)],
+        ['Bark', () => barkNotify(text, desp, params)],
+        ['Telegram', () => tgBotNotify(text, desp)],
+        ['钉钉', () => ddBotNotify(text, desp)],
+        ['企业微信机器人', () => qywxBotNotify(text, desp)],
+        ['企业微信应用', () => qywxamNotify(text, desp)],
+        ['iGot', () => iGotNotify(text, desp, params)],
+        ['go-cqhttp', () => gobotNotify(text, desp)],
+        ['gotify', () => gotifyNotify(text, desp)],
+        ['synology_chat', () => chatNotify(text, desp)],
+        ['PushDeer', () => pushDeerNotify(text, desp)],
+        ['智能微秘书', () => aibotkNotify(text, desp)],
+        ['飞书机器人', () => fsBotNotify(text, desp)],
+        ['SMTP邮件', () => smtpNotify(text, desp)],
+        ['PushMe', () => pushMeNotify(text, desp, params)],
+        ['Chronocat', () => chronocatNotify(text, desp)],
+        ['自定义webhook', () => webhookNotify(text, desp)],
+        ['Qmsg', () => qmsgNotify(text, desp)],
+        ['Ntfy', () => ntfyNotify(text, desp)],
+        ['wxpusher', () => wxPusherNotify(text, desp)],
+    ];
+    await Promise.all(channelList.map(([name, fn]) =>
+        Promise.resolve().then(fn).catch((e) => {
+            console.log(`[notify] 渠道「${name}」发送异常，已隔离（不阻断其他渠道）: ` + ((e && e.message) ? e.message : e));
+        })
+    ));
 }
 
 module.exports = {

@@ -171,16 +171,28 @@ function assertOk(res, action) {
 }
 
 async function request(method, base, urlPath, { token = "", data = null, params = null, hdrs = null } = {}) {
-  const res = await axios({
-    method,
-    url: `${base}${urlPath}`,
-    data,
-    params,
-    timeout: 20000,
-    validateStatus: () => true,
-    headers: hdrs || headers(token),
-  });
-  return res.data;
+  const maxAttempts = String(method).toLowerCase() === "get" ? 2 : 1;
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await axios({
+        method,
+        url: `${base}${urlPath}`,
+        data,
+        params,
+        timeout: 20000,
+        validateStatus: () => true,
+        headers: hdrs || headers(token),
+      });
+      return res.data;
+    } catch (e) {
+      lastError = e;
+      if (attempt >= maxAttempts || !/timeout|ECONNRESET|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(String(e.code || "") + " " + String(e.message || e))) break;
+      $.log(`${method.toUpperCase()} ${urlPath} 瞬时网络异常，1.5秒后重试(${attempt}/${maxAttempts - 1}): ${e.code || e.message || e}`);
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+  throw new Error(`${method.toUpperCase()} ${urlPath} 网络异常: ${lastError?.code || lastError?.message || lastError}`);
 }
 
 function aesCbcPkcs7Hex(text, key, iv) {
@@ -242,6 +254,7 @@ class Task {
     this.openid = account.openid;
     this.token = account.token || "";
     this.member = {};
+    this.encryptKeyCache = null;
     this.cacheKey = this.openid || (this.token ? md5(this.token).slice(0, 16) : `account_${this.index}`);
   }
 
@@ -352,10 +365,15 @@ class Task {
   }
 
   async gardenGet(urlPath, params = {}) {
-    const res = await this.withRelogin(async () =>
-      request("get", GARDEN_BASE, urlPath, { hdrs: gardenHeaders(await this.ensureGarden()), params })
-    );
-    return assertOk(res, urlPath);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const res = await this.withRelogin(async () =>
+        request("get", GARDEN_BASE, urlPath, { hdrs: gardenHeaders(await this.ensureGarden()), params })
+      );
+      const msg = `${res?.message || ""}${res?.msg || ""}`;
+      if (okCode(res) || attempt >= 2 || !/会话预热中|请\s*5\s*秒后重试/.test(msg)) return assertOk(res, urlPath);
+      $.log(`账号[${this.index}] ${urlPath} 会话预热中，5.5秒后重试`);
+      await new Promise((resolve) => setTimeout(resolve, 5500));
+    }
   }
 
   async gardenPost(urlPath, data = {}) {
@@ -370,17 +388,24 @@ class Task {
    * 用君品荟自己的 appid 取，服务端一律回 5001「用户信息异常」——
    * 因为它是按请求头里的 AppID 去找对应 appid 的用户密钥来解密的。
    */
-  async getEncryptKey() {
+  async getEncryptKey(force = false) {
     if (!this.openid) throw new Error("缺少 openid，无法生成 encryptData");
-    const { data } = await axios.post(
-      `${gardenWechat.serverUrl}/wx/encryptkey`,
-      { appid: GARDEN_APP_ID, openid: this.openid },
-      {
-        headers: { auth: gardenWechat.auth },
-        timeout: 30000,
-        validateStatus: () => true,
-      }
-    );
+    if (!force && this.encryptKeyCache) return this.encryptKeyCache;
+    let response;
+    try {
+      response = await axios.post(
+        `${gardenWechat.serverUrl}/wx/encryptkey`,
+        { appid: GARDEN_APP_ID, openid: this.openid, ...(force ? { force: true } : {}) },
+        {
+          headers: { auth: gardenWechat.auth },
+          timeout: 85000,
+          validateStatus: () => true,
+        }
+      );
+    } catch (e) {
+      throw new Error(`/wx/encryptkey 网络异常: ${e.code || e.message || e}`);
+    }
+    const data = response.data;
     if (!data?.status) throw new Error(data?.message || "wx_server 获取 encryptkey 失败");
     const info = data.data || {};
     const encryptKey = info.encryptKey || info.encrypt_key;
@@ -389,12 +414,14 @@ class Task {
     if (!encryptKey || !iv || version === undefined) {
       throw new Error(`wx_server encryptkey 缺少必要字段: ${JSON.stringify(data)}`);
     }
-    return { encryptKey, iv, version };
+    this.encryptKeyCache = { encryptKey, iv, version };
+    $.log(`账号[${this.index}] encryptkey ${force ? "强刷" : "获取"}成功并在本轮复用(version=${version}, source=${data.source || "unknown"})`);
+    return this.encryptKeyCache;
   }
 
-  async encryptData(data = {}) {
+  async encryptData(data = {}, forceKey = false) {
     const payload = data && typeof data === "object" ? { ...data } : {};
-    const key = await this.getEncryptKey();
+    const key = await this.getEncryptKey(forceKey);
     payload.ts = Date.now();
     payload.encryptData = aesCbcPkcs7Hex(JSON.stringify(payload), key.encryptKey, key.iv);
     payload.version = key.version;
@@ -402,11 +429,11 @@ class Task {
   }
 
   async encryptedPost(urlPath, data = {}) {
-    return this.withEncryptHint(urlPath, async () => this.gardenPost(urlPath, await this.encryptData(data)));
+    return this.withEncryptHint(urlPath, async (forceKey) => this.gardenPost(urlPath, await this.encryptData(data, forceKey)));
   }
 
   async encryptedGet(urlPath, data = {}) {
-    return this.withEncryptHint(urlPath, async () => this.gardenGet(urlPath, await this.encryptData(data)));
+    return this.withEncryptHint(urlPath, async (forceKey) => this.gardenGet(urlPath, await this.encryptData(data, forceKey)));
   }
 
   /**
@@ -415,11 +442,17 @@ class Task {
    */
   async withEncryptHint(urlPath, fn) {
     try {
-      return await fn();
+      return await fn(false);
     } catch (e) {
       const msg = String(e.message || e);
       if (/用户信息异常|请从小程序重新进入|请删除小程序/.test(msg)) {
-        throw new Error(`${msg} ← encryptData 校验失败：密钥必须取 ${GARDEN_APP_ID}(习酒) 的，见文件头说明`);
+        this.encryptKeyCache = null;
+        $.log(`账号[${this.index}] ${urlPath} 加密校验被拒，强刷 encryptkey 后仅重试该接口一次`);
+        try {
+          return await fn(true);
+        } catch (retryError) {
+          throw new Error(`${retryError.message || retryError} ← encryptData 校验失败：已强刷 ${GARDEN_APP_ID}(习酒) 密钥并重试`);
+        }
       }
       if (/滑块|5008/.test(msg)) {
         throw new Error(`${msg} ← 触发滑块验证，按规则不绕，请在小程序里手动过一次`);
@@ -446,8 +479,10 @@ class Task {
     try {
       const data = await this.encryptedPost("/garden/sign/dailySign");
       $.log(`账号[${this.index}] 签到成功: ${shortJson(data || "ok")}`);
+      return true;
     } catch (e) {
       $.log(`账号[${this.index}] 签到失败: ${e.message || e}`);
+      return false;
     }
   }
 
@@ -715,32 +750,57 @@ class Task {
 
   async run() {
     $.log(`\n账号[${this.index}] ${mask(this.openid || this.cacheKey)}`);
-    // 所有业务都在 garden 上，直接用 garden 会话；原来的 fm 静默登录只是拿一个
-    // 对 garden 无效的 X-Access-Token，白耗一个 code，已不再调用。
+    // 核心成功口径：garden 登录 + 首次会员查询 + 签到。附属任务与末尾复查失败只告警，
+    // 不得覆盖已经完成的签到，避免 qlrun 因农场状态变化或瞬时网络抖动重复执行整轮。
     await this.ensureGarden();
     await this.queryMember();
-    await this.dailySign();
+    if (!(await this.dailySign())) throw new Error("核心签到失败");
 
-    const tasks = await this.queryTasks();
-    await this.doTasks(tasks);
+    try {
+      const tasks = await this.queryTasks();
+      await this.doTasks(tasks);
+    } catch (e) {
+      $.log(`账号[${this.index}] 附属任务告警: ${e.message || e}`);
+    }
 
-    await this.runFarmAutomation();
+    try {
+      await this.runFarmAutomation();
+    } catch (e) {
+      $.log(`账号[${this.index}] 农场附属动作告警: ${e.message || e}`);
+    }
 
-    await this.queryMember();
-    await this.queryFarm();
+    try {
+      await this.queryMember();
+      await this.queryFarm();
+    } catch (e) {
+      $.log(`账号[${this.index}] 末尾状态复查告警（不影响已完成签到）: ${e.message || e}`);
+    }
+    return true;
   }
 }
 
 !(async () => {
   $.checkEnv(ckName);
-  if (!$.userCount) return;
+  if (!$.userCount) {
+    $.log("[QLRUN_RESULT] FAILURE reason=no-account");
+    return;
+  }
+  let coreSuccess = 0;
+  let coreFailure = 0;
   for (const account of $.userList) {
     try {
       await new Task(account).run();
+      coreSuccess++;
     } catch (e) {
-      $.log(`账号执行失败: ${e.message || e}`);
+      coreFailure++;
+      $.log(`账号核心执行失败: ${e.message || e}`);
     }
   }
+  if (coreFailure === 0 && coreSuccess === $.userCount) {
+    $.log(`[QLRUN_RESULT] SUCCESS core=${coreSuccess}/${$.userCount}`);
+  } else {
+    $.log(`[QLRUN_RESULT] FAILURE core=${coreSuccess}/${$.userCount} failed=${coreFailure}`);
+  }
 })()
-  .catch((e) => $.log(`脚本异常: ${e.message || e}`))
+  .catch((e) => $.log(`[QLRUN_RESULT] FAILURE reason=script-exception detail=${e.message || e}`))
   .finally(() => $.done && $.done());

@@ -108,4 +108,10 @@ fi
 chmod 0755 "$REPO/tools/qlrun" "$REPO/tools/qlrun-launcher" "$REPO/tools/qlall.js" "$REPO/tools/qlall-launcher"
 cp "$REPO/tools/task-before.js" "$DATA/config/task_before.js"
 chmod 0600 "$DATA/config/task_before.js"
-echo "[updater] merged $REMOTE_HEAD and deployed runtime hooks"
+if git remote get-url fork >/dev/null 2>&1; then
+  if ! git push fork HEAD:main; then
+    notify_failure '【青龙更新】合并成功但推送 fork 失败' "仓库：$REPO\n合并后提交：$(git rev-parse HEAD)\n本地运行代码已更新，但 GitHub fork 尚未同步。\n备份分支：$BACKUP_REF\n日志：$LOG"
+    exit 4
+  fi
+fi
+echo "[updater] merged $REMOTE_HEAD, deployed runtime hooks, and synchronized fork"

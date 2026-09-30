@@ -10,7 +10,18 @@ LOG_DIR="$DATA/log/update-smallfawn"
 LOCK_DIR="$DATA/.qlrun/update-smallfawn.lock.d"
 mkdir -p "$LOG_DIR" "$DATA/.qlrun"
 LOG="$LOG_DIR/$(date '+%Y-%m-%d-%H-%M-%S').log"
+RUNTIME_BACKUP="$(mktemp -d "$DATA/.qlrun/update-runtime.XXXXXX")"
 exec > >(tee -a "$LOG") 2>&1
+
+restore_runtime_files() {
+  if [ -d "$RUNTIME_BACKUP" ]; then
+    (cd "$RUNTIME_BACKUP" && find . -type f -print0) | while IFS= read -r -d '' rel; do
+      mkdir -p "$REPO/$(dirname "$rel")"
+      cp "$RUNTIME_BACKUP/$rel" "$REPO/$rel"
+    done
+    rm -rf "$RUNTIME_BACKUP"
+  fi
+}
 
 notify_failure() {
   local subject="$1" body="$2"
@@ -27,11 +38,22 @@ NODE
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo '[updater] another update is running; skip'
+  rm -rf "$RUNTIME_BACKUP"
   exit 0
 fi
-trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+trap 'restore_runtime_files; rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 cd "$REPO" || { echo "[updater] repository missing: $REPO"; exit 1; }
+# 运行态文件不得参与代码合并。即使上游曾误跟踪缓存，也先备份并恢复到 HEAD，
+# 合并结束或失败后由 trap 原样还原，避免覆盖当前登录态。
+for runtime_file in wxapp/*_token_cache.json wxapp/*_cache.json daily/*_token_cache.json jd/fruit_helpcode_new; do
+  [ -f "$runtime_file" ] || continue
+  mkdir -p "$RUNTIME_BACKUP/$(dirname "$runtime_file")"
+  cp "$runtime_file" "$RUNTIME_BACKUP/$runtime_file"
+  if git ls-files --error-unmatch "$runtime_file" >/dev/null 2>&1; then
+    git checkout -- "$runtime_file"
+  fi
+done
 if ! git diff --quiet || ! git diff --cached --quiet; then
   notify_failure '【青龙更新】工作树存在未提交改动' "仓库：$REPO\n自动更新已停止，避免覆盖未提交修改。\n日志：$LOG"
   exit 1

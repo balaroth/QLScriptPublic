@@ -105,9 +105,7 @@ if [ -n "$CHECK_FAIL" ]; then
   exit 3
 fi
 
-cp "$REPO/tools/qlrun-launcher" /usr/local/bin/qlrun
-cp "$REPO/tools/qlall-launcher" /usr/local/bin/qlall
-chmod 0755 /usr/local/bin/qlrun /usr/local/bin/qlall
+chmod 0755 "$REPO/tools/qlrun" "$REPO/tools/qlrun-launcher" "$REPO/tools/qlall.js" "$REPO/tools/qlall-launcher"
 cp "$REPO/tools/task-before.js" "$DATA/config/task_before.js"
 chmod 0600 "$DATA/config/task_before.js"
 echo "[updater] merged $REMOTE_HEAD and deployed runtime hooks"

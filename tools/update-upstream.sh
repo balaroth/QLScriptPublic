@@ -109,6 +109,20 @@ if [ -n "$CHECK_FAIL" ]; then
   exit 3
 fi
 
+# —— 自动恢复：本次上游 diff 命中、且原本被面板禁用的业务脚本，恢复为"手动执行"任务 ——
+# 仅处理 A/M 的 .js/.py（删除/重命名/非脚本/tools/backup/库文件一律不动）；
+# 恢复口径：isDisabled=0、schedule=@once 1577808000000（过去时间=仅手动）、status=空闲。
+# 本步骤为非致命：失败只记日志/告警，不回滚已合并代码、不阻塞后续 hook 部署与 fork 推送。
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+RESTORE_OUT="$LOG_DIR/restore-$(date '+%Y-%m-%d-%H-%M-%S').json"
+if [ -f "$SELF_DIR/restore-disabled.js" ]; then
+  QL_DATA_DIR="$DATA" QL_SCRIPT_REPO="$REPO" \
+    node "$SELF_DIR/restore-disabled.js" "$LOCAL_HEAD" --repo "$REPO" --db "$DATA/db/database.sqlite" --out "$RESTORE_OUT" \
+    || echo "[updater] restore-disabled 非零退出码（详见 $RESTORE_OUT），继续部署"
+else
+  echo "[updater] 未找到 restore-disabled.js，跳过后置恢复步骤"
+fi
+
 chmod 0755 "$REPO/tools/qlrun" "$REPO/tools/qlrun-launcher" "$REPO/tools/qlall.js" "$REPO/tools/qlall-launcher"
 cp "$REPO/tools/task-before.js" "$DATA/config/task_before.js"
 chmod 0600 "$DATA/config/task_before.js"

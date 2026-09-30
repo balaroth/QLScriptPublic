@@ -21,6 +21,21 @@ const FAIL = /取不到|失效|实人|人机验证|安全验证|拦截|滑块|�
 const QLRUN_SUCCESS = /\[QLRUN_RESULT\]\s+SUCCESS(?:\s|$)/;
 const QLRUN_FAILURE = /\[QLRUN_RESULT\]\s+FAILURE(?:\s|$)/;
 
+// —— 修复版归因信号（2026-09-30 53项误判审计）——
+// 设计原则：优先结构化结果；其次服务器“已签到/幂等终态”权威结论；
+// 空跑(无账号/未配变量)与业务受限(活动结束/地理围栏/需广告)归 skip，既不算成功也不算失败；
+// 凡未被上述“明确终态”命中的，一律回落严格失败判定，不放宽，绝不拿模糊成功词掩盖真实失败。
+// 服务器已确认“今天签到动作已完成/无需再签”的幂等终态
+const CORE_SIGNIN_OK = /今日已签到|已经签到|请勿重复打卡|重复打卡|已达最大参与次数|已达签到上限|次数已达到?上限|签到完成|签到[0-9]?成功|今日广告签到已完成|每日任务完成|领工作奖励[^\n]*完成|今日已抽奖/;
+// 登录/账号在“发起签到之前”就已不可用（真失败，幂等成功不能覆盖）
+const PRE_LOGIN_FAIL = /Bad Auth|AccessToken无效|accessToken is illegal|accessToken\s+illegal|未登录|需要登录|去登录|necessaryloginerror|NO_TOKEN|NO_MOBILE|invalid session|会话失效|登录失效|登录失败|未完成升级|未完成注册|用户不存在|信息获取失败|登录响应未返回\s*token|未返回\s*token/;
+// 网络/依赖/服务端真故障
+const INFRA_FAIL = /timeout of \d+\s*ms exceeded|HTTP\s*4\d\d|HTTP\s*5\d\d|HTTPError: Response code 4\d\d|WAF拦截|CERT_HAS_EXPIRED|MODULE_NOT_FOUND|Cannot find module|<title>40[0-9]<\/title>|<title>50[0-9]<\/title>/;
+// 空跑：本就没有可执行的账号/凭据（不是签到失败）
+const EMPTY_RUN = /共找到\s*0\s*个账号|未设置[^\n]*环境变量|未找到[^\n]*环境变量|未找到任何账号信息|未添加[^\n]*变量|变量值格式应为|未配置[^\n]*账号/;
+// 业务受限/活动终态（脚本正常跑完，只是今天无可签或平台限制）
+const PLATFORM_SKIP = /任务需要跳转\/广告，跳过|运行态校验拦截|当前无每日签到活动|活动已结束|活动未开启|未开启签到|当前距离不在门店签到范围内|非会员跳过|会员级别不能签到|门店未开启签到|未查询到每日额度|未找到签到\/每日任务/;
+
 function ts() { return new Date().toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" }); }
 
 // 业务脚本发现：递归收集可直接运行的入口脚本，排除库/备份/资源
@@ -45,10 +60,32 @@ function discover() {
 
 function judge(text, exitCode = 0) {
     const clean = text.split("\n").filter((l) => !NOISE.test(l)).join("\n");
-    if (exitCode !== 0) return "fail";
+    // —— 优先级（高→低）——
+    // 1) 结构化失败契约：脚本自报 FAILURE，任何成功词都不能覆盖
     if (QLRUN_FAILURE.test(clean)) return "fail";
+    // 2) 非零退出 = 进程自报失败，恢复原 qlall “非零退出优先失败”口径
+    if (exitCode !== 0) return "fail";
+    // 3) 结构化成功契约：脚本自报 SUCCESS，优先于模糊文本失败词
     if (QLRUN_SUCCESS.test(clean)) return "ok";
-    // 未升级到结构化结果的旧脚本仍保持失败信号优先。
+
+    const emptyRun = EMPTY_RUN.test(clean);
+    const coreOk = CORE_SIGNIN_OK.test(clean);
+    const preLoginFail = PRE_LOGIN_FAIL.test(clean);
+    const infraFail = INFRA_FAIL.test(clean);
+    const platSkip = PLATFORM_SKIP.test(clean);
+
+    // 4) 硬故障优先：登录态在签到前已坏，或网络/依赖/服务端故障。
+    //    只要命中，既不被“今日已签到”等成功词覆盖，也不被“未配置变量”误判为空跑。
+    if (preLoginFail || infraFail) return "fail";
+    // 5) 空跑：无账号/未配变量/变量格式错（能走到这里说明无硬故障）—— 不是签到失败
+    if (emptyRun && !coreOk) return "skip";
+    // 6) 权威幂等成功：服务端已确认今天签过/无需再签（能走到这里说明无硬故障）。
+    //    同段的“发贴过频/拉帖子列表-40001”等子任务噪音不影响签到终态；
+    //    但 HTTP 4xx/5xx/WAF/模块缺失等硬故障已在第 4 步拦截。
+    if (coreOk) return "ok";
+    // 7) 业务受限终态（活动结束/未开启/地理围栏/需广告跳转/平台运行态校验），且无硬故障 —— 不算失败
+    if (platSkip) return "skip";
+    // 8) 其余回落原有严格判定，不放宽
     if (FAIL.test(clean)) return "fail";
     if (SUCC.test(clean)) return "ok";
     return "unknown";
@@ -257,13 +294,14 @@ async function sendSummary(report, totalMs) {
         const tools = path.join(REPO, "tools", "sendNotify.js");
         const { sendNotify } = require(tools);
         const okN = report.filter((r) => r.verdict === "ok").length;
-        // “无法判定”一律按失败统计（用户口径）
-        const failed = report.filter((r) => r.verdict !== "ok");
+        const skipN = report.filter((r) => r.verdict === "skip").length;
+        // 失败口径：仅 verdict==="fail"（unknown 已在主循环归并；skip 为无账号/活动终态，不计失败）
+        const failed = report.filter((r) => r.verdict === "fail");
         const failN = failed.length;
         const unkN = report.filter((r) => r.wasUnknown).length;
         const mins = Math.round(totalMs / 60000);
         let desp = `<p>统一签到执行完成（北京时间 ${ts()}，耗时约 ${mins} 分钟）</p>`;
-        desp += `<p>共 <b>${report.length}</b> 个脚本：<span style="color:green">成功 ${okN}</span> ｜ <span style="color:red">失败 ${failN}</span>`;
+        desp += `<p>共 <b>${report.length}</b> 个脚本：<span style="color:green">成功 ${okN}</span> ｜ <span style="color:red">失败 ${failN}</span> ｜ <span style="color:#888">跳过/空跑 ${skipN}</span>`;
         if (unkN) desp += `（其中 <b>${unkN}</b> 个无明确成功结论，已按失败计）`;
         desp += `</p>`;
         if (failN) {
@@ -284,6 +322,16 @@ async function sendSummary(report, totalMs) {
                 desp += `<details style="margin:6px 0;border:1px solid #ddd;border-radius:4px;padding:6px"><summary style="cursor:pointer;font-weight:600">${esc(r.name)}（${r.wasUnknown ? "未判定" : "失败"}，尝试 ${r.attempts} 次）</summary>`;
                 desp += `<pre style="white-space:pre-wrap;word-break:break-all;font-size:12px;background:#f7f7f7;padding:8px;border-radius:4px;max-height:480px;overflow:auto">${esc(cleanFullLog(r.lastText))}</pre></details>`;
             }
+        }
+        if (skipN) {
+            const skipped = report.filter((r) => r.verdict === "skip");
+            desp += `<details style="margin:8px 0"><summary style="cursor:pointer;color:#666">跳过/空跑明细（${skipN}，未配置账号/变量或活动已结束，不计失败）</summary>`;
+            desp += `<ul style="font-size:12px;color:#666">`;
+            for (const r of skipped) {
+                const key = (r.lastText || "").split("\n").map((x) => x.trim()).filter(Boolean).slice(-1)[0] || "";
+                desp += `<li>${esc(r.name)}：${esc(key.slice(0, 120))}</li>`;
+            }
+            desp += `</ul></details>`;
         }
         desp += `<hr><div style="color:#888;font-size:12px">本邮件由统一签到执行器 qlall 在全部脚本执行完成后汇总发送，单个脚本不再单独发信；无明确成功结论的任务已统一按失败统计并附完整日志。</div>`;
         await sendNotify(`【青龙签到汇总】成功${okN} 失败${failN} 共${report.length}`, desp, {});
@@ -329,10 +377,11 @@ async function sendSummary(report, totalMs) {
             attempts = a;
             console.log(`[qlall] (${i + 1}/${rels.length}) 第${a}次 ${name}`);
             result = await runOnce(rel, taskId);
-            if (result.verdict === "ok") break;
+            // 成功或空跑/业务受限终态(skip)都无需重试
+            if (result.verdict === "ok" || result.verdict === "skip") break;
             if (a < ATTEMPTS) await sleep(RETRY_GAP_MS);
         }
-        // 无明确成功结论（unknown）按失败口径，但保留来源标记用于汇总区分
+        // 无明确成功结论（unknown）按失败口径，但保留来源标记用于汇总区分；skip 保持不动
         const wasUnknown = result.verdict === "unknown";
         if (wasUnknown) result.verdict = "fail";
         await markSubState(taskId, "idle");
@@ -341,9 +390,10 @@ async function sendSummary(report, totalMs) {
         console.log(`[qlall] ${name} => ${r.verdict}（尝试 ${attempts} 次）`);
     }
     const okN = report.filter((r) => r.verdict === "ok").length;
-    const failN = report.filter((r) => r.verdict !== "ok").length;
-    fs.writeFileSync(path.join(STATE_DIR, "last-summary.json"), JSON.stringify({ time: ts(), total: report.length, ok: okN, fail: failN, report }, null, 1));
-    console.log(`[qlall] 全部完成：成功 ${okN} / 失败(含未判定) ${failN}，共 ${report.length}`);
+    const skipN = report.filter((r) => r.verdict === "skip").length;
+    const failN = report.filter((r) => r.verdict === "fail").length;
+    fs.writeFileSync(path.join(STATE_DIR, "last-summary.json"), JSON.stringify({ time: ts(), total: report.length, ok: okN, fail: failN, skip: skipN, report }, null, 1));
+    console.log(`[qlall] 全部完成：成功 ${okN} / 失败 ${failN} / 跳过空跑 ${skipN}，共 ${report.length}`);
     if (!stopped && failN > 0 && process.env.QL_NO_MAIL !== '1') {
         await sendSummary(report, Date.now() - start);
     } else if (stopped) {

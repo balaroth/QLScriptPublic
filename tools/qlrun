@@ -120,6 +120,10 @@ while [ $ATT -lt $ATTEMPTS ]; do
     cat "$OUT"
 
     FAIL=1
+    NO_RETRY=0
+    if grep -aqE '\[QLRUN_RESULT\][[:space:]]+FAILURE.*retryable=0([[:space:]]|$)' "$OUT"; then
+        NO_RETRY=1
+    fi
     if [ $RC -eq 0 ]; then
         is_business_fail "$OUT"
         VERDICT=$?
@@ -143,6 +147,10 @@ while [ $ATT -lt $ATTEMPTS ]; do
         break
     fi
     FINAL=1
+    if [ $NO_RETRY -eq 1 ]; then
+        echo "[$(TS)] [qlrun] 结构化结果标记 retryable=0，确定性失败不再重试"
+        break
+    fi
     if [ $ATT -lt $ATTEMPTS ]; then
         echo "[$(TS)] [qlrun] 第 ${ATT} 次业务失败，${RETRY_GAP}s 后重试…"
         sleep $RETRY_GAP

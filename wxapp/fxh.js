@@ -216,6 +216,11 @@ class Task {
             await this.queryPoints();
         } catch (e) {
             this.log(`执行失败: ${e.message || e}`);
+            // 品牌 BFF 登录被 WAF 拦（HTTP 403 / WAF拦截页面），属上游反爬，d4 code 通道本身正常。
+            // 直连重试不会通过 → 结构化 FAILURE retryable=0，避免 qlall 同轮 3 次空跑。
+            if (/403|WAF|拦截/i.test(String(e.message || e))) {
+                this.log(`[QLRUN_RESULT] FAILURE reason=fxh_bff_waf_403 retryable=0`);
+            }
         }
     }
 }

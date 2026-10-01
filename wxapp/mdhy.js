@@ -302,6 +302,11 @@ class Task {
             return this.sign(false);
         }
         if (r2 && r2.msg && !this.signed) this.log(`⚠️ 签到2未成功: ${r2.msg}`);
+        // 业务侧返回"用户不存在"（微信 openid 未在活动侧注册/绑定），非 authErr、重登无效。
+        // 结构化 FAILURE retryable=0，避免 qlall 同轮 3 次空跑。
+        if (r2 && /用户不存在|未注册|不存在|用户未找到/.test(String(r2.msg))) {
+            this.log(`[QLRUN_RESULT] FAILURE reason=mdhy_user_not_exist retryable=0`);
+        }
         const ui = await this.getUserInfo();
         if (ui) this.log(`当前成长值/积分: ${ui.points}`);
     }

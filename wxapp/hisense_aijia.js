@@ -635,7 +635,7 @@ class Task {
     }
   }
 
-  async run() {
+  async run(isRetry = false) {
     try {
       await this.ensureLogin();
       $.log(`账号[${this.index}] 登录态: customerId=${mask(this.customerId)} token=${mask(this.accessToken)}`);
@@ -647,7 +647,16 @@ class Task {
       await this.signIn(taskId, status);
       await this.queryPoints();
     } catch (e) {
-      $.log(`账号[${this.index}] 运行失败: ${e.message || e}`);
+      // accessToken 失效（028012 / AccessToken无效 / accessToken is illegal）：
+      // ensureLogin 因缓存里有 accessToken 而短路、从不刷新；这里检测到 token 错误就用
+      // refreshToken 刷新一次并重放整轮（仅一次，避免递归）。无 refreshToken 配置则保持真实失败。
+      const msg = String(e.message || e);
+      if (!isRetry && /028012|AccessToken无效|accessToken is illegal|token.*invalid|illegal|未登录|登录失效|失效/i.test(msg)) {
+        $.log(`账号[${this.index}] 检测到 accessToken 失效，尝试 refreshToken 刷新后重试一次`);
+        if (await this.refreshAccessToken()) return this.run(true);
+        $.log(`账号[${this.index}] refreshToken 不可用（账号未配置 refreshToken），保持真实失败`);
+      }
+      $.log(`账号[${this.index}] 运行失败: ${msg}`);
     }
   }
 }

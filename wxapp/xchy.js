@@ -256,6 +256,17 @@ class Task {
         if (code === 404002 || /未满足当前活动参与条件/.test(message)) {
             return this.log(`⚠️ 签到被携程运行态校验(风控)拦截：${message || code}（登录/状态查询正常，写操作需运行态私有签名，无法绕过）`);
         }
+        // 404001「未登录」：携程业务码，HTTP 200 + Ack=Success 时会被下方 okResponseStatus 分支当成
+        // 正常返回直接打印，导致缓存 cticket 失效却不触发重登。显式在此拦截并刷新 ticket 重试一次。
+        if (code === 404001 || /未登录|登录失效|请重新登录/.test(message)) {
+            if (retry) {
+                this.log("会话失效(404001 未登录)，重新登录后重试");
+                this.ticket = ""; delete readCache()[this.openid];
+                await this.login();
+                return this.sign(false);
+            }
+            return this.log(`❌ 签到失败：${message || code}`);
+        }
         if (okResponseStatus(d)) {
             return this.log(`签到返回：${short(res.text, 500)}`);
         }

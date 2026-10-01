@@ -68,6 +68,11 @@ class Task {
             $.log(`🌸账号[${this.index}]` + `🕊签到成功🎉`);
         } else {
             $.log(`🌸账号[${this.index}] 签到-失败:${result.msg}❌`)
+            // QWHD_SESSION_TOKEN cookie 过期，脚本无自动登录路径，只能人工重抓。
+            // 命中登录类报错即结构化 FAILURE retryable=0，避免 qlall 同轮 3 次空跑。
+            if (/登录|登陆|未登录|去登录|凭证|失效|会话过期/i.test(String(result.msg))) {
+                $.log(`[QLRUN_RESULT] FAILURE reason=chinaMobile_cookie_expired retryable=0`)
+            }
         }
 
 

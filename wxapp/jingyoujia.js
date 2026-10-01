@@ -76,27 +76,33 @@ class Task {
     }
 
     async run() {
-        const cached = this.getCachedToken();
-        if (cached) {
-            this.applyToken(cached);
-            $.log(`账号[${this.index}] 使用缓存token`);
-            if (!(await this.checkToken())) {
-                this.removeCachedToken();
-                $.log(`账号[${this.index}] 缓存token失效，重新登录`);
+        try {
+            const cached = this.getCachedToken();
+            if (cached) {
+                this.applyToken(cached);
+                $.log(`账号[${this.index}] 使用缓存token`);
+                if (!(await this.checkToken())) {
+                    this.removeCachedToken();
+                    $.log(`账号[${this.index}] 缓存token失效，重新登录`);
+                }
             }
-        }
 
-        if (!this.token) {
-            await this.loginByWxCode();
-            if (!this.token) return;
-        }
+            if (!this.token) {
+                await this.loginByWxCode();
+                if (!this.token) return;
+            }
 
-        await this.getCustomerDetails();
-        await this.getIntegral();
-        await this.findCheckTask();
-        await this.queryRecord();
-        await this.signIn();
-        await this.getIntegral();
+            await this.getCustomerDetails();
+            await this.getIntegral();
+            await this.findCheckTask();
+            await this.queryRecord();
+            await this.signIn();
+            await this.getIntegral();
+            this.outcome = this.outcome || "fail";
+        } catch (e) {
+            this.outcome = "error";
+            $.log(`账号[${this.index}] 运行失败: ${e.message || e}`);
+        }
     }
 
     getCachedToken() {
@@ -223,6 +229,8 @@ class Task {
         try {
             const data = await this.request({ apiPath: "/app/jingyoujia/taskContinuousRecord/findCheckTask" });
             if (!data || !data.id) {
+                // 账号正常、服务端当前无连续签到活动：确定性不可完成，按二分类口径记为不可重试失败。
+                this.outcome = "no-task";
                 $.log(`账号[${this.index}] 当前无签到活动`);
                 return;
             }
@@ -253,6 +261,7 @@ class Task {
         if (!this.task?.id) return;
         if (this.record?.todayFinish) {
             $.log(`账号[${this.index}] 今日已签到`);
+            this.outcome = "ok";
             return;
         }
         try {
@@ -265,11 +274,13 @@ class Task {
             });
             const integral = data?.currentSignIntegral ?? data?.integral ?? "";
             $.log(`账号[${this.index}] 签到成功${integral !== "" ? `: +${integral}积分` : ""}`);
+            this.outcome = "ok";
             await this.finishTask();
         } catch (e) {
             const message = String(e.message || e);
             if (/已签到|重复|todayFinish/.test(message)) {
                 $.log(`账号[${this.index}] 今日已签到`);
+                this.outcome = "ok";
                 return;
             }
             if (/20230529|captcha|验证码|滑块/.test(message)) {
@@ -300,8 +311,23 @@ class Task {
 
 !(async () => {
     $.checkEnv(ckName);
+    let success = 0;
+    let failed = 0;
+    let retryable = true;
     for (const account of $.userList) {
-        await new Task(account).run();
+        const t = new Task(account);
+        await t.run();
+        if (t.outcome === "ok") success++;
+        else {
+            failed++;
+            // 无签到活动为确定性不可完成（当日重试无效），不可重试；其余运行错误保留可重试。
+            if (t.outcome === "no-task") retryable = false;
+        }
+    }
+    if (failed === 0 && success === $.userCount) {
+        $.log(`[QLRUN_RESULT] SUCCESS core=${success}/${$.userCount}`);
+    } else {
+        $.log(`[QLRUN_RESULT] FAILURE retryable=${retryable ? 1 : 0} core=${success}/${$.userCount} failed=${failed}`);
     }
 })()
     .catch((e) => $.log(e.message || e))

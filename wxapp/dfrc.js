@@ -220,7 +220,9 @@ class Task {
         const msg = res.message || res.msg || short(res);
         if (code === 10000) return this.log(`✅ 签到成功`);
         if (code === 10010 || /已签|签到过|重复|已有签到/.test(String(msg))) return this.log(`✅ 今日已签到（${msg}）`);
-        if (retry && /token|登录|未授权|失效|过期|未登录|鉴权|unauth|invalid/i.test(String(msg)) || res.code === 401 || res.status === 401) {
+        // "Bad Auth"（东风日产 wxapi JWT 网关鉴权拒绝）此前未命中中文/401 判据，缓存 JWT 失效时
+        // 直接判签到失败而不触发 code→login 重登；补入 bad auth 让既有重登路径生效。
+        if (retry && /token|登录|未授权|失效|过期|未登录|鉴权|unauth|invalid|bad auth/i.test(String(msg)) || res.code === 401 || res.status === 401) {
             this.log("会话失效，重新登录后重试");
             this.token = ""; this.apiToken = ""; this.oneid = "";
             await this.login();

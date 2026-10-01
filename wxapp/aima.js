@@ -243,7 +243,15 @@ async function signIn(account, index) {
     const point = joinRes.data.content?.point || joinRes.data.content?.points || 0;
     $.log(`🎉 账号【${index}】签到成功！${point ? `获得 ${point} 积分` : ""}`);
   } else {
-    throw new Error(`签到失败: HTTP ${joinRes.status} ${JSON.stringify(joinRes.data)}`);
+    const body = joinRes.data;
+    const err = new Error(`签到失败: HTTP ${joinRes.status} ${JSON.stringify(body)}`);
+    // 品牌服务端明确活动未开始（910103 / MKT_ACTIVITY_NOT_BEGIN）：账号正常、服务端活动未开放，
+    // 重试/重登在当日窗口内不可能改变结果，标记为不可重试终态。
+    if (body?.code === 910103 || /MKT_ACTIVITY_NOT_BEGIN|活动未开始/.test(JSON.stringify(body))) {
+      err.terminal = "activity-not-begin";
+      err.retryable = false;
+    }
+    throw err;
   }
 }
 
@@ -266,15 +274,26 @@ async function signIn(account, index) {
 
   console.log(`共找到${accounts.length}个账号`);
 
+  let success = 0;
+  let failed = 0;
+  let retryable = true;
   for (let i = 0; i < accounts.length; i++) {
     try {
       console.log(`\n🚀 user:【${i + 1}】 start work`);
       await signIn(accounts[i], i + 1);
+      success++;
     } catch (e) {
+      failed++;
+      if (e && e.retryable === false) retryable = false;
       console.log(`❌ 账号【${i + 1}】执行失败: ${e.message}`);
     }
   }
 
+  if (failed === 0 && success === accounts.length) {
+    console.log(`[QLRUN_RESULT] SUCCESS core=${success}/${accounts.length}`);
+  } else {
+    console.log(`[QLRUN_RESULT] FAILURE retryable=${retryable ? 1 : 0} core=${success}/${accounts.length} failed=${failed}`);
+  }
   // await $.sendMsg($.logs.join("\n"));
 })()
   .catch((e) => console.log(e))

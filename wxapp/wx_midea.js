@@ -150,17 +150,16 @@ class UserInfo {
             //console.log(options);
             //result = JSON.parse(result);
             //console.log(result);
-            console.log(`✅${options.fn}成功🎉`);
-            msg += `✅${options.fn}成功🎉\n` + JSON.stringify(result);
-            console.log(JSON.stringify(result));
-            /*if (result["errcode"] == 0) {
+            // 修复：原实现无条件打印"✅签到2成功"（成功判断被注释掉），在请求 403/errcode!=0 时产生假成功信号，
+            // 会被 qlall SUCC 正则误判为成功。恢复按 errcode==0 判定。
+            if (result && result["errcode"] == 0) {
                 console.log(`✅${options.fn}成功🎉`);
                 msg += `✅${options.fn}成功🎉\n`;
             } else {
                 console.log(`❌${options.fn}失败`);
                 msg += `❌${options.fn}失败\n`;
                 console.log(JSON.stringify(result));
-            }*/
+            }
         } catch (e) {
             console.log(e);
         }

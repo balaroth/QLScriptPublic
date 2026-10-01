@@ -137,6 +137,11 @@ class Task {
         }
         if (/已签|已领|签到过|重复|已完成/.test(String(msg))) return this.log(`✅ 今日已签到（${msg}）`);
         this.log(`❌ 签到失败: ${msg}`);
+        // 上游业务网关返回 405 / HTML 错误页（Alibaba spm），接口或方法已变更，脚本侧不可恢复。
+        // 结构化 FAILURE retryable=0，避免 qlall 同轮 3 次空跑。
+        if (/405|<!doctype|<html|data-spm|method not allowed/i.test(String(msg))) {
+            this.log(`[QLRUN_RESULT] FAILURE reason=jtc_upstream_405 retryable=0`);
+        }
     }
     async ensureLogin() {
         const cached = readCache()[this.account.openid] || {};

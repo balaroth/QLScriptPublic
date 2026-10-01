@@ -111,6 +111,9 @@ class Task {
             let { data: res } = await axios.request(options);
             if (res.success == true) {
                 $.log(`签到成功 获得【${res.point}】快乐瓶`)
+            } else if (res && /已签到|重复签到|请勿重复|已经签/.test(String(res.message || res.msg || ""))) {
+                // 幂等终态：服务端已确认今日签过，不应误报为"签到失败"
+                $.log(`今日已签到，无需重复签到（${res.message}）`)
             } else {
                 $.log(`签到失败`)
                 console.log(res);

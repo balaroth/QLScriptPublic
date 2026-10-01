@@ -487,6 +487,12 @@ class Task {
       return true;
     } catch (e) {
       $.log(`账号[${this.index}] 签到失败: ${e.message || e}`);
+      const m = String(e.message || e);
+      // dailySign encryptData 校验被拒（用户信息异常）：withEncryptHint 内已强刷习酒密钥并重试过一次仍失败，
+      // 属上游 garden 签名校验问题，同轮立即重试无意义 → 结构化 FAILURE retryable=0，避免 qlall 3 次空跑。
+      if (/用户信息异常|encryptData 校验失败|请删除小程序|请从小程序重新进入/.test(m)) {
+        $.log(`[QLRUN_RESULT] FAILURE reason=junpinhui_encryptdata_rejected retryable=0`);
+      }
       return false;
     }
   }

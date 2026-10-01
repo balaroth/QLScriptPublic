@@ -207,13 +207,19 @@ class Task {
     async run() {
         if (!this.account.openid) {
             this.log("跳过：变量值里没有 openid");
+            this.outcome = "skip-openid";
             return;
         }
         try {
             await this.ensureLogin();
             await this.queryUser();
             await this.sign();
+            this.outcome = "ok";
         } catch (e) {
+            this.outcome = "fail";
+            // 品牌服务端 TLS 证书过期 / 网关上游故障（CERT_HAS_EXPIRED、robustForward、502/503）：
+            // 账号与脚本均正常，不可由重试自愈，标记为不可重试终态。
+            this.terminal = /CERT_HAS_EXPIRED|robustForward|HTTP 50[23]/.test(String((e && e.message) || e));
             this.log(`执行失败: ${e.message || e}`);
         }
     }
@@ -222,12 +228,23 @@ class Task {
 !(async () => {
     $.checkEnv(ckName);
     if (!$.userCount) {
-        $.log(`未找到变量 ${ckName}`);
+        $.log(`[QLRUN_RESULT] FAILURE retryable=0 reason=no-account detail=未找到变量 ${ckName}`);
         return;
     }
+    let success = 0;
+    let failed = 0;
+    let retryable = true;
     for (let i = 0; i < $.userList.length; i++) {
-        await new Task($.userList[i]).run();
+        const t = new Task($.userList[i]);
+        await t.run();
+        if (t.outcome === "ok") success++;
+        else if (t.outcome === "fail") { failed++; if (t.terminal) retryable = false; }
         if (i < $.userList.length - 1) await $.wait(1500, 3000);
+    }
+    if (failed === 0 && success === $.userCount) {
+        $.log(`[QLRUN_RESULT] SUCCESS core=${success}/${$.userCount}`);
+    } else {
+        $.log(`[QLRUN_RESULT] FAILURE retryable=${retryable ? 1 : 0} core=${success}/${$.userCount} failed=${failed}`);
     }
 })()
     .catch((e) => $.log(e.message || e))

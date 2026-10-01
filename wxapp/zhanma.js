@@ -175,6 +175,11 @@ async function getuser(timeout = 2 * 1000) {
                 } else {
 
                     console.log(`信息获取失败请检查`)
+                    // safe token 过期（necessaryloginerror/需要登录），脚本无 code→login 路径，只能人工重取。
+                    // 命中即结构化 FAILURE retryable=0，避免 qlall 同轮 3 次空跑。
+                    if (/necessaryloginerror|需要登录|未登录|not.?login/i.test(JSON.stringify(result))) {
+                        console.log(`[QLRUN_RESULT] FAILURE reason=zhanma_safe_token_expired retryable=0`)
+                    }
 
                 }
 

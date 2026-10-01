@@ -12,6 +12,16 @@ const Notify = 0; //0为关闭通知，1为打开通知,未添加
 const debug = 0; //0为关闭调试，1为打开调试,默认为0
 const ganta = 1; //0为关闭饲料互助，1为打开互助,默认为1
 const addFriend = 1; //0为关闭加好友，1为打开加好友,默认为1
+const axios = $.isNode() ? require('axios') : null;
+const fs = $.isNode() ? require('fs') : null;
+const path = $.isNode() ? require('path') : null;
+const ZHANMA_APPID = 'wx94dca6ef07a54c55';
+const ZHANMA_SESSION_HEADER = 'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025';
+const ZHANMA_LEGACY_SKEY = 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp';
+const ZHANMA_API = 'https://warhorsechina.cojoy.com.cn/app/api';
+const ZHANMA_CACHE = process.env.ZHANMA_SESSION_CACHE || '/ql/data/config/zhanma-session.json';
+const WX_SERVER = (process.env.wx_server_url || 'http://d4.dqf.cc.cd:8787').replace(/\/+$/, '');
+const WX_AUTH = process.env.wx_auth || '';
 //////////////////////////////////////////////////////////////////
 let zmnlxq = process.env.zmnlxq;
 let zmnlxqArr = [];
@@ -21,7 +31,13 @@ let data = '';
 let msg = '';
 let Version = "1.0.0";
 let VersionLatest = '';
-let ok = ''
+let ok = '';
+let currentAccountIndex = 0;
+let zhanmaSkey = ZHANMA_LEGACY_SKEY;
+let sessionState = [];
+let envAccountKeys = [];
+let coreSuccess = 0;
+let failureRetryable = 0;
 
 
 !(async () => {
@@ -40,7 +56,9 @@ let ok = ''
         console.log(`\n=================== 共找到 ${zmnlxqArr.length} 个账号 ===================`)
         if (addFriend) {
             for (let index = 0; index < zmnlxqArr.length; index++) {
-                zmnlxq = zmnlxqArr[index]
+                currentAccountIndex = index;
+                zmnlxq = zmnlxqArr[index];
+                zhanmaSkey = sessionState[index]?.skey || ZHANMA_LEGACY_SKEY;
                 console.log('去加好友');
                 await $.wait(200);
                 for (let index2 = 0; index2 < zmnlxqArr.length; index2++) {
@@ -54,7 +72,10 @@ let ok = ''
 
         for (let index = 0; index < zmnlxqArr.length; index++) {
             let num = index + 1
-            zmnlxq = zmnlxqArr[index]
+            currentAccountIndex = index;
+            zmnlxq = zmnlxqArr[index];
+            zhanmaSkey = sessionState[index]?.skey || ZHANMA_LEGACY_SKEY;
+            ok = 0;
             console.log(`\n========= 开始【第 ${num} 个账号】执行任务=========\n`)
             //      data = zmnlxqArr[index].split('&');    
 
@@ -63,6 +84,7 @@ let ok = ''
             await $.wait(2 * 1000);
 
             if (ok == 1) {
+                coreSuccess++;
                 console.log('开始签到');
                 await $.wait(2 * 1000);
                 await checkin();
@@ -104,7 +126,9 @@ let ok = ''
         if (ganta) {
             for (let index = 0; index < zmnlxqArr.length; index++) {
                 let num = index + 1
-                zmnlxq = zmnlxqArr[index]
+                currentAccountIndex = index;
+                zmnlxq = zmnlxqArr[index];
+                zhanmaSkey = sessionState[index]?.skey || ZHANMA_LEGACY_SKEY;
                 console.log(`\n========= 开始【第 ${num} 个账号】执行饲料互助=========\n`)
                 let isCompletedTousiliao = false, isCompletedSongsiliao = false;
                 for (let num2 = 0; num2 < totalAccountsfrinds.length; num2++) {
@@ -126,6 +150,11 @@ let ok = ''
             }
         }
 
+        if (coreSuccess === zmnlxqArr.length) {
+            console.log(`[QLRUN_RESULT] SUCCESS core=${coreSuccess}/${zmnlxqArr.length}`);
+        } else {
+            console.log(`[QLRUN_RESULT] FAILURE reason=zhanma_core_failed retryable=${failureRetryable ? 1 : 0} core=${coreSuccess}/${zmnlxqArr.length}`);
+        }
         await SendMsg(msg);    // 与发送通知有关系
     }
 
@@ -137,24 +166,15 @@ let ok = ''
  * 获取信息
  * 
  */
-async function getuser(timeout = 2 * 1000) {
+async function getuser(timeout = 8 * 1000, allowRenew = true) {
     return new Promise((resolve) => {
         let url = {
-            url: `https://warhorsechina.cojoy.com.cn/app/api/custom/getusercenter?safe=${zmnlxq}`,
-            headers: {
-                'Host': 'warhorsechina.cojoy.com.cn',
-                'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
-            },
-            // body: '',     
-
+            url: `${ZHANMA_API}/custom/getusercenter?safe=${encodeURIComponent(zmnlxq)}`,
+            headers: zhanmaHeaders(),
         }
         $.get(url, async (error, response, data) => {
             try {
-                console.log(error)
-                console.log(data)
+                if (error) throw new Error(String(error));
                 result = JSON.parse(data)
                 if (result.status == 1) {
                     ok = 1;
@@ -172,24 +192,119 @@ async function getuser(timeout = 2 * 1000) {
                             console.log('未授权手机号，无法完善个人资料')
                         }
                     }
+                } else if (allowRenew && isLoginExpired(result)) {
+                    console.log('登录态已过期，自动获取手机号授权并刷新 safe+skey');
+                    await renewZhanmaSession(currentAccountIndex);
+                    await getuser(timeout, false);
                 } else {
-
-                    console.log(`信息获取失败请检查`)
-                    // safe token 过期（necessaryloginerror/需要登录），脚本无 code→login 路径，只能人工重取。
-                    // 命中即结构化 FAILURE retryable=0，避免 qlall 同轮 3 次空跑。
-                    if (/necessaryloginerror|需要登录|未登录|not.?login/i.test(JSON.stringify(result))) {
-                        console.log(`[QLRUN_RESULT] FAILURE reason=zhanma_safe_token_expired retryable=0`)
+                    console.log(`信息获取失败: ${result.msg || result.status || 'unknown'}`)
+                    if (isLoginExpired(result)) {
+                        console.log(`[QLRUN_RESULT] FAILURE reason=zhanma_session_refresh_failed retryable=1`)
                     }
-
                 }
-
             } catch (e) {
-                console.log(e)
+                failureRetryable = 1;
+                console.log(`战马信息获取/续期失败: ${e.message || e}`)
+                console.log(`[QLRUN_RESULT] FAILURE reason=zhanma_session_refresh_failed retryable=1`)
             } finally {
                 resolve();
             }
         }, timeout)
     })
+}
+
+function zhanmaHeaders(skey = zhanmaSkey) {
+    return {
+        'Host': 'warhorsechina.cojoy.com.cn',
+        'CUSTOMAPPID': ZHANMA_APPID,
+        [ZHANMA_SESSION_HEADER]: skey || ZHANMA_LEGACY_SKEY,
+        'user-agent': `Mozilla/5.0 (Linux; Android 10; wv) AppleWebKit/537.36 Mobile MicroMessenger/8.0 MiniProgramEnv/Android miniProgram/${ZHANMA_APPID}`
+    };
+}
+
+function isLoginExpired(value) {
+    return /necessaryloginerror|需要登录|未登录|not.?login/i.test(JSON.stringify(value || {}));
+}
+
+function loadSessionCache() {
+    if (!fs) return { sessions: [] };
+    try {
+        const value = JSON.parse(fs.readFileSync(ZHANMA_CACHE, 'utf8'));
+        return value && Array.isArray(value.sessions) ? value : { sessions: [] };
+    } catch (_) {
+        return { sessions: [] };
+    }
+}
+
+function saveSessionCache() {
+    if (!fs || !path) return;
+    const dir = path.dirname(ZHANMA_CACHE);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${ZHANMA_CACHE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, updatedAt: Date.now(), sessions: sessionState }, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, ZHANMA_CACHE);
+    try { fs.chmodSync(ZHANMA_CACHE, 0o600); } catch (_) {}
+}
+
+async function collectorPost(route, tag) {
+    if (!axios) throw new Error('axios unavailable');
+    if (!WX_AUTH) throw new Error('缺少 wx_auth');
+    const nonce = `${tag}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const response = await axios.post(`${WX_SERVER}${route}`, { appid: ZHANMA_APPID, openid: nonce }, {
+        headers: { auth: WX_AUTH, 'content-type': 'application/json' }, timeout: 135000, validateStatus: () => true
+    });
+    if (response.status !== 200 || !(response.data?.status || response.data?.ok)) {
+        throw new Error(`${route}失败: ${response.data?.message || `HTTP ${response.status}`}`);
+    }
+    return response.data;
+}
+
+async function renewZhanmaSession(index) {
+    const phone = await collectorPost('/wx/getphonenumber', 'zhanma-phone');
+    const phoneRaw = phone.raw || phone.data?.raw || {};
+    const encryptedData = phone.encryptedData || phoneRaw.encryptedData || '';
+    const iv = phone.iv || phoneRaw.iv || '';
+    if (!encryptedData || !iv) throw new Error('手机号授权结果缺少 encryptedData/iv');
+
+    const codeData = await collectorPost('/wx/code', 'zhanma-code');
+    const code = codeData.data?.code || codeData.code || '';
+    if (!code) throw new Error('wx_server 未返回登录 code');
+
+    const login = await axios.post(`${ZHANMA_API}/wxphonelogin`, { profile: {} }, {
+        headers: {
+            ...zhanmaHeaders(sessionState[index]?.skey || ZHANMA_LEGACY_SKEY),
+            'X-WX-Code': code,
+            'X-WX-Encrypted-Data': encryptedData,
+            'X-WX-IV': iv,
+            'Content-Type': 'application/json',
+            'Referer': `https://servicewechat.com/${ZHANMA_APPID}/182/page-frame.html`
+        },
+        timeout: 30000,
+        validateStatus: () => true
+    });
+    const session = login.data?.desc?.data || {};
+    const safe = String(session.f1safe || '');
+    const skey = String(session.skey || '');
+    if (login.status !== 200 || login.data?.status !== 'ok' || !safe || !skey) {
+        throw new Error(`wxphonelogin失败: ${typeof login.data?.desc === 'string' ? login.data.desc : login.data?.status || login.status}`);
+    }
+
+    const verify = await axios.get(`${ZHANMA_API}/custom/getusercenter`, {
+        params: { safe }, headers: zhanmaHeaders(skey), timeout: 30000, validateStatus: () => true
+    });
+    if (verify.status !== 200 || String(verify.data?.status) !== '1') {
+        throw new Error(`新会话验证失败: ${verify.data?.msg || verify.data?.status || verify.status}`);
+    }
+
+    sessionState[index] = {
+        sourceSafe: envAccountKeys[index], safe, skey,
+        type: session.type || 'weixin', expire: Number(session.expire || 0), updatedAt: Date.now()
+    };
+    zmnlxqArr[index] = safe;
+    zmnlxq = safe;
+    zhanmaSkey = skey;
+    saveSessionCache();
+    console.log(`自动登录成功，会话已持久化（expire=${sessionState[index].expire || 'unknown'}）`);
 }
 
 /**
@@ -203,8 +318,8 @@ function getTel(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -242,8 +357,8 @@ function checkin(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -281,8 +396,8 @@ function joinxcx(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -317,8 +432,8 @@ function getranklist(addFriend = false, fromsafe = '', timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -369,8 +484,8 @@ function getotherhorseinfo(likeUserId, timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -406,8 +521,8 @@ function like(likeUserId, timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -442,8 +557,8 @@ function getshare(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -478,8 +593,8 @@ function checkslgift(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -514,8 +629,8 @@ function saveuserinfo(avatar, nickname, sex, birthday, tel, timeout = 2 * 1000) 
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -550,8 +665,8 @@ function gzhkl(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -589,8 +704,8 @@ async function gettiku(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -644,8 +759,8 @@ function getques(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -677,8 +792,8 @@ function ques1(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -712,8 +827,8 @@ function ques2(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -749,8 +864,8 @@ function ques3(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -786,8 +901,8 @@ function getmaer(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -819,8 +934,8 @@ function getmoyimo(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -852,8 +967,8 @@ async function getweima(timeout = 2 * 1000) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -891,8 +1006,8 @@ function tousiliao(num2) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
         }
         $.get(url, async (error, response, data) => {
@@ -921,8 +1036,8 @@ function songsiliao(num2) {
             headers: {
                 'Host': 'warhorsechina.cojoy.com.cn',
                 'CUSTOMAPPID': 'wx94dca6ef07a54c55',
-                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': 'CjkFMAxsbtJ1VFO0xTbjwthRyAXEbyYgFNQWdUwgVY21PBcefkNbehUCWYBp',
-                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx532ecb3bdaaf92f9'
+                'cGvnZetrWSWfLcdYaN40mLdFx6ObkRltdZmhS5hQkgDbuZd9bLcQevwBVEjx-war-horse-zm-2025': zhanmaSkey,
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Build/QKQ1.190828.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/86.0.4240.99 XWEB/3235 MMWEBSDK/20220204 Mobile Safari/537.36 MMWEBID/6242 MicroMessenger/8.0.20.2080(0x28001435) Process/appbrand0 WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx94dca6ef07a54c55'
             },
             // body: '',     
 
@@ -983,7 +1098,18 @@ async function Envs() {
         return;
     }
 
-    return true;
+    zmnlxqArr = zmnlxqArr.map(item => String(item || '').trim()).filter(Boolean);
+    envAccountKeys = [...zmnlxqArr];
+    const cached = loadSessionCache();
+    sessionState = zmnlxqArr.map((sourceSafe, index) => {
+        const hit = cached.sessions?.[index];
+        if (hit && hit.sourceSafe === sourceSafe && hit.safe && hit.skey && (!hit.expire || Date.now() < hit.expire)) {
+            zmnlxqArr[index] = hit.safe;
+            return hit;
+        }
+        return { sourceSafe, safe: sourceSafe, skey: ZHANMA_LEGACY_SKEY };
+    });
+    return zmnlxqArr.length > 0;
 }
 
 // ============================================发送消息============================================ \\

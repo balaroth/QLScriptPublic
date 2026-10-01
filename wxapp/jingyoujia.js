@@ -228,8 +228,11 @@ class Task {
     async findCheckTask() {
         try {
             const data = await this.request({ apiPath: "/app/jingyoujia/taskContinuousRecord/findCheckTask" });
-            if (!data || !data.id) {
-                // 账号正常、服务端当前无连续签到活动：确定性不可完成，按二分类口径记为不可重试失败。
+            // 服务端只要返回活动配置（taskName/showIntegralConfigs）即视为有每日签到；
+            // 连续记录 id 在首次签到前恒为 null，不能用 data.id 判定有无活动（否则永远签不上）。
+            const hasTask = !!data && (data.id || data.taskName || (Array.isArray(data.showIntegralConfigs) && data.showIntegralConfigs.length));
+            if (!hasTask) {
+                // 账号正常、服务端当前确无签到活动：确定性不可完成，按二分类口径记为不可重试失败。
                 this.outcome = "no-task";
                 $.log(`账号[${this.index}] 当前无签到活动`);
                 return;
@@ -237,7 +240,7 @@ class Task {
             this.task = data;
             const start = String(data.startTime || "").slice(0, 10);
             const end = String(data.endTime || "").slice(0, 10);
-            $.log(`账号[${this.index}] 签到活动: taskId=${data.id}${start || end ? ` ${start}-${end}` : ""}`);
+            $.log(`账号[${this.index}] 签到活动: ${data.taskName || "每日签到"}${data.id ? ` taskId=${data.id}` : ""}${start || end ? ` ${start}-${end}` : ""}`);
         } catch (e) {
             $.log(`账号[${this.index}] 获取签到活动失败: ${e.message || e}`);
         }
@@ -258,7 +261,7 @@ class Task {
     }
 
     async signIn() {
-        if (!this.task?.id) return;
+        if (!this.task) return;
         if (this.record?.todayFinish) {
             $.log(`账号[${this.index}] 今日已签到`);
             this.outcome = "ok";

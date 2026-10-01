@@ -324,6 +324,12 @@ class Task {
       this.garden = null;
       await this.gardenLogin();
       res = await fn();
+      // 首次 401 已触发 garden 重登+重放；仅当重放后仍返回授权/登录类失败时，判定为确定性失败，
+      // 结构化 FAILURE retryable=0（同轮再试无意义）。不提前阻断首次 401 的重登。
+      const afterMsg = `${res?.message || ""}${res?.msg || ""}`;
+      if (!okCode(res) && /授权已过期|授权失效|登录已过期|登录失效|未登录/.test(afterMsg)) {
+        $.log(`[QLRUN_RESULT] FAILURE reason=junpinhui_garden_auth_expired_after_relogin retryable=0`);
+      }
     }
     return res;
   }

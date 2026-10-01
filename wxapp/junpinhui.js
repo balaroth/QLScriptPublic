@@ -365,14 +365,19 @@ class Task {
   }
 
   async gardenGet(urlPath, params = {}) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    // gateway 冷会话预热实测约 18 秒；GET 为幂等读取，可在 30 秒窗口内轮询。
+    // 不把该策略用于 POST，避免签到/农场写操作被重复提交。
+    const warmupDelays = [5500, 6500, 7500, 8500];
+    for (let attempt = 0; attempt <= warmupDelays.length; attempt++) {
       const res = await this.withRelogin(async () =>
         request("get", GARDEN_BASE, urlPath, { hdrs: gardenHeaders(await this.ensureGarden()), params })
       );
       const msg = `${res?.message || ""}${res?.msg || ""}`;
-      if (okCode(res) || attempt >= 2 || !/会话预热中|请\s*5\s*秒后重试/.test(msg)) return assertOk(res, urlPath);
-      $.log(`账号[${this.index}] ${urlPath} 会话预热中，5.5秒后重试`);
-      await new Promise((resolve) => setTimeout(resolve, 5500));
+      const warming = /会话预热中|请\s*5\s*秒后重试/.test(msg);
+      if (okCode(res) || !warming || attempt >= warmupDelays.length) return assertOk(res, urlPath);
+      const delay = warmupDelays[attempt];
+      $.log(`账号[${this.index}] ${urlPath} 会话预热中，${(delay / 1000).toFixed(1)}秒后重试(${attempt + 1}/${warmupDelays.length})`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
 

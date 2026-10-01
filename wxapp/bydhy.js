@@ -153,17 +153,21 @@ class Task {
         const msg = res?.msg || res?.message || "";
         if (ret === 0) {
             const d = res.data || {};
-            return this.log(`✅ 签到成功${d.integral !== undefined ? `，积分 ${d.integral}` : ""}${d.continuous !== undefined ? `，连续 ${d.continuous} 天` : ""}${msg ? `（${msg}）` : ""}`);
+            this.log(`✅ 签到成功${d.integral !== undefined ? `，积分 ${d.integral}` : ""}${d.continuous !== undefined ? `，连续 ${d.continuous} 天` : ""}${msg ? `（${msg}）` : ""}`);
+            return true;
         }
-        if (/已签|签到过|重复|已完成/.test(msg)) return this.log(`✅ 今日已签到（${msg}）`);
-        if (ret === 50010) return this.log(`⚠️ 该微信号的比亚迪账号未完成升级/注册（${msg}），需先在比亚迪App里完成账号升级`);
+        if (/已签|签到过|重复|已完成/.test(msg)) {
+            this.log(`✅ 今日已签到（${msg}）`);
+            return true;
+        }
+        if (ret === 50010) throw Object.assign(new Error(`该微信号的比亚迪账号未完成升级/注册（${msg}），需先在比亚迪App里完成账号升级`), { retryable: false });
         if (retry && /session|登录|未授权|失效|过期|token/i.test(msg)) {
             this.log("会话失效，重新登录后重试");
             this.sessionId = "";
             await this.login();
             return this.sign(false);
         }
-        this.log(`❌ 签到失败(ret=${ret}): ${msg || short(res)}`);
+        throw new Error(`签到失败(ret=${ret}): ${msg || short(res)}`);
     }
     async ensureLogin() {
         const cached = readCache()[this.account.openid] || {};
@@ -171,21 +175,35 @@ class Task {
         if (!this.sessionId) await this.login();
     }
     async run() {
-        if (!this.account.openid) { this.log("跳过：变量值里没有 openid"); return; }
-        try {
-            await this.ensureLogin();
-            await this.sign();
-        } catch (e) {
-            this.log(`执行失败: ${e.message || e}`);
-        }
+        if (!this.account.openid) throw Object.assign(new Error("变量值里没有 openid"), { retryable: false });
+        await this.ensureLogin();
+        return this.sign();
     }
 }
 
 !(async () => {
     $.checkEnv(ckName);
-    if (!$.userCount) { $.log(`未找到变量 ${ckName}`); return; }
+    if (!$.userCount) {
+        $.log(`[QLRUN_RESULT] FAILURE retryable=0 reason=no-account detail=未找到变量 ${ckName}`);
+        return;
+    }
+    let success = 0;
+    let failed = 0;
+    let retryable = true;
     for (let i = 0; i < $.userList.length; i++) {
-        await new Task($.userList[i]).run();
+        try {
+            await new Task($.userList[i]).run();
+            success++;
+        } catch (e) {
+            failed++;
+            if (e && e.retryable === false) retryable = false;
+            $.log(`账号[${i + 1}] 执行失败: ${e.message || e}`);
+        }
         if (i < $.userList.length - 1) await $.wait(1500, 3000);
     }
-})().catch((e) => $.log(e.message || e)).finally(() => $.done());
+    if (failed === 0 && success === $.userCount) {
+        $.log(`[QLRUN_RESULT] SUCCESS core=${success}/${$.userCount}`);
+    } else {
+        $.log(`[QLRUN_RESULT] FAILURE retryable=${retryable ? 1 : 0} core=${success}/${$.userCount} failed=${failed}`);
+    }
+})().catch((e) => $.log(`[QLRUN_RESULT] FAILURE retryable=1 reason=script-exception detail=${e.message || e}`)).finally(() => $.done());

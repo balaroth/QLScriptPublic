@@ -12,7 +12,6 @@ const fs = require("fs");
 const path = require("path");
 
 // ================== 配置区 ==================
-const ACTIVITY_ID = "100001275";
 const BASE_URL = "https://scrm.aimatech.com";
 const WXCLIENT_URL = `${BASE_URL}/aima/wxclient`;
 const MINI_APPID = "wx2dcfb409fd5ddfb4";
@@ -94,7 +93,7 @@ function buildHeaders(token = "") {
     Sign: md5(signStr).toLowerCase(),
     "content-type": "application/json",
     charset: "utf-8",
-    Referer: "https://servicewechat.com/wx2dcfb409fd5ddfb4/223/page-frame.html",
+    Referer: "https://servicewechat.com/wx2dcfb409fd5ddfb4/227/page-frame.html",
     "User-Agent": USER_AGENT,
   };
 }
@@ -199,11 +198,55 @@ async function getAccessToken(account) {
 }
 
 // ================== 核心逻辑 ==================
+async function discoverSignActivity(account, token, onToken) {
+  const res = await request(
+    "post",
+    `${WXCLIENT_URL}/mkt/activities/locations:search`,
+    token,
+    {
+      data: { locations: [0, 1, 2] },
+      account,
+      onToken,
+    }
+  );
+
+  if (res.status !== 200 || res.data?.code !== 200) {
+    throw new Error(`发现签到活动失败: HTTP ${res.status} ${JSON.stringify(res.data)}`);
+  }
+
+  const unique = new Map();
+  for (const item of Array.isArray(res.data?.content) ? res.data.content : []) {
+    if (Number(item?.templateType) !== 3 || !item?.activityId) continue;
+    unique.set(String(item.activityId), item);
+  }
+  const activities = [...unique.values()];
+  if (activities.length !== 1) {
+    throw new Error(
+      `签到活动发现异常: 期望唯一的模板3活动，实际${activities.length}个 ${JSON.stringify(
+        activities.map((item) => ({
+          activityId: item.activityId,
+          activityName: item.activityName || item.name || "",
+          status: item.status,
+          beginDate: item.beginDate,
+          endDate: item.endDate,
+        }))
+      )}`
+    );
+  }
+  return activities[0];
+}
+
 async function signIn(account, index) {
   let token = await getAccessToken(account);
   const setToken = (newToken) => {
     token = newToken;
   };
+
+  const activity = await discoverSignActivity(account, token, setToken);
+  const activityId = activity.activityId;
+  $.log(
+    `🎯 账号【${index}】当前签到活动: ${activity.activityName || activity.name || "未命名"}（${activityId}）`
+  );
 
   $.log(`🚀 账号【${index}】查询签到状态...`);
   const searchRes = await request(
@@ -211,7 +254,7 @@ async function signIn(account, index) {
     `${WXCLIENT_URL}/mkt/activities/sign:search`,
     token,
     {
-      data: { activityId: ACTIVITY_ID },
+      data: { activityId },
       account,
       onToken: setToken,
     }
@@ -233,7 +276,7 @@ async function signIn(account, index) {
     `${WXCLIENT_URL}/mkt/activities/sign:join`,
     token,
     {
-      data: { activityId: ACTIVITY_ID, activitySceneId: null },
+      data: { activityId, activitySceneId: null },
       account,
       onToken: setToken,
     }

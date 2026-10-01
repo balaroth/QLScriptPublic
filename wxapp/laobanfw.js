@@ -35,12 +35,16 @@ const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const https = require("https");
 const WeChatServer = require("./wcs.js");
 
 const ckName = "laobanfw";
 const MINI_APP_ID = "wxc8c90950cf4546f6";
 const BASE = "https://vip.foxech.com/index.php/api";
 const SALT = "ae1fd50f";
+// 该站 TLS 证书已过期（服务端未续期），Node 默认 certificate has expired 直接拒连；
+// vip.foxech.com 已从 wxbridge 劫持名单移出，本站直连 d3，仅对本站放宽证书校验恢复可用（不影响其它请求）。
+const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
 const TOKEN_CACHE_FILE = path.join(__dirname, "laobanfw_token_cache.json");
 const USER_AGENT =
     "Mozilla/5.0 (Linux; Android 12; M2012K11AC Build/SKQ1.220303.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -121,6 +125,7 @@ class Task {
                 xweb_xhr: "1",
             },
             timeout: 20000,
+            httpsAgent,
             validateStatus: () => true,
         });
         if (res.status !== 200) throw new Error(`${apiPath} HTTP ${res.status}: ${short(res.data)}`);

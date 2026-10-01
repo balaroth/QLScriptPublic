@@ -1,240 +1,268 @@
+#!/usr/bin/env node
 /**
- * cron 27 19 * * *  wx_midea.js
+ * cron 27 19 * * * wx_midea.js
  * Show:每天运行一次
- * @author:https://github.com/smallfawn/QLScriptPublic
- * 变量名:wx_midea
- * 变量值:https://mvip.midea.cn/next/mucuserinfo/getmucuserinfo headers中的COOKIE  只写uid=xxxx;sukey=yyyy;#headers 中 ucAccessToken的值
- * 具体示例   uid=xxxx;sukey=yyyy;#7895566asa  多账号&分开 或者换行
- * scriptVersionNow = "0.0.1";
+ * 美的会员（当前主端）自动登录、会员状态校验、积分流水同步、可领取积分任务领取
+ *
+ * 旧版 wx_midea=uid=...;sukey=...;#ucAccessToken 已废弃：
+ * - 旧线下会员签到接口 create_daily_score 已退役；
+ * - 旧营销签到活动已退役；
+ * - 当前正式主端使用 wx49a622805968d156 + 手机号授权 + ucAccessToken。
+ *
+ * 依赖青龙环境：wx_server_url、wx_auth（由统一执行器注入）
+ * scriptVersionNow = "1.0.0";
  */
 
-const $ = new Env("微信小程序 - 美的会员");
-const notify = $.isNode() ? require('../sendNotify') : '';
-let ckName = "wx_midea";
-let envSplitor = ["&", "\n"]; //多账号分隔符
-let strSplitor = "#"; //多变量分隔符
-let userIdx = 0;
-let userList = [];
-let msg = "";
-class UserInfo {
-    constructor(str) {
-        this.index = ++userIdx;
-        this.ck = str.split(strSplitor)[0]; //单账号多变量分隔符
-        this.ckStatus = true;
-        this.at = str.split(strSplitor)[1];
-    }
-    async main() {
-        $.msg($.name, "", `开始第${this.index}个账号`)
-        //await this.user_info();
-        await $.wait(3000)
-        if (!this.ckStatus) {
-            $.msg($.name, "", `❌第${this.index}个账号失效`);
-            return;
-        }
-        await this.signIn()
-        await this.signIn2()
+'use strict';
 
-    }
-    async user_info() {
-        try {
-            let options = {
-                fn: "信息查询",
-                method: "get",
-                url: `https://mvip.midea.cn/next/mucuserinfo/getmucuserinfo`,
-                headers: {
-                    "Host": "mvip.midea.cn",
-                    "Connection": "keep-alive",
-                    "charset": "utf-8",
-                    "cookie": this.ck,
-                    "User-Agent": "Mozilla/5.0 (Linux; Android 10; MI 8 Lite Build/QKQ1.190910.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/111.0.5563.116 Mobile Safari/537.36 XWEB/1110005 MMWEBSDK/20230405 MMWEBID/2585 MicroMessenger/8.0.35.2360(0x2800235D) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 MiniProgramEnv/android",
-                    "Content-Type": "application/json",
-                    "Accept-Encoding": "gzip,compress,br,deflate",
-                    "Referer": "https://servicewechat.com/wx03925a39ca94b161/409/page-frame.html"
-                },
-            }
-            let result = await httpRequest(options);
-            //console.log(options);
-            //console.log(result);
-            if (result["errcode"] == 0) {
-                console.log(`✅${options.fn}成功 [${result.data.userinfo.Mobile}] 当前积分[${result.data.userinfo.VipGrow}]🎉`);
-                msg += `✅${options.fn}成功 [${result.data.userinfo.Mobile}] 当前积分[${result.data.userinfo.VipGrow}]🎉\n`;
-                this.ckStatus = true;
-            } else {
-                console.log(`❌${options.fn}失败`);
-                msg += `❌${options.fn}失败\n`;
-                this.ckStatus = false;
-                console.log(JSON.stringify(result));
-            }
-        } catch (e) {
-            console.log(e);
-        }
-    }
-    async signIn() {
-        try {
-            let options = {
-                fn: "签到",
-                method: "get",
-                url: `https://mvip.midea.cn/my/score/create_daily_score`,
-                headers: {
-                    'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                    "cookie": this.ck,
-                },
-            }
-            let result = await httpRequest(options);
-            //console.log(options);
-            //result = JSON.parse(result);
-            //console.log(result);
-            if (result["errcode"] == 0) {
-                console.log(`✅${options.fn}成功🎉`);
-                msg += `✅${options.fn}成功🎉\n`+JSON.stringify(result);
-            } else {
-                console.log(`❌${options.fn}失败`);
-                msg += `❌${options.fn}失败\n`;
-                console.log(JSON.stringify(result));
-            }
-        } catch (e) {
-            console.log(e);
-        }
-    }
+const axios = require('axios');
+const notify = require('../sendNotify');
 
-    async signIn2() {
-        try {
-            let options = {
-                fn: "签到2",
-                method: "post",
-                url: `https://mvip.midea.cn/mscp_mscp/api/cms_api/activity-center-im-service/im-svr/im/game/page/sign`,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; MI 8 Lite Build/QKQ1.190910.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/130.0.6723.103 Mobile Safari/537.36 XWEB/1300333 MMWEBSDK/20240404 MMWEBID/2585 MicroMessenger/8.0.49.2600(0x2800315A) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 miniProgram/wx03925a39ca94b161',
-                    'Accept': 'application/json, text/plain, */*',
-                    'Accept-Encoding': 'gzip, deflate, br, zstd',
-                    'Content-Type': 'application/json',
-                    'sec-ch-ua-platform': '"Android"',
-                    'sec-ch-ua': '"Chromium";v="130", "Android WebView";v="130", "Not?A_Brand";v="99"',
-                    'ucAccessToken': '' + this.at,
-                    'sec-ch-ua-mobile': '?1',
-                    'intercept': '1',
-                    'apiKey': '3660663068894a0d9fea574c2673f3c0',
-                    'Origin': 'https://mvip.midea.cn',
-                    'X-Requested-With': 'com.tencent.mm',
-                    'Sec-Fetch-Site': 'same-origin',
-                    'Sec-Fetch-Mode': 'cors',
-                    'Sec-Fetch-Dest': 'empty',
-                    'Referer': 'https://mvip.midea.cn/mscp_weixin/apps/h5-pro-wx-interaction-marketing/',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-                },
-                body: JSON.stringify({
-                    "headParams": {
-                        "language": "CN",
-                        "originSystem": "MCSP",
-                        "timeZone": "",
-                        "userCode": "",
-                        "tenantCode": "",
-                        "userKey": "TEST_",
-                        "transactionId": ""
-                    },
-                    "pagination": null,
-                    "restParams": {
-                        "gameId": 22,
-                        "actvId": "401671388248692763",
-                        "rootCode": "MDHY",
-                        "appCode": "MDHY_XCX",
-                        "imUserId": "",
-                        "uid": "",
-                        "openId": "",
-                        "unionId": ""
-                    }
-                })
-            }
+const NAME = '微信小程序 - 美的会员';
+const APPID = 'wx49a622805968d156';
+const PLATFORM = 'WX_MEIDIDAOJIA_MINI';
+const CHANNEL = '1.1.1.6.2.78.1.1';
+const WCP_TAG = 'a3d1d55ebdd44ab1b8d46eba7b68472e';
+const SOURCE_CLIENT = 'MIDEA_WEAPPLET';
+const API = 'https://mcsp.midea.com';
+const WX_SERVER = (process.env.wx_server_url || 'http://d4.dqf.cc.cd:8787').replace(/\/+$/, '');
+const WX_AUTH = process.env.wx_auth || '';
+const REQUEST_TIMEOUT = Number(process.env.MIDEA_REQUEST_TIMEOUT || 40000);
+const COLLECTOR_TIMEOUT = Number(process.env.MIDEA_COLLECTOR_TIMEOUT || 140000);
 
-            let result = await httpRequest(options);
-            //console.log(options);
-            //result = JSON.parse(result);
-            //console.log(result);
-            // 修复：原实现无条件打印"✅签到2成功"（成功判断被注释掉），在请求 403/errcode!=0 时产生假成功信号，
-            // 会被 qlall SUCC 正则误判为成功。恢复按 errcode==0 判定。
-            if (result && result["errcode"] == 0) {
-                console.log(`✅${options.fn}成功🎉`);
-                msg += `✅${options.fn}成功🎉\n`;
-            } else {
-                console.log(`❌${options.fn}失败`);
-                msg += `❌${options.fn}失败\n`;
-                console.log(JSON.stringify(result));
-            }
-        } catch (e) {
-            console.log(e);
-        }
-    }
+let failed = false;
+let retryable = false;
+let notification = [];
+
+function safeText(value, max = 160) {
+  return String(value ?? '').replace(/[\r\n]+/g, ' ').slice(0, max);
 }
 
-async function start() {
-    const tasks = userList.map(user => user.main());
-    await Promise.all(tasks);
-    notify.sendNotify($.name, msg);
-    /*let taskall = [];
-    for (let user of userList) {
-        if (user.ckStatus) {
-            taskall.push(await user.main());
-        }
-    }
-    await Promise.all(taskall);*/
+function businessMessage(body) {
+  return safeText(body?.msg || body?.message || body?.errmsg || body?.error || body?.code || 'unknown');
 }
 
-!(async () => {
-    if (!(await checkEnv())) return;
-    if (userList.length > 0) {
-        await start();
-    }
-})()
-    .catch((e) => console.log(e))
-    .finally(() => $.done());
-
-//********************************************************
-/**
- * 变量检查与处理
- * @returns
- */
-async function checkEnv() {
-    let userCookie = ($.isNode() ? process.env[ckName] : $.getdata(ckName)) || "";
-    if (userCookie) {
-        let e = envSplitor[0];
-        for (let o of envSplitor)
-            if (userCookie.indexOf(o) > -1) {
-                e = o;
-                break;
-            }
-        for (let n of userCookie.split(e)) n && userList.push(new UserInfo(n));
-    } else {
-        console.log("未找到CK");
-        return;
-    }
-    return console.log(`共找到${userList.length}个账号`), true; //true == !0
+function isSuccess(body) {
+  return body && ['0', '000000'].includes(String(body.code ?? body.errcode ?? body.errCode));
 }
 
-/////////////////////////////////////////////////////////////////////////////////////
-function httpRequest(options) {
-    if (!options["method"]) {
-        return console.log(`请求方法不存在`);
-    }
-    if (!options["fn"]) {
-        console.log(`函数名不存在`);
-    }
-    return new Promise((resolve) => {
-        $[options.method](options, (err, resp, data) => {
-            try {
-                if (err) {
-                    $.logErr(err);
-                } else {
-                    try {
-                        data = JSON.parse(data);
-                    } catch (error) { }
-                }
-            } catch (e) {
-                $.logErr(e, resp);
-            } finally {
-                resolve(data);
-            }
-        });
-    });
+function requestEnvelope(restParams, token, userCode = '', pagination = {}) {
+  const timestamp = String(Date.now());
+  const transactionId = `${timestamp}${Math.random().toString().slice(2)}`.slice(-13);
+  return {
+    headParams: {
+      language: 'CN',
+      originSystem: 'cms-app-mini',
+      timeZone: '8',
+      userType: 'C',
+      userCode,
+      tenantCode: '',
+      userKey: token,
+      sign: `e02ac436de344f729498263395de1dba${timestamp}0de1177c77524a7f965a36cf09d21345`,
+      timestamp,
+      miniAppVersion: 'release',
+      transactionId,
+    },
+    restParams,
+    pagination,
+  };
 }
-// prettier-ignore
-function Env(t, s) { return new (class { constructor(t, s) { (this.name = t), (this.data = null), (this.dataFile = "box.dat"), (this.logs = []), (this.logSeparator = "\n"), (this.startTime = new Date().getTime()), Object.assign(this, s), this.log("", `\ud83d\udd14${this.name},\u5f00\u59cb!`) } isNode() { return "undefined" != typeof module && !!module.exports } isQuanX() { return "undefined" != typeof $task } isSurge() { return "undefined" != typeof $httpClient && "undefined" == typeof $loon } isLoon() { return "undefined" != typeof $loon } getScript(t) { return new Promise((s) => { this.get({ url: t }, (t, e, i) => s(i)) }) } runScript(t, s) { return new Promise((e) => { let i = this.getdata("@chavy_boxjs_userCfgs.httpapi"); i = i ? i.replace(/\n/g, "").trim() : i; let o = this.getdata("@chavy_boxjs_userCfgs.httpapi_timeout"); (o = o ? 1 * o : 20), (o = s && s.timeout ? s.timeout : o); const [h, a] = i.split("@"), r = { url: `http://${a}/v1/scripting/evaluate`, body: { script_text: t, mock_type: "cron", timeout: o }, headers: { "X-Key": h, Accept: "*/*" }, }; this.post(r, (t, s, i) => e(i)) }).catch((t) => this.logErr(t)) } loaddata() { if (!this.isNode()) return {}; { (this.fs = this.fs ? this.fs : require("fs")), (this.path = this.path ? this.path : require("path")); const t = this.path.resolve(this.dataFile), s = this.path.resolve(process.cwd(), this.dataFile), e = this.fs.existsSync(t), i = !e && this.fs.existsSync(s); if (!e && !i) return {}; { const i = e ? t : s; try { return JSON.parse(this.fs.readFileSync(i)) } catch (t) { return {} } } } } writedata() { if (this.isNode()) { (this.fs = this.fs ? this.fs : require("fs")), (this.path = this.path ? this.path : require("path")); const t = this.path.resolve(this.dataFile), s = this.path.resolve(process.cwd(), this.dataFile), e = this.fs.existsSync(t), i = !e && this.fs.existsSync(s), o = JSON.stringify(this.data); e ? this.fs.writeFileSync(t, o) : i ? this.fs.writeFileSync(s, o) : this.fs.writeFileSync(t, o) } } lodash_get(t, s, e) { const i = s.replace(/\[(\d+)\]/g, ".$1").split("."); let o = t; for (const t of i) if (((o = Object(o)[t]), void 0 === o)) return e; return o } lodash_set(t, s, e) { return Object(t) !== t ? t : (Array.isArray(s) || (s = s.toString().match(/[^.[\]]+/g) || []), (s.slice(0, -1).reduce((t, e, i) => Object(t[e]) === t[e] ? t[e] : (t[e] = Math.abs(s[i + 1]) >> 0 == +s[i + 1] ? [] : {}), t)[s[s.length - 1]] = e), t) } getdata(t) { let s = this.getval(t); if (/^@/.test(t)) { const [, e, i] = /^@(.*?)\.(.*?)$/.exec(t), o = e ? this.getval(e) : ""; if (o) try { const t = JSON.parse(o); s = t ? this.lodash_get(t, i, "") : s } catch (t) { s = "" } } return s } setdata(t, s) { let e = !1; if (/^@/.test(s)) { const [, i, o] = /^@(.*?)\.(.*?)$/.exec(s), h = this.getval(i), a = i ? ("null" === h ? null : h || "{}") : "{}"; try { const s = JSON.parse(a); this.lodash_set(s, o, t), (e = this.setval(JSON.stringify(s), i)) } catch (s) { const h = {}; this.lodash_set(h, o, t), (e = this.setval(JSON.stringify(h), i)) } } else e = this.setval(t, s); return e } getval(t) { return this.isSurge() || this.isLoon() ? $persistentStore.read(t) : this.isQuanX() ? $prefs.valueForKey(t) : this.isNode() ? ((this.data = this.loaddata()), this.data[t]) : (this.data && this.data[t]) || null } setval(t, s) { return this.isSurge() || this.isLoon() ? $persistentStore.write(t, s) : this.isQuanX() ? $prefs.setValueForKey(t, s) : this.isNode() ? ((this.data = this.loaddata()), (this.data[s] = t), this.writedata(), !0) : (this.data && this.data[s]) || null } initGotEnv(t) { (this.got = this.got ? this.got : require("got")), (this.cktough = this.cktough ? this.cktough : require("tough-cookie")), (this.ckjar = this.ckjar ? this.ckjar : new this.cktough.CookieJar()), t && ((t.headers = t.headers ? t.headers : {}), void 0 === t.headers.Cookie && void 0 === t.cookieJar && (t.cookieJar = this.ckjar)) } get(t, s = () => { }) { t.headers && (delete t.headers["Content-Type"], delete t.headers["Content-Length"]), this.isSurge() || this.isLoon() ? $httpClient.get(t, (t, e, i) => { !t && e && ((e.body = i), (e.statusCode = e.status)), s(t, e, i) }) : this.isQuanX() ? $task.fetch(t).then((t) => { const { statusCode: e, statusCode: i, headers: o, body: h } = t; s(null, { status: e, statusCode: i, headers: o, body: h }, h) }, (t) => s(t)) : this.isNode() && (this.initGotEnv(t), this.got(t).on("redirect", (t, s) => { try { const e = t.headers["set-cookie"].map(this.cktough.Cookie.parse).toString(); this.ckjar.setCookieSync(e, null), (s.cookieJar = this.ckjar) } catch (t) { this.logErr(t) } }).then((t) => { const { statusCode: e, statusCode: i, headers: o, body: h, } = t; s(null, { status: e, statusCode: i, headers: o, body: h }, h) }, (t) => s(t))) } post(t, s = () => { }) { if ((t.body && t.headers && !t.headers["Content-Type"] && (t.headers["Content-Type"] = "application/x-www-form-urlencoded"), delete t.headers["Content-Length"], this.isSurge() || this.isLoon())) $httpClient.post(t, (t, e, i) => { !t && e && ((e.body = i), (e.statusCode = e.status)), s(t, e, i) }); else if (this.isQuanX()) (t.method = "POST"), $task.fetch(t).then((t) => { const { statusCode: e, statusCode: i, headers: o, body: h } = t; s(null, { status: e, statusCode: i, headers: o, body: h }, h) }, (t) => s(t)); else if (this.isNode()) { this.initGotEnv(t); const { url: e, ...i } = t; this.got.post(e, i).then((t) => { const { statusCode: e, statusCode: i, headers: o, body: h } = t; s(null, { status: e, statusCode: i, headers: o, body: h }, h) }, (t) => s(t)) } } time(t) { let s = { "M+": new Date().getMonth() + 1, "d+": new Date().getDate(), "H+": new Date().getHours(), "m+": new Date().getMinutes(), "s+": new Date().getSeconds(), "q+": Math.floor((new Date().getMonth() + 3) / 3), S: new Date().getMilliseconds(), }; /(y+)/.test(t) && (t = t.replace(RegExp.$1, (new Date().getFullYear() + "").substr(4 - RegExp.$1.length))); for (let e in s) new RegExp("(" + e + ")").test(t) && (t = t.replace(RegExp.$1, 1 == RegExp.$1.length ? s[e] : ("00" + s[e]).substr(("" + s[e]).length))); return t } msg(s = t, e = "", i = "", o) { const h = (t) => !t || (!this.isLoon() && this.isSurge()) ? t : "string" == typeof t ? this.isLoon() ? t : this.isQuanX() ? { "open-url": t } : void 0 : "object" == typeof t && (t["open-url"] || t["media-url"]) ? this.isLoon() ? t["open-url"] : this.isQuanX() ? t : void 0 : void 0; this.isMute || (this.isSurge() || this.isLoon() ? $notification.post(s, e, i, h(o)) : this.isQuanX() && $notify(s, e, i, h(o))), this.logs.push("", "==============\ud83d\udce3\u7cfb\u7edf\u901a\u77e5\ud83d\udce3=============="), this.logs.push(s), e && this.logs.push(e), i && this.logs.push(i) } log(...t) { t.length > 0 && (this.logs = [...this.logs, ...t]), console.log(t.join(this.logSeparator)) } logErr(t, s) { const e = !this.isSurge() && !this.isQuanX() && !this.isLoon(); e ? this.log("", `\u2757\ufe0f${this.name},\u9519\u8bef!`, t.stack) : this.log("", `\u2757\ufe0f${this.name},\u9519\u8bef!`, t) } wait(t) { return new Promise((s) => setTimeout(s, t)) } done(t = {}) { const s = new Date().getTime(), e = (s - this.startTime) / 1e3; this.log("", `\ud83d\udd14${this.name},\u7ed3\u675f!\ud83d\udd5b ${e}\u79d2`), this.log(), (this.isSurge() || this.isQuanX() || this.isLoon()) && $done(t) } })(t, s) }
+
+async function collectorPost(route, tag) {
+  if (!WX_AUTH) throw new Error('缺少 wx_auth，无法调用微信授权采集器');
+  const nonce = `midea-${tag}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const response = await axios.post(
+    `${WX_SERVER}${route}`,
+    { appid: APPID, openid: nonce },
+    {
+      headers: { auth: WX_AUTH, 'content-type': 'application/json' },
+      timeout: COLLECTOR_TIMEOUT,
+      validateStatus: () => true,
+    },
+  );
+  const data = response.data || {};
+  if (response.status !== 200 || !(data.status || data.ok)) {
+    throw new Error(`${route}失败: ${businessMessage(data) || `HTTP ${response.status}`}`);
+  }
+  return data;
+}
+
+async function mideaPost(path, data, headers = {}, originalInput = true) {
+  const response = await axios.post(`${API}/${path.replace(/^\/+/, '')}`, data, {
+    headers: {
+      'content-type': 'application/json',
+      'miniAppVersion': 'release',
+      wcpTag: WCP_TAG,
+      ...headers,
+    },
+    timeout: REQUEST_TIMEOUT,
+    validateStatus: () => true,
+  });
+  if (response.status !== 200) {
+    const error = new Error(`${path} HTTP ${response.status}: ${businessMessage(response.data)}`);
+    error.retryable = response.status >= 500 || response.status === 408 || response.status === 429;
+    throw error;
+  }
+  const body = response.data || {};
+  if (!originalInput && !isSuccess(body)) {
+    const error = new Error(`${path}业务失败: ${businessMessage(body)}`);
+    error.retryable = /系统繁忙|超时|稍后再试|timeout/i.test(JSON.stringify(body));
+    throw error;
+  }
+  return body;
+}
+
+function extractPhoneAuth(data) {
+  const raw = data?.raw || data?.data?.raw || {};
+  return {
+    encryptedData: data?.encryptedData || raw.encryptedData || '',
+    iv: data?.iv || raw.iv || '',
+  };
+}
+
+function extractCode(data) {
+  return data?.data?.code || data?.code || '';
+}
+
+async function login() {
+  console.log('正在获取当前美的主端手机号授权...');
+  const phone = extractPhoneAuth(await collectorPost('/wx/getphonenumber', 'phone'));
+  if (!phone.encryptedData || !phone.iv) throw new Error('手机号授权结果缺少 encryptedData/iv');
+
+  const jsCode = extractCode(await collectorPost('/wx/code', 'code'));
+  if (!jsCode) throw new Error('微信授权采集器未返回登录 code');
+
+  const body = await mideaPost(
+    'api/cms_bff/mcsp-uc-mvip-bff/app/login/wx/mini/getLoginInfo.do',
+    {
+      jsCode,
+      channelCode: CHANNEL,
+      encryptedData: phone.encryptedData,
+      ivStr: phone.iv,
+      loginMode: 2,
+      platformType: PLATFORM,
+    },
+    {},
+    false,
+  );
+  const session = body.data || {};
+  if (!session.ucAccessToken || !session.c4aUid || !session.openId) {
+    throw new Error('美的登录成功但缺少 ucAccessToken/c4aUid/openId');
+  }
+  console.log('美的主端手机号授权登录成功');
+  return session;
+}
+
+function authHeaders(session) {
+  return {
+    ucAccessToken: session.ucAccessToken,
+    userKey: session.ucAccessToken,
+    'login-mode-type': '2',
+    'source-client': SOURCE_CLIENT,
+  };
+}
+
+async function getProfile(session) {
+  const body = await mideaPost(
+    'api/cms_bff/mcsp-uc-mvip-bff/member/getMemberInfo.do',
+    {
+      pagination: {},
+      restParams: { brand: 1, sourceSys: 'MIDEA', c4aUid: session.c4aUid },
+      openid: session.openId,
+    },
+    authHeaders(session),
+    false,
+  );
+  const profile = body.data || {};
+  if (!profile.uid || Number(profile.userState) !== 1) {
+    throw new Error(`会员状态异常: uid=${profile.uid ? 'present' : 'missing'} userState=${safeText(profile.userState)}`);
+  }
+  const point = profile.vipPoint ?? profile.vipPointPool ?? '未知';
+  const growth = profile.vipGrow ?? '未知';
+  const level = profile.levelName || profile.mfansLevelName || '普通会员';
+  console.log(`会员身份有效：${level}，积分 ${point}，成长值 ${growth}`);
+  notification.push(`会员身份有效：${level}，积分 ${point}，成长值 ${growth}`);
+  return profile;
+}
+
+async function getScoreDetail(session, profile) {
+  const body = await mideaPost(
+    'api/cms_bff/mcsp-uc-mvip-bff/integral/getScoreDetail.do',
+    requestEnvelope({}, session.ucAccessToken, session.c4aUid, { pageNo: 1, pageSize: 20, countFlag: true }),
+    authHeaders(session),
+    false,
+  );
+  const rows = Array.isArray(body.data) ? body.data : [];
+  console.log(`积分流水同步成功：返回 ${rows.length} 条`);
+  return rows;
+}
+
+async function getPointTasks(session) {
+  const body = await mideaPost(
+    'api/cms_bff/mcsp-uc-mvip-bff/pointTask/list.do',
+    requestEnvelope({ platform: '19' }, session.ucAccessToken, session.c4aUid, {}),
+    authHeaders(session),
+    false,
+  );
+  const tasks = Array.isArray(body.data) ? body.data : [];
+  if (!tasks.length) {
+    console.log('当前官方积分任务列表为空');
+    return [];
+  }
+  console.log(`当前官方积分任务：${tasks.map((t) => `${t.taskName || t.taskCode}[${t.taskStatus}]`).join('，')}`);
+  return tasks;
+}
+
+async function receiveReadyTasks(session, tasks) {
+  const ready = tasks.filter((task) => Number(task.taskStatus) === 1 && task.taskCode);
+  if (!ready.length) {
+    console.log('当前无已完成待领取的积分任务');
+    notification.push('当前无已完成待领取的积分任务');
+    return 0;
+  }
+  let received = 0;
+  for (const task of ready) {
+    const body = await mideaPost(
+      'api/cms_bff/mcsp-uc-mvip-bff/pointTask/receive.do',
+      requestEnvelope({ taskCode: task.taskCode }, session.ucAccessToken, session.c4aUid, {}),
+      authHeaders(session),
+      false,
+    );
+    console.log(`积分任务领取成功：${task.taskName || task.taskCode} +${task.pointValue ?? '?'}积分`);
+    received += 1;
+    if (body.data) console.log(`领取结果：${safeText(JSON.stringify(body.data), 240)}`);
+  }
+  notification.push(`已领取 ${received} 个积分任务`);
+  return received;
+}
+
+async function main() {
+  console.log(`\n🔔${NAME},开始!`);
+  console.log('协议：当前美的主端手机号授权登录 + 统一会员/积分接口');
+  console.log('说明：旧版每日签到和营销签到活动均已退役，不再调用');
+  const session = await login();
+  const profile = await getProfile(session);
+  await getScoreDetail(session, profile);
+  const tasks = await getPointTasks(session);
+  await receiveReadyTasks(session, tasks);
+  console.log('[QLRUN_RESULT] SUCCESS reason=midea_member_sync_ok');
+}
+
+(async () => {
+  try {
+    await main();
+  } catch (error) {
+    failed = true;
+    retryable = Boolean(error?.retryable) || /timeout|ECONN|ENOTFOUND|EAI_AGAIN|系统繁忙|稍后再试|超时/i.test(String(error?.message || error));
+    const reason = safeText(error?.message || error, 360);
+    console.error(`美的会员执行失败: ${reason}`);
+    console.log(`[QLRUN_RESULT] FAILURE reason=midea_member_flow_failed retryable=${retryable ? 1 : 0}`);
+    notification.push(`执行失败：${reason}`);
+  } finally {
+    if (process.env.QL_SUPPRESS_NOTIFY !== '1' && notification.length) {
+      try { await notify.sendNotify(NAME, notification.join('\n')); } catch (error) { console.error(`通知失败: ${safeText(error?.message || error)}`); }
+    }
+    console.log(`🔔${NAME},结束!`);
+    if (failed) process.exitCode = 1;
+  }
+})();

@@ -151,7 +151,7 @@ class Task {
         const res = await this.post(SIGN_URL, { date: "", belong_brand: "hy", session_id: this.sessionId, app_version: "460", app_client: "mina" });
         const ret = Number(res?.ret);
         const msg = res?.msg || res?.message || "";
-        if (ret === 0) {
+        if (ret === 0 || (ret === 200 && /success|成功/i.test(msg))) {
             const d = res.data || {};
             this.log(`✅ 签到成功${d.integral !== undefined ? `，积分 ${d.integral}` : ""}${d.continuous !== undefined ? `，连续 ${d.continuous} 天` : ""}${msg ? `（${msg}）` : ""}`);
             return true;
@@ -159,6 +159,12 @@ class Task {
         if (/已签|签到过|重复|已完成/.test(msg)) {
             this.log(`✅ 今日已签到（${msg}）`);
             return true;
+        }
+        if (ret === 50010 && retry) {
+            this.log("缓存会话返回账号未升级，强制新登录后复核一次");
+            this.sessionId = "";
+            await this.login();
+            return this.sign(false);
         }
         if (ret === 50010) throw Object.assign(new Error(`该微信号的比亚迪账号未完成升级/注册（${msg}），需先在比亚迪App里完成账号升级`), { retryable: false });
         if (retry && /session|登录|未授权|失效|过期|token/i.test(msg)) {

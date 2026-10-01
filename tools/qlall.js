@@ -98,6 +98,10 @@ function runOnce(rel, taskId) {
         // QL_SUPPRESS_NOTIFY=1 硬静默子任务一切通知（含失败邮件），汇总由本执行器单独发；
         // 注入 ID=<该脚本对应Crontab的id>，task.sh 才会把日志写到面板识别的 logName_id 目录。
         const childEnv = { ...process.env, ONLY_ERROR_NOTIFY: "true", QL_SUPPRESS_NOTIFY: "1", QL_ALL_RUN: "1" };
+        // 定时触发 qlall 时，青龙会给父任务注入 no_tee/log_name 等日志控制变量。
+        // 若原样继承，子 task 会把输出纯重定向到父任务日志目录，stdout 为空，最终全部 unknown→fail。
+        // 子任务必须自行生成面板日志并同时通过 tee 回传 stdout；ID 仍保留用于关联对应 Crontab。
+        for (const key of ["no_tee", "real_log_path", "log_name", "real_time"]) delete childEnv[key];
         if (taskId) childEnv.ID = String(taskId);
         const child = spawn("task", [rel], {
             cwd: path.join(DATA, "scripts"),

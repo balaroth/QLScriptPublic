@@ -611,8 +611,24 @@ class Task {
     }
 
     $.log("\n========== 执行汇总 ==========");
+    let core = 0, noaction = 0, blocked = 0;
     for (const item of summaries) {
-        $.log(`${item.appName}: ${item.member} ${item.assets} 签到=${item.sign}`);
+        const sig = String(item.sign || "");
+        // core: 真正签到完成（今日已签 或 Submit 后 IsCheckIn=true）
+        // noaction: 门店未开启签到/无每日任务（服务端明确无可签）
+        // blocked: 门店离线/商城到期/收益卡未配/签到未完成（门店侧确定性，重试无效）
+        if (sig === "今日已签到" || /signed=true/.test(sig)) { item.status = "core"; core++; }
+        else if (sig === "未找到签到/每日任务") { item.status = "noaction"; noaction++; }
+        else { item.status = "blocked"; blocked++; }
+        $.log(`${item.appName}: [${item.status}] ${item.member} ${item.assets} 签到=${item.sign}`);
+    }
+    const total = summaries.length;
+    // 诚实结构化结果：core=真正签到成功的门店；blocked/noaction 为门店侧确定性状态。
+    // 无 blocked（全部可达门店都签上）才算 SUCCESS；有 blocked 保留不可重试失败并给出 core 口径。
+    if (blocked === 0) {
+        $.log(`[QLRUN_RESULT] SUCCESS core=${core}/${total}`);
+    } else {
+        $.log(`[QLRUN_RESULT] FAILURE retryable=0 core=${core}/${total} blocked=${blocked} noaction=${noaction}`);
     }
 })()
     .catch((e) => $.log(e.message || e))

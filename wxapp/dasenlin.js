@@ -146,6 +146,7 @@ class Task {
         await this.getSignInfo();
         await this.signIn();
         await this.ginsengTask();
+        this.ok = true;
     }
 
     getCachedToken() {
@@ -430,9 +431,19 @@ class Task {
 
 !(async () => {
     $.checkEnv(ckName);
+    let okCount = 0, failCount = 0;
     for (const account of $.userList) {
-        await new Task(account).run();
+        const t = new Task(account);
+        try {
+            await t.run();
+            if (t.ok) { okCount++; } else { failCount++; }
+        } catch (e) {
+            failCount++;
+            $.log("账号执行异常: " + (e.message || e));
+        }
     }
+    const verdict = (failCount === 0 && okCount > 0) ? "SUCCESS" : "FAILURE";
+    console.log(`[QLRUN_RESULT] ${verdict} ok=${okCount} fail=${failCount}`);
 })()
     .catch((e) => $.log(e.message || e))
     .finally(() => $.done());

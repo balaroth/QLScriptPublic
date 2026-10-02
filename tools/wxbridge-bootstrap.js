@@ -27,7 +27,7 @@ if (global.__WX_BRIDGE_PATCHED__) {
   const [GW_HOST, GW_PORT_RAW] = GATEWAY.split(':');
   const GW_PORT = Number(GW_PORT_RAW || 8787);
   const TARGETS = new Set(
-    (process.env.WX_BRIDGE_HOSTS || 'account.xiaomi.com,api.vip.miui.com,apimallwm.exijiu.com,fm.exijiu.com,xcx.exijiu.com,camparicrm.81680.cn,www.feihevip.com,mcsp.midea.com,littleswanmp.midea.com,app.niuyougu.com.cn,jiuyixiaoer.fzjingzhou.com,tm-api.pin-dao.cn,tm-web.pin-dao.cn,www.rewards.mobil.com.cn,vip.qiaqiafood.com,qq-tasting-hall.qiaqiafood.com,hd.opposhop.cn,mpb.jingjiu.com')
+    (process.env.WX_BRIDGE_HOSTS || 'account.xiaomi.com,api.vip.miui.com,apimallwm.exijiu.com,fm.exijiu.com,xcx.exijiu.com,camparicrm.81680.cn,www.feihevip.com,mcsp.midea.com,littleswanmp.midea.com,app.niuyougu.com.cn,jiuyixiaoer.fzjingzhou.com,tm-api.pin-dao.cn,tm-web.pin-dao.cn,www.rewards.mobil.com.cn,vip.qiaqiafood.com,qq-tasting-hall.qiaqiafood.com,hd.opposhop.cn,mpb.jingjiu.com,crmweixin.dslbuy.com,dcapi.dslbuy.com')
       .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
   );
   const hostOf = (o) => String((o && (o.hostname || o.host)) || '').split(':')[0].toLowerCase();

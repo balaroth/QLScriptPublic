@@ -62,10 +62,21 @@ function md5Upper(text) {
     return crypto.createHash("md5").update(text).digest("hex").toUpperCase();
 }
 
+// 每个进程运行只记录一次：本次运行首个请求 nonce 的不可逆短指纹（不打印原 nonce/token）
+let nonceFingerprintLogged = false;
+function logNonceFingerprint(nonceStr) {
+    if (nonceFingerprintLogged) return;
+    nonceFingerprintLogged = true;
+    const fp = crypto.createHash("sha256").update(nonceStr).digest("hex").slice(0, 12);
+    $.log(`nonce fingerprint: ${fp} (first request of this run, irreversible)`);
+}
+
 function buildSignedHeaders({ data = null, token = "" } = {}) {
+    const nonceStr = randomString(16);
+    logNonceFingerprint(nonceStr);
     const headers = {
         fhAppid: APP_ID,
-        fhNonceStr: randomString(16),
+        fhNonceStr: nonceStr,
         fhTimestamp: Math.floor(Date.now() / 1000),
         token,
         source: 1,

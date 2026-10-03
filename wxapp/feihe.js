@@ -22,7 +22,6 @@ const MINI_APP_ID = "wx4205ec55b793245e";
 const API_BASE = "https://www.feihevip.com";
 const APP_ID = "xmyx";
 const APP_KEY = "TwUQ01lKS1Km5zlV2f7amsZc5EQYkTbv";
-const SIGN_TASK_TYPE = "DJSYQD";
 const TOKEN_CACHE_FILE = path.join(__dirname, "feihe_token_cache.json");
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) MicroMessenger/3.9.12 MiniProgramEnv/Windows WindowsWechat/WMPF";
 
@@ -106,6 +105,7 @@ class Task {
         this.account = String(account || "").trim();
         this.token = "";
         this.userInfo = {};
+        this.signed = false;
     }
 
     async run() {
@@ -113,7 +113,7 @@ class Task {
         if (cached) {
             this.token = cached.token || "";
             $.log(`账号[${this.index}] 使用缓存token: ${maskToken(this.token)}`);
-            if (!(await this.checkToken())) {
+            if (!(await this.tokenValid())) {
                 $.log(`账号[${this.index}] 缓存token失效，重新code登录`);
                 this.removeCachedToken();
                 this.token = "";
@@ -125,8 +125,7 @@ class Task {
         }
         if (!this.token) return;
 
-        await this.getIndexInfo();
-        await this.signIn();
+        await this.executeSignin();
     }
 
     getCachedToken() {
@@ -214,61 +213,48 @@ class Task {
         $.log(`账号[${this.index}] code登录成功: ${data.crmId || data.openId || ""} token=${maskToken(this.token)}`);
     }
 
-    async checkToken() {
+    // 以真实签到状态接口判定缓存有效性（structures/index 不校验登录态，不能作为判据）
+    async tokenValid() {
         try {
-            const result = await this.request({
-                method: "POST",
-                apiPath: "/api/structures/index",
-                data: { id: "" },
-                allowFail: true,
-            });
-            return String(result?.code) === "200";
+            const r = await this.request({ apiPath: "/api/member/signin/getSignInfo", allowFail: true });
+            return String(r?.code) === "200";
         } catch (e) {
             return false;
         }
     }
 
-    async getIndexInfo() {
-        const result = await this.request({
-            method: "POST",
-            apiPath: "/api/structures/index",
-            data: { id: "" },
-            allowFail: true,
-        });
-        if (String(result?.code) === "200") {
-            const signModule = (result.data?.modules || []).find((item) => String(item.moduleType) === "17");
-            $.log(`账号[${this.index}] 首页签到入口: ${signModule ? "已发现" : "未发现"}`);
-        } else {
-            $.log(`账号[${this.index}] 首页信息查询失败: ${result?.msg || JSON.stringify(result)}`);
+    // 读取会员/积分/今日签到状态（权威状态机）
+    async fetchSignInfo() {
+        const r = await this.request({ apiPath: "/api/member/signin/getSignInfo", allowFail: true });
+        if (String(r?.code) !== "200") {
+            throw new Error(`查询签到状态失败: code=${r?.code} msg=${r?.msg || JSON.stringify(r)}`);
         }
+        return r.data || {};
     }
 
-    async signIn() {
-        const finish = await this.request({
-            apiPath: "/api/member/signin/tofinish",
-            query: { taskType: SIGN_TASK_TYPE },
-            allowFail: true,
-        });
-        if (String(finish?.code) === "200" && finish.data === true) {
-            $.log(`账号[${this.index}] 签到任务已上报`);
-        } else if (String(finish?.code) === "200") {
-            $.log(`账号[${this.index}] 签到接口返回: ${JSON.stringify(finish.data)}`);
-        } else {
-            throw new Error(`签到失败: ${finish?.msg || JSON.stringify(finish)}`);
+    async executeSignin() {
+        const before = await this.fetchSignInfo();
+        const pointsBefore = before.memberDetail?.totalPoint;
+
+        // 今日已签：幂等终态，不重复领取
+        if (Number(before.isSignedInToday) === 1) {
+            $.log(`账号[${this.index}] 今日已签到，当前积分: ${pointsBefore}，连签${before.continuityDayNum}天（幂等，不重复领取）`);
+            this.signed = true;
+            return;
         }
 
-        const complete = await this.request({
-            apiPath: "/api/member/signin/completeTask",
-            query: { taskType: SIGN_TASK_TYPE },
-            allowFail: true,
-        });
-        if (String(complete?.code) === "200") {
-            const points = complete.data?.awardSendPoints || complete.data?.awardPoint || "";
-            $.log(`账号[${this.index}] 签到完成${points ? `，获得${points}积分` : ""}`);
-        } else if (complete?.msg) {
-            // msg 常常只是一串 trace id，带上 code 与完整响应才能判断是奖励已领还是真失败
-            $.log(`账号[${this.index}] 完成确认返回: code=${complete.code} ${JSON.stringify(complete).slice(0, 200)}`);
+        // 真实签到动作（空 body；以服务端状态翻转为准，不以接口回执文字为准）
+        await this.request({ method: "POST", apiPath: "/api/member/signin/sign", data: {}, allowFail: true });
+
+        const after = await this.fetchSignInfo();
+        if (Number(after.isSignedInToday) === 1) {
+            const pointsAfter = after.memberDetail?.totalPoint;
+            const gained = (Number(pointsAfter) - Number(pointsBefore)) || 0;
+            $.log(`账号[${this.index}] 签到成功，积分 ${pointsBefore} -> ${pointsAfter}（+${gained}），连签${after.continuityDayNum}天`);
+            this.signed = true;
+            return;
         }
+        throw new Error(`签到后服务端仍未确认今日签到: ${JSON.stringify(after).slice(0, 180)}`);
     }
 }
 
@@ -276,13 +262,25 @@ class Task {
     $.checkEnv(ckName);
     if (!$.userCount) return;
 
+    let okCount = 0;
+    let failCount = 0;
     for (const account of $.userList) {
         const task = new Task(account);
         try {
             await task.run();
+            if (task.signed) okCount++;
+            else failCount++;
         } catch (e) {
             $.log(`账号[${task.index}] 运行失败: ${e.message || e}`);
+            failCount++;
         }
+    }
+
+    // 结构化结果契约：仅当服务端确认今日已签/积分落账才 SUCCESS，否则硬 FAILURE
+    if (failCount === 0 && okCount > 0) {
+        console.log(`[QLRUN_RESULT] SUCCESS reason=feihe_signin_ok accounts=${okCount}`);
+    } else {
+        console.log(`[QLRUN_RESULT] FAILURE reason=feihe_signin_failed retryable=1 ok=${okCount} fail=${failCount}`);
     }
 })()
     .catch((e) => $.log(`运行异常: ${e.message || e}`))

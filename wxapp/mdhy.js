@@ -7,7 +7,9 @@
  * 旧版 wx_midea=uid=...;sukey=...;#ucAccessToken 已废弃：
  * - 旧线下会员签到接口 create_daily_score 已退役；
  * - 旧营销签到活动已退役；
- * - 当前正式主端使用 wx49a622805968d156 + 手机号授权 + ucAccessToken。
+ * - 当前正式主端使用 wx49a622805968d156 + 手机号授权 + ucAccessToken；
+ * - collector 的 /wx/phone-login-bundle 在同一设备锁、blank-off和runtime窗口中原子配对
+ *   手机号 encryptedData/iv 与新的 wx.login code；禁止拆成两个独立collector调用。
  *
  * 依赖青龙环境：wx_server_url、wx_auth（由统一执行器注入）
  * scriptVersionNow = "1.0.0";
@@ -112,30 +114,27 @@ async function mideaPost(path, data, headers = {}, originalInput = true) {
   return body;
 }
 
-function extractPhoneAuth(data) {
+function extractPhoneBundle(data) {
   const raw = data?.raw || data?.data?.raw || {};
   return {
+    // collector 原子接口在同一设备锁/blank-off/runtime窗口中配对手机号密文与登录code。
+    code: data?.data?.loginCode || data?.loginCode || '',
     encryptedData: data?.encryptedData || raw.encryptedData || '',
     iv: data?.iv || raw.iv || '',
   };
 }
 
-function extractCode(data) {
-  return data?.data?.code || data?.code || '';
-}
-
 async function login() {
-  console.log('正在获取当前美的主端手机号授权...');
-  const phone = extractPhoneAuth(await collectorPost('/wx/getphonenumber', 'phone'));
-  if (!phone.encryptedData || !phone.iv) throw new Error('手机号授权结果缺少 encryptedData/iv');
-
-  const jsCode = extractCode(await collectorPost('/wx/code', 'code'));
-  if (!jsCode) throw new Error('微信授权采集器未返回登录 code');
+  console.log('正在获取当前美的主端手机号授权登录包...');
+  const phone = extractPhoneBundle(await collectorPost('/wx/phone-login-bundle', 'phone-login'));
+  if (!phone.code || !phone.encryptedData || !phone.iv) {
+    throw new Error('手机号授权结果缺少同会话 code/encryptedData/iv');
+  }
 
   const body = await mideaPost(
     'api/cms_bff/mcsp-uc-mvip-bff/app/login/wx/mini/getLoginInfo.do',
     {
-      jsCode,
+      jsCode: phone.code,
       channelCode: CHANNEL,
       encryptedData: phone.encryptedData,
       ivStr: phone.iv,

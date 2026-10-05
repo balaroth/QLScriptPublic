@@ -592,12 +592,21 @@ class Task {
     }
 }
 
+function classifyAggregateSign(sign = "") {
+    const value = String(sign || "").trim();
+    if (/signed=false/.test(value)) return "failed";
+    if (value === "今日已签到" || /signed=true|^签到成功(?:\s|:|$)|任务奖励已领取|任务已完成/.test(value)) return "success";
+    if (/未找到签到\/每日任务|未开启签到|非会员跳过/.test(value)) return "neutral";
+    return "failed";
+}
+
 !(async () => {
     const plan = APPS.map((app) => ({ app, accounts: getAccounts(app) })).filter((item) => item.accounts.length);
     const totalAccounts = plan.reduce((sum, item) => sum + item.accounts.length, 0);
     $.log(`共找到${plan.length}个小程序，${totalAccounts}个执行账号`);
     if (!plan.length) {
         $.log(`未配置 ${CK_NAME} 或原单脚本变量`);
+        $.log(`[QLRUN_RESULT] FAILURE retryable=0 total=0 success=0 neutral=0 failed=0 reason=no_configured_accounts`);
         return;
     }
 
@@ -611,25 +620,25 @@ class Task {
     }
 
     $.log("\n========== 执行汇总 ==========");
-    let core = 0, noaction = 0, blocked = 0;
+    let success = 0, neutral = 0, failed = 0;
     for (const item of summaries) {
-        const sig = String(item.sign || "");
-        // core: 真正签到完成（今日已签 或 Submit 后 IsCheckIn=true）
-        // noaction: 门店未开启签到/无每日任务（服务端明确无可签）
-        // blocked: 门店离线/商城到期/收益卡未配/签到未完成（门店侧确定性，重试无效）
-        if (sig === "今日已签到" || /signed=true/.test(sig)) { item.status = "core"; core++; }
-        else if (sig === "未找到签到/每日任务") { item.status = "noaction"; noaction++; }
-        else { item.status = "blocked"; blocked++; }
+        item.status = classifyAggregateSign(item.sign);
+        if (item.status === "success") success++;
+        else if (item.status === "neutral") neutral++;
+        else failed++;
         $.log(`${item.appName}: [${item.status}] ${item.member} ${item.assets} 签到=${item.sign}`);
     }
     const total = summaries.length;
-    // 诚实结构化结果：core=真正签到成功的门店；blocked/noaction 为门店侧确定性状态。
-    // 无 blocked（全部可达门店都签上）才算 SUCCESS；有 blocked 保留不可重试失败并给出 core 口径。
-    if (blocked === 0) {
-        $.log(`[QLRUN_RESULT] SUCCESS core=${core}/${total}`);
+    // 聚合型任务：只要至少一个已执行子项没有失败（真实成功或明确无可执行动作），总任务即成功。
+    // 只有所有已执行子项全部失败时，才输出结构化 FAILURE；逐项失败明细仍完整保留。
+    if (success + neutral > 0) {
+        $.log(`[QLRUN_RESULT] SUCCESS total=${total} success=${success} neutral=${neutral} failed=${failed}`);
     } else {
-        $.log(`[QLRUN_RESULT] FAILURE retryable=0 core=${core}/${total} blocked=${blocked} noaction=${noaction}`);
+        $.log(`[QLRUN_RESULT] FAILURE retryable=0 total=${total} success=0 neutral=0 failed=${failed} reason=all_subtasks_failed`);
     }
 })()
-    .catch((e) => $.log(e.message || e))
+    .catch((e) => {
+        $.log(e.message || e);
+        $.log(`[QLRUN_RESULT] FAILURE retryable=1 reason=aggregate_fatal_error`);
+    })
     .finally(() => $.done());

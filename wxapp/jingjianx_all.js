@@ -606,6 +606,13 @@ class ShopTask {
     }
 }
 
+function classifyAggregateSign(sign = "") {
+    const value = String(sign || "").trim();
+    if (value === "今日已签到" || /^签到成功(?:\s|$)/.test(value)) return "success";
+    if (/未开启签到|非会员跳过/.test(value)) return "neutral";
+    return "failed";
+}
+
 !(async () => {
     const totalEntries = parseEntries(process.env[CK_NAME] || "");
     const summaries = [];
@@ -629,15 +636,31 @@ class ShopTask {
 
     if (!summaries.length) {
         $.log(`未找到账号，请配置 ${CK_NAME} 或原单脚本变量名`);
+        $.log(`[QLRUN_RESULT] FAILURE retryable=0 total=0 success=0 neutral=0 failed=0 reason=no_configured_accounts`);
         return;
     }
 
     $.log("\n========== jingjianx 签到汇总 ==========");
+    let success = 0, neutral = 0, failed = 0;
     for (const item of summaries) {
+        item.status = classifyAggregateSign(item.sign);
+        if (item.status === "success") success++;
+        else if (item.status === "neutral") neutral++;
+        else failed++;
         $.log(
-            `${item.appName} | ${item.loginShopName || item.shopName} | ${item.memberText || "未知用户"} | 代币=${item.assets.coin} 积分=${item.assets.integral} 彩票=${item.assets.ticket} 优惠券=${item.assets.coupon} | ${item.sign}`
+            `${item.appName} | ${item.loginShopName || item.shopName} | [${item.status}] ${item.memberText || "未知用户"} | 代币=${item.assets.coin} 积分=${item.assets.integral} 彩票=${item.assets.ticket} 优惠券=${item.assets.coupon} | ${item.sign}`
         );
     }
+    const total = summaries.length;
+    // 聚合型任务：存在任意真实成功或明确中性结果即总成功；只有全部已执行门店失败才总失败。
+    if (success + neutral > 0) {
+        $.log(`[QLRUN_RESULT] SUCCESS total=${total} success=${success} neutral=${neutral} failed=${failed}`);
+    } else {
+        $.log(`[QLRUN_RESULT] FAILURE retryable=0 total=${total} success=0 neutral=0 failed=${failed} reason=all_subtasks_failed`);
+    }
 })()
-    .catch((e) => $.log(e.message || e))
+    .catch((e) => {
+        $.log(e.message || e);
+        $.log(`[QLRUN_RESULT] FAILURE retryable=1 reason=aggregate_fatal_error`);
+    })
     .finally(() => $.done());

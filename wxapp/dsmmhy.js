@@ -78,10 +78,18 @@ function short(v, n = 200) {
 }
 
 const isOk = (res) => Number(res?.code) === 0;
-const msgOf = (res) => res?.msg || res?.message || short(res);
+const msgOf = (res) => res?.msg || res?.message || res?.data?.desc || res?.data?.message || short(res);
 const isAlreadyDone = (t) => /已签|已经签|签到过|重复|已完成|already/i.test(String(t || ""));
 const isNotMember = (res) =>
     Number(res?.code) === 1000000002 || /userId must be|未注册|请先注册|注册会员|开通会员|没有会员/i.test(msgOf(res));
+const isSessionInvalid = (res) =>
+    Number(res?.code) === 401 || /invalid\s*session|session\s*(?:invalid|expired)|会话失效|登录失效|未登录/i.test(msgOf(res));
+
+function sessionError(res) {
+    const error = new Error(`SESSION_INVALID:${msgOf(res) || "invalid session"}`);
+    error.code = "SESSION_INVALID";
+    return error;
+}
 
 class Task {
     constructor(raw) {
@@ -170,6 +178,15 @@ class Task {
         this.log(`登录成功（店铺 kdtId=${this.cred.kdtId}${d.nickname ? `，${d.nickname}` : ""}）`);
     }
 
+    removeCachedCredential() {
+        const cache = readCache();
+        if (cache[this.account.openid]) {
+            delete cache[this.account.openid];
+            writeCache(cache);
+        }
+        this.cred = null;
+    }
+
     async h5Get(apiPath, params = {}) {
         const q = new URLSearchParams({
             store_id: "",
@@ -185,13 +202,14 @@ class Task {
             timeout: 15000,
             validateStatus: () => true,
         });
+        if (isSessionInvalid(data)) throw sessionError(data);
         return data;
     }
 
     async checkSession() {
         try {
-            const res = await this.h5Get("/wscaccount/api/authorize/data.json");
-            return isOk(res);
+            const res = await this.h5Get("/wscump/checkin/check-in-info.json");
+            return isOk(res) && !isSessionInvalid(res);
         } catch (e) {
             return false;
         }
@@ -205,8 +223,8 @@ class Task {
                 this.log("使用缓存ck");
                 return;
             }
-            this.log("缓存ck失效，重新登录");
-            this.cred = null;
+            this.log("缓存ck不可用，重新登录");
+            this.removeCachedCredential();
         }
         if (!this.cred) await this.login();
     }
@@ -222,7 +240,9 @@ class Task {
             } else if (isNotMember(info)) {
                 this.notMember = true;
             }
-        } catch (e) {}
+        } catch (e) {
+            if (e?.code === "SESSION_INVALID") throw e;
+        }
         return CHECKIN_ID;
     }
 
@@ -245,7 +265,9 @@ class Task {
             if (isNotMember(act)) {
                 return this.log("⚠️ 该微信号还没在袋鼠妈妈注册会员（有赞签到要先注册），请在小程序里注册一次再跑");
             }
-        } catch (e) {}
+        } catch (e) {
+            if (e?.code === "SESSION_INVALID") throw e;
+        }
 
         const res = await this.h5Get("/wscump/checkin/checkinV2.json", { checkinId });
         if (isOk(res)) {
@@ -279,8 +301,19 @@ class Task {
             return;
         }
         try {
-            await this.ensureLogin();
-            await this.sign();
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    await this.ensureLogin();
+                    await this.sign();
+                    return;
+                } catch (e) {
+                    if (e?.code !== "SESSION_INVALID" || attempt > 0) throw e;
+                    this.log("检测到会话过期，清理缓存并重新登录");
+                    this.removeCachedCredential();
+                    this.notMember = false;
+                    await this.login();
+                }
+            }
         } catch (e) {
             if (String(e.message).startsWith("NO_ACCOUNT")) {
                 this.log("⚠️ 该微信号还没在袋鼠妈妈注册会员（有赞登录未激活），请在小程序里登录注册一次再跑");

@@ -8,8 +8,9 @@
  * - 旧线下会员签到接口 create_daily_score 已退役；
  * - 旧营销签到活动已退役；
  * - 当前正式主端使用 wx49a622805968d156 + 手机号授权 + ucAccessToken；
- * - collector 的 /wx/phone-login-bundle 在同一设备锁、blank-off和runtime窗口中原子配对
- *   手机号 encryptedData/iv 与新的 wx.login code；禁止拆成两个独立collector调用。
+ * - collector 的 /wx/login-phone-bundle 在同一设备锁、blank-off和runtime窗口中原子配对
+ *   新的 wx.login code 与随后生成的手机号 encryptedData/iv；禁止拆成两个独立collector调用，
+ *   也禁止在手机号授权完成后再调用 wx.login（会轮换 session_key，造成密文偶发失配）。
  *
  * 依赖青龙环境：wx_server_url、wx_auth（由统一执行器注入）
  * scriptVersionNow = "1.0.0";
@@ -125,31 +126,44 @@ function extractPhoneBundle(data) {
 }
 
 async function login() {
-  console.log('正在获取当前美的主端手机号授权登录包...');
-  const phone = extractPhoneBundle(await collectorPost('/wx/phone-login-bundle', 'phone-login'));
-  if (!phone.code || !phone.encryptedData || !phone.iv) {
-    throw new Error('手机号授权结果缺少同会话 code/encryptedData/iv');
-  }
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    console.log(`正在获取当前美的主端手机号授权登录包${attempt > 1 ? '（重新获取）' : ''}...`);
+    const phone = extractPhoneBundle(
+      await collectorPost('/wx/login-phone-bundle', `login-phone-${attempt}-${process.env.MDHY_TEST_NONCE || Date.now()}`),
+    );
+    if (!phone.code || !phone.encryptedData || !phone.iv) {
+      throw new Error('手机号授权结果缺少同会话 code/encryptedData/iv');
+    }
 
-  const body = await mideaPost(
-    'api/cms_bff/mcsp-uc-mvip-bff/app/login/wx/mini/getLoginInfo.do',
-    {
-      jsCode: phone.code,
-      channelCode: CHANNEL,
-      encryptedData: phone.encryptedData,
-      ivStr: phone.iv,
-      loginMode: 2,
-      platformType: PLATFORM,
-    },
-    {},
-    false,
-  );
-  const session = body.data || {};
-  if (!session.ucAccessToken || !session.c4aUid || !session.openId) {
-    throw new Error('美的登录成功但缺少 ucAccessToken/c4aUid/openId');
+    try {
+      const body = await mideaPost(
+        'api/cms_bff/mcsp-uc-mvip-bff/app/login/wx/mini/getLoginInfo.do',
+        {
+          jsCode: phone.code,
+          channelCode: CHANNEL,
+          encryptedData: phone.encryptedData,
+          ivStr: phone.iv,
+          loginMode: 2,
+          platformType: PLATFORM,
+        },
+        {},
+        false,
+      );
+      const session = body.data || {};
+      if (!session.ucAccessToken || !session.c4aUid || !session.openId) {
+        throw new Error('美的登录成功但缺少 ucAccessToken/c4aUid/openId');
+      }
+      console.log('美的主端手机号授权登录成功');
+      return session;
+    } catch (error) {
+      lastError = error;
+      const deterministic = /缺少 ucAccessToken|缺少同会话|缺少 wx_auth/i.test(String(error?.message || error));
+      if (attempt >= 2 || deterministic) throw error;
+      console.log('本轮授权包未通过登录校验，重新获取整套授权包');
+    }
   }
-  console.log('美的主端手机号授权登录成功');
-  return session;
+  throw lastError || new Error('美的登录失败');
 }
 
 function authHeaders(session) {

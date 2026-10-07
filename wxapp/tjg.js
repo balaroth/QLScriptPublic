@@ -274,6 +274,10 @@ class Task {
 
     async sign() {
         const before = await this.verifySignDone(1);
+        if (process.env.TJG_GATE_FORCE_SECURE_INIT === "1") {
+            await collectorSecureNetworkInit(`gate-${this.index}`);
+            this.log("门禁模式：官方安全网络初始化验证通过");
+        }
         if (isSignTaskDone(before)) {
             this.log(`今日已签到（官方任务进度 ${before.now}/${before.daily_limit}）`);
             return "already";

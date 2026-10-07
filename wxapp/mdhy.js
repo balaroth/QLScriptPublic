@@ -20,6 +20,8 @@
 
 const axios = require('axios');
 const notify = require('../sendNotify');
+const fs = require('fs');
+const path = require('path');
 
 const NAME = '美的会员签到';
 const APPID = 'wx49a622805968d156';
@@ -32,6 +34,31 @@ const WX_SERVER = (process.env.wx_server_url || 'http://d4.dqf.cc.cd:8787').repl
 const WX_AUTH = process.env.wx_auth || '';
 const REQUEST_TIMEOUT = Number(process.env.MIDEA_REQUEST_TIMEOUT || 40000);
 const COLLECTOR_TIMEOUT = Number(process.env.MIDEA_COLLECTOR_TIMEOUT || 140000);
+const DEFAULT_SESSION_CACHE_DIR = fs.existsSync('/ql/data/config') ? '/ql/data/config' : __dirname;
+const SESSION_CACHE_FILE = process.env.MIDEA_SESSION_CACHE_FILE || path.join(DEFAULT_SESSION_CACHE_DIR, '.midea_member_session.json');
+
+function readSessionCache() {
+  try {
+    const session = JSON.parse(fs.readFileSync(SESSION_CACHE_FILE, 'utf8'));
+    return session && session.ucAccessToken && session.c4aUid && session.openId ? session : null;
+  } catch (_) { return null; }
+}
+
+function writeSessionCache(session) {
+  const tmp = `${SESSION_CACHE_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({
+    ucAccessToken: session.ucAccessToken,
+    c4aUid: session.c4aUid,
+    openId: session.openId,
+    updatedAt: new Date().toISOString(),
+  }), { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, SESSION_CACHE_FILE);
+  try { fs.chmodSync(SESSION_CACHE_FILE, 0o600); } catch (_) {}
+}
+
+function clearSessionCache() {
+  try { fs.unlinkSync(SESSION_CACHE_FILE); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
 
 let failed = false;
 let retryable = false;
@@ -127,16 +154,18 @@ function extractPhoneBundle(data) {
 
 async function login() {
   let lastError = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    console.log(`正在获取当前美的主端手机号授权登录包${attempt > 1 ? '（重新获取）' : ''}...`);
-    const phone = extractPhoneBundle(
-      await collectorPost('/wx/login-phone-bundle', `login-phone-${attempt}-${process.env.MDHY_TEST_NONCE || Date.now()}`),
-    );
-    if (!phone.code || !phone.encryptedData || !phone.iv) {
-      throw new Error('手机号授权结果缺少同会话 code/encryptedData/iv');
-    }
-
+  const strategies = ['/wx/midea-login-phone-bundle', '/wx/midea-login-phone-bundle', '/wx/phone-login-bundle'];
+  for (let attempt = 1; attempt <= strategies.length; attempt++) {
+    const route = strategies[attempt - 1];
+    console.log(`正在获取当前美的主端手机号授权登录包（${route}，第${attempt}次）...`);
     try {
+      const phone = extractPhoneBundle(
+        await collectorPost(route, `phone-login-${attempt}-${process.env.MDHY_TEST_NONCE || Date.now()}`),
+      );
+      if (!phone.code || !phone.encryptedData || !phone.iv) {
+        throw new Error('手机号授权结果缺少同会话 code/encryptedData/iv');
+      }
+
       const body = await mideaPost(
         'api/cms_bff/mcsp-uc-mvip-bff/app/login/wx/mini/getLoginInfo.do',
         {
@@ -154,13 +183,15 @@ async function login() {
       if (!session.ucAccessToken || !session.c4aUid || !session.openId) {
         throw new Error('美的登录成功但缺少 ucAccessToken/c4aUid/openId');
       }
-      console.log('美的主端手机号授权登录成功');
+      await getProfile(session, { quiet: true });
+      writeSessionCache(session);
+      console.log('美的主端手机号授权登录成功，会员接口验真通过并已更新session缓存');
       return session;
     } catch (error) {
       lastError = error;
-      const deterministic = /缺少 ucAccessToken|缺少同会话|缺少 wx_auth/i.test(String(error?.message || error));
-      if (attempt >= 2 || deterministic) throw error;
-      console.log('本轮授权包未通过登录校验，重新获取整套授权包');
+      const deterministic = /缺少 wx_auth/i.test(String(error?.message || error));
+      if (deterministic) throw error;
+      if (attempt < strategies.length) console.log(`本轮授权链路未通过验真：${safeText(error.message)}；切换整套授权策略`);
     }
   }
   throw lastError || new Error('美的登录失败');
@@ -175,7 +206,7 @@ function authHeaders(session) {
   };
 }
 
-async function getProfile(session) {
+async function getProfile(session, options = {}) {
   const body = await mideaPost(
     'api/cms_bff/mcsp-uc-mvip-bff/member/getMemberInfo.do',
     {
@@ -193,8 +224,10 @@ async function getProfile(session) {
   const point = profile.vipPoint ?? profile.vipPointPool ?? '未知';
   const growth = profile.vipGrow ?? '未知';
   const level = profile.levelName || profile.mfansLevelName || '普通会员';
-  console.log(`会员身份有效：${level}，积分 ${point}，成长值 ${growth}`);
-  notification.push(`会员身份有效：${level}，积分 ${point}，成长值 ${growth}`);
+  if (!options.quiet) {
+    console.log(`会员身份有效：${level}，积分 ${point}，成长值 ${growth}`);
+    notification.push(`会员身份有效：${level}，积分 ${point}，成长值 ${growth}`);
+  }
   return profile;
 }
 
@@ -253,8 +286,22 @@ async function main() {
   console.log(`\n🔔${NAME},开始!`);
   console.log('协议：当前美的主端手机号授权登录 + 统一会员/积分接口');
   console.log('说明：旧版每日签到和营销签到活动均已退役，不再调用');
-  const session = await login();
-  const profile = await getProfile(session);
+  let session = readSessionCache();
+  let profile;
+  if (session) {
+    try {
+      profile = await getProfile(session);
+      console.log('缓存session经会员接口验真通过');
+    } catch (error) {
+      console.log(`缓存session失效，进入完整手机号授权恢复：${safeText(error.message)}`);
+      clearSessionCache();
+      session = null;
+    }
+  }
+  if (!session) {
+    session = await login();
+    profile = await getProfile(session);
+  }
   await getScoreDetail(session, profile);
   const tasks = await getPointTasks(session);
   await receiveReadyTasks(session, tasks);

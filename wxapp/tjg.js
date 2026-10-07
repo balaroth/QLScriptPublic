@@ -122,6 +122,30 @@ async function apiRequest(method, endpoint, token, params = {}) {
     return body;
 }
 
+async function collectorSecureNetworkInit(label) {
+    if (!process.env.wx_auth) {
+        const error = new Error("缺少 wx_auth，无法初始化签到安全网络");
+        error.retryable = false;
+        throw error;
+    }
+    const nonce = ["tjg-secure", label, process.env.TJG_TEST_NONCE || Date.now(), Math.random().toString(36).slice(2, 10)].join("-");
+    const response = await axios.post(`${WX_SERVER_URL}/wx/secure-network-init`, {
+        appid: MINI_APP_ID,
+        openid: nonce,
+    }, {
+        headers: { auth: process.env.wx_auth, "Content-Type": "application/json" },
+        timeout: 180000,
+        validateStatus: () => true,
+    });
+    const body = response.data || {};
+    if (response.status !== 200 || body.status !== true) {
+        const error = new Error(`安全网络初始化失败: ${body.message || short(body)}`);
+        error.retryable = true;
+        throw error;
+    }
+    return true;
+}
+
 async function collectorRuntimeCode(label) {
     if (!process.env.wx_auth) {
         const error = new Error("缺少 wx_auth，无法获取签到所需 wx_code");
@@ -256,6 +280,7 @@ class Task {
         }
 
         let lastBody = null;
+        await collectorSecureNetworkInit(this.index);
         for (let attempt = 1; attempt <= 2; attempt++) {
             const wxCode = await collectorRuntimeCode(`sign-${this.index}-${attempt}`);
             const body = await apiRequest("GET", EP.sign, this.token, { wx_code: wxCode });

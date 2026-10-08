@@ -178,6 +178,23 @@ class Task {
         lastError = error;
         if (error instanceof AuthExpiredError) throw error;
         const status = error.response && error.response.status;
+        const body = error.response && error.response.data;
+        const apiCode = body && typeof body === 'object' ? Number(body.code) : null;
+        if (
+          status === 401 ||
+          status === 403 ||
+          apiCode === 40001 ||
+          /未授权|登录已过期|请先登录|无效的令牌|令牌无效|token\s*(?:invalid|expired)/i.test(
+            (body && body.msg) || '',
+          )
+        ) {
+          throw new AuthExpiredError((body && body.msg) || undefined, {
+            cause: error,
+            apiCode: body && body.code,
+            httpStatus: status,
+            endpoint: options.url,
+          });
+        }
         const retryable =
           idempotent &&
           attempt < attempts &&
@@ -559,16 +576,17 @@ async function main() {
   const accounts = parseAccounts(raw);
   const readOnly = boolEnv('XINXI_READ_ONLY', false);
   const probeOnly = boolEnv('XINXI_PROBE_ONLY', false);
+  const mode = probeOnly ? '探活' : readOnly ? '只读' : '任务';
   logger.log(
     `共找到${accounts.length}个账号${readOnly ? '（只读模式）' : ''}${probeOnly ? '（仅探活）' : ''}`,
   );
 
   let failed = 0;
+  let skipped = false;
   if (!accounts.length) {
     if (!probeOnly) {
-      logger.error('未配置 xinxi（兼容 XSSONF）账号；拒绝把后端探活误报为业务成功');
-      logger.log('如只需检查后端是否在线，请显式设置 XINXI_PROBE_ONLY=1');
-      failed += 1;
+      skipped = true;
+      logger.warn('未配置 xinxi（兼容 XSSONF）账号，本次按未配置跳过，不冒充业务成功');
     } else {
       logger.warn('未配置业务账号，按 XINXI_PROBE_ONLY=1 仅执行后端探活');
       const probe = await probeBackend(axios, logger);
@@ -586,7 +604,16 @@ async function main() {
     }
   }
 
-  logger.log(`执行汇总：账号=${accounts.length}，失败=${failed}，模式=${readOnly ? '只读' : '任务'}`);
+  logger.log(`执行汇总：账号=${accounts.length}，失败=${failed}，模式=${mode}`);
+  if (failed) {
+    console.log(`[QLRUN_RESULT] FAILURE accounts=${accounts.length} failed=${failed} retryable=1`);
+  } else if (skipped) {
+    console.log('[QLRUN_RESULT] SKIP reason=no_accounts configured=0');
+  } else if (probeOnly) {
+    console.log('[QLRUN_RESULT] SUCCESS reason=backend_probe_ok');
+  } else {
+    console.log(`[QLRUN_RESULT] SUCCESS accounts=${accounts.length} failed=0 mode=${mode}`);
+  }
   await env.sendMsg();
   const seconds = ((Date.now() - env.startTime) / 1000).toFixed(3);
   console.log(`🔔${env.name},结束!🕛 ${seconds}秒`);

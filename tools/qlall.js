@@ -44,7 +44,7 @@ function ts() { return new Date().toLocaleString("zh-CN", { hour12: false, timeZ
 // 业务脚本发现：递归收集可直接运行的入口脚本，排除库/备份/资源
 function discover() {
     const out = [];
-    const EXCLUDE_DIR = new Set(["node_modules", "tools", "backup", "function", "assets", "cache", ".git"]);
+    const EXCLUDE_DIR = new Set(["node_modules", "tools", "backup", "function", "assets", "cache", ".git", "tests"]);
     const EXCLUDE_FILE = new Set(["sendNotify.js", "wcs.js", "env.js", "notify.py"]);
     (function walk(dir) {
         for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {

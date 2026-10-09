@@ -7,7 +7,10 @@
 cron: 30 7 * * *
 ------------------------------------------
 环境变量：
-  xinxi=sso#备注              多账号使用换行或 & 分隔（兼容旧变量 XSSONF）
+  xinxi=sso#备注              可选；多账号使用换行或 & 分隔（兼容旧变量 XSSONF）
+  wx_server_url               自动登录所需，collector 地址（d3 已配置）
+  wx_auth                     自动登录所需，collector 鉴权值（d3 已配置）
+  XINXI_AUTO_LOGIN=1          默认开启：无 sso 或 sso 失效时自动用 wx.login code 换新 sso
   XINXI_READ_ONLY=1           只读验证，不执行签到/评论/点赞/关注/分享
   XINXI_PROBE_ONLY=1          未配置账号时仅探测后端；默认缺账号会失败，防止误报成功
   XINXI_HTTP_TIMEOUT=15000    请求超时（毫秒）
@@ -22,6 +25,8 @@ const { Env } = require('../tools/env');
 
 const API_BASE = 'https://api.xinc818.com';
 const CDN_API_BASE = 'https://cdn-api.xinc818.com';
+const MINI_APP_ID = 'wx673f827a4c2c94fa';
+const DEFAULT_WX_SERVER_URL = 'http://d4.dqf.cc.cd:8787';
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) ' +
   'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 ' +
@@ -92,6 +97,53 @@ function randomRequestId(timestamp) {
   return `${crypto.randomBytes(12).toString('hex')}-${timestamp}`;
 }
 
+function wxServerConfig() {
+  return {
+    url: String(process.env.wx_server_url || DEFAULT_WX_SERVER_URL).replace(/\/+$/, ''),
+    auth: process.env.wx_auth || '',
+  };
+}
+
+async function exchangeCodeForToken(code, http = axios, timeout = 20000) {
+  const response = await http.request({
+    method: 'GET',
+    url: `${API_BASE}/mini/wechat/login`,
+    params: { code },
+    timeout,
+    headers: { 'User-Agent': DEFAULT_USER_AGENT },
+  });
+  const result = response && response.data;
+  if (!result || Number(result.code) !== 0 || typeof result.data !== 'string' || !result.data) {
+    throw new AuthExpiredError(
+      `微信静默登录失败：${(result && result.msg) || '响应中没有 sso'}`,
+      { apiCode: result && result.code },
+    );
+  }
+  return result.data;
+}
+
+async function fetchTokenFromCollector(options = {}) {
+  const http = options.http || axios;
+  const logger = options.logger || console;
+  const timeout = options.timeout || intEnv('XINXI_LOGIN_TIMEOUT', 120000, 10000, 180000);
+  const config = options.wxServer || wxServerConfig();
+  if (!config.auth) throw new ApiError('缺少 wx_auth，无法自动获取微信登录 code');
+  logger.log('通过 collector 获取心喜 wx.login code...');
+  const response = await http.request({
+    method: 'POST',
+    url: `${config.url}/wx/code`,
+    data: { appid: MINI_APP_ID, openid: `xinxi-${Date.now()}` },
+    timeout,
+    headers: { auth: config.auth, 'Content-Type': 'application/json' },
+  });
+  const body = response && response.data;
+  const code = body && (body.code || (body.data && body.data.code));
+  if (!code) throw new ApiError(`collector 未返回 code：${JSON.stringify(body || {})}`);
+  const token = await exchangeCodeForToken(code, http, Math.min(timeout, 30000));
+  logger.log('心喜 sso 自动获取成功');
+  return token;
+}
+
 function createLogger(env) {
   return {
     log: (message) => env.log(message),
@@ -118,13 +170,35 @@ class Task {
     this.goods = [];
     this.failures = [];
     this.authValid = false;
+    this.autoLogin = options.autoLogin ?? boolEnv('XINXI_AUTO_LOGIN', true);
+    this.tokenProvider = options.tokenProvider || (() => fetchTokenFromCollector({ http: this.http, logger: this.logger }));
+    this.authRefreshAttempted = false;
   }
 
   prefix(message) {
     return `账号[${this.index}]【${this.remark}】${message}`;
   }
 
+  async ensureToken(force = false) {
+    if (this.token && !force) return this.token;
+    if (!this.autoLogin) throw new AuthExpiredError('未配置 sso，且 XINXI_AUTO_LOGIN 已关闭');
+    if (this.authRefreshAttempted && force) throw new AuthExpiredError('自动刷新 sso 后仍鉴权失败');
+    this.authRefreshAttempted = true;
+    this.logger.log(this.prefix(`${force ? 'sso 已失效，正在自动刷新' : '未配置 sso，正在自动登录'}`));
+    this.token = await this.tokenProvider();
+    return this.token;
+  }
+
+  async retryAfterAuth(error, options, meta) {
+    if (this.autoLogin && !meta.authRetry && !this.authRefreshAttempted) {
+      await this.ensureToken(true);
+      return this.request(options, { ...meta, authRetry: true });
+    }
+    throw error;
+  }
+
   async request(options, meta = {}) {
+    if (!meta.noAuth) await this.ensureToken(false);
     const method = String(options.method || 'GET').toUpperCase();
     const idempotent = meta.idempotent === true;
     const attempts = idempotent ? this.maxRetries + 1 : 1;
@@ -176,7 +250,9 @@ class Task {
         return result;
       } catch (error) {
         lastError = error;
-        if (error instanceof AuthExpiredError) throw error;
+        if (error instanceof AuthExpiredError) {
+          return this.retryAfterAuth(error, options, meta);
+        }
         const status = error.response && error.response.status;
         const body = error.response && error.response.data;
         const apiCode = body && typeof body === 'object' ? Number(body.code) : null;
@@ -188,12 +264,16 @@ class Task {
             (body && body.msg) || '',
           )
         ) {
-          throw new AuthExpiredError((body && body.msg) || undefined, {
-            cause: error,
-            apiCode: body && body.code,
-            httpStatus: status,
-            endpoint: options.url,
-          });
+          return this.retryAfterAuth(
+            new AuthExpiredError((body && body.msg) || undefined, {
+              cause: error,
+              apiCode: body && body.code,
+              httpStatus: status,
+              endpoint: options.url,
+            }),
+            options,
+            meta,
+          );
         }
         const retryable =
           idempotent &&
@@ -502,6 +582,10 @@ class Task {
           await this.wait(500);
         } catch (error) {
           const message = `${task.taskName || task.code || '未知任务'}：${errorText(error)}`;
+          if (/未注册|未绑定手机号|请先绑定手机号/.test(message)) {
+            this.logger.warn(this.prefix(`${message}，当前账号未完成手机号注册，已跳过该会员任务`));
+            continue;
+          }
           this.failures.push(message);
           this.logger.error(this.prefix(message));
           if (error instanceof AuthExpiredError) throw error;
@@ -512,8 +596,7 @@ class Task {
         await this.signContinuous();
         await this.getGoods();
       } catch (error) {
-        this.failures.push(errorText(error));
-        this.logger.warn(this.prefix(`收尾查询失败：${errorText(error)}`));
+        this.logger.warn(this.prefix(`收尾查询失败（不影响签到结果）：${errorText(error)}`));
       }
 
       for (const item of this.goods) {
@@ -573,7 +656,11 @@ async function main() {
   const env = new Env('辛喜小程序');
   const logger = createLogger(env);
   const raw = process.env.xinxi || process.env.XSSONF || '';
+  const autoLogin = boolEnv('XINXI_AUTO_LOGIN', true);
   const accounts = parseAccounts(raw);
+  if (!accounts.length && autoLogin && !boolEnv('XINXI_PROBE_ONLY', false)) {
+    accounts.push({ token: '', remark: process.env.XINXI_REMARK || '自动登录账号' });
+  }
   const readOnly = boolEnv('XINXI_READ_ONLY', false);
   const probeOnly = boolEnv('XINXI_PROBE_ONLY', false);
   const mode = probeOnly ? '探活' : readOnly ? '只读' : '任务';
@@ -630,11 +717,14 @@ if (require.main === module) {
 module.exports = {
   API_BASE,
   CDN_API_BASE,
+  MINI_APP_ID,
   ApiError,
   AuthExpiredError,
   Task,
   parseAccounts,
   generateMd5Signature,
+  exchangeCodeForToken,
+  fetchTokenFromCollector,
   probeBackend,
   errorText,
 };

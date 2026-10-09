@@ -115,7 +115,7 @@ while [ $ATT -lt $ATTEMPTS ]; do
     echo "[$(TS)] [qlrun] ===== 第 ${ATT}/${ATTEMPTS} 次执行：$NAME ====="
 
     QL_SUPPRESS_NOTIFY=1 ONLY_ERROR_NOTIFY=true \
-      timeout --foreground -s 2 -k 15s $RUN_TIMEOUT task "$FILE" > "$OUT" 2>&1
+      timeout --foreground -s 2 -k 15s $RUN_TIMEOUT /ql/shell/task.sh "$FILE" > "$OUT" 2>&1
     RC=$?
     cat "$OUT"
 

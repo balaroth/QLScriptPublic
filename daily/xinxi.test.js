@@ -8,6 +8,9 @@ const {
   parseAccounts,
   generateMd5Signature,
   probeBackend,
+  exchangeCodeForToken,
+  fetchTokenFromCollector,
+  MINI_APP_ID,
 } = require(process.env.XINXI_CANDIDATE || './xinxi.js');
 
 const silentLogger = { log() {}, warn() {}, error() {} };
@@ -42,7 +45,7 @@ async function testAuthExpiredStopsAccount() {
   };
   const task = new Task(
     { token: 'expired', remark: '失效账号' },
-    { http, logger: silentLogger, maxRetries: 0, wait: async () => {} },
+    { http, logger: silentLogger, maxRetries: 0, wait: async () => {}, autoLogin: false },
   );
   const result = await task.run();
   assert.strictEqual(result.ok, false);
@@ -64,6 +67,7 @@ async function testStringAuthCodeAndHttpAuthStatus() {
         logger: silentLogger,
         maxRetries: 0,
         wait: async () => {},
+        autoLogin: false,
       },
     );
     await assert.rejects(
@@ -94,6 +98,7 @@ async function testRejectedHttpAuthStatus() {
         logger: silentLogger,
         maxRetries: 2,
         wait: async () => {},
+        autoLogin: false,
       },
     );
     await assert.rejects(
@@ -225,11 +230,116 @@ async function testProbeBackendRetriesTransientFailure() {
   assert.strictEqual(cdn.attempts, 2);
 }
 
+async function testAutomaticLoginFlow() {
+  const calls = [];
+  const http = {
+    async request(options) {
+      calls.push(options);
+      if (options.url.endsWith('/wx/code')) {
+        assert.strictEqual(options.data.appid, MINI_APP_ID);
+        assert.strictEqual(options.headers.auth, 'auth-value');
+        return response({ status: true, code: 'wx-code' });
+      }
+      if (options.url.endsWith('/mini/wechat/login')) {
+        assert.strictEqual(options.params.code, 'wx-code');
+        return response({ code: 0, msg: 'OK', data: 'fresh-sso' });
+      }
+      throw new Error(`unexpected ${options.url}`);
+    },
+  };
+  const token = await fetchTokenFromCollector({
+    http,
+    logger: silentLogger,
+    wxServer: { url: 'http://collector.test', auth: 'auth-value' },
+    timeout: 10000,
+  });
+  assert.strictEqual(token, 'fresh-sso');
+  assert.strictEqual(calls.length, 2);
+}
+
+async function testMissingTokenAutoLogin() {
+  const headers = [];
+  const http = {
+    async request(options) {
+      headers.push(options.headers || {});
+      return response({ code: 0, data: { nickname: '自动登录', integral: 1 } });
+    },
+  };
+  let tokenCalls = 0;
+  const task = new Task(
+    { token: '', remark: '自动' },
+    {
+      http,
+      logger: silentLogger,
+      maxRetries: 0,
+      wait: async () => {},
+      tokenProvider: async () => { tokenCalls += 1; return 'fresh-sso'; },
+    },
+  );
+  await task.userInfo();
+  assert.strictEqual(tokenCalls, 1);
+  assert.strictEqual(headers[0].sso, 'fresh-sso');
+}
+
+async function testExpiredTokenRefreshesOnce() {
+  let calls = 0;
+  let tokenCalls = 0;
+  const http = {
+    async request(options) {
+      calls += 1;
+      if (calls === 1) return response({ code: 40001, msg: '登录已过期' });
+      assert.strictEqual(options.headers.sso, 'refreshed-sso');
+      return response({ code: 0, data: { nickname: '刷新成功', integral: 2 } });
+    },
+  };
+  const task = new Task(
+    { token: 'expired', remark: '刷新' },
+    {
+      http,
+      logger: silentLogger,
+      maxRetries: 0,
+      wait: async () => {},
+      tokenProvider: async () => { tokenCalls += 1; return 'refreshed-sso'; },
+    },
+  );
+  const user = await task.userInfo();
+  assert.strictEqual(user.nickname, '刷新成功');
+  assert.strictEqual(calls, 2);
+  assert.strictEqual(tokenCalls, 1);
+}
+
+async function testUnregisteredMemberTasksDoNotFailSignIn() {
+  const http = {
+    async request(options) {
+      if (options.url.endsWith('/mini/user')) return response({ code: 0, data: { nickname: '游客', integral: 1 } });
+      if (options.url.endsWith('/mini/sign/status')) return response({ code: 0, data: true });
+      if (options.url.endsWith('/mini/dailyTask/daily')) {
+        return response({ code: 0, data: [{ code: 'SHARE', taskName: '分享', status: false }] });
+      }
+      if (options.url.endsWith('/mini/dailyTask/share')) return response({ code: 40002, msg: '未注册', data: null });
+      if (options.url.endsWith('/mini/sign/continuous')) return response({ code: 0, data: 1 });
+      if (options.url.includes('/mini/integralGoods?')) {
+        const error = new Error('timeout');
+        error.code = 'ECONNABORTED';
+        throw error;
+      }
+      throw new Error(`unexpected ${options.url}`);
+    },
+  };
+  const task = new Task(
+    { token: 'valid', remark: '游客' },
+    { http, logger: silentLogger, maxRetries: 0, wait: async () => {} },
+  );
+  const result = await task.run();
+  assert.strictEqual(result.ok, true);
+  assert.deepStrictEqual(result.failures, []);
+}
+
 async function testNoAccountIsExplicitSkip() {
   const script = process.env.XINXI_CANDIDATE || './xinxi.js';
   const child = spawnSync(process.execPath, [script], {
     cwd: __dirname,
-    env: { ...process.env, xinxi: '', XSSONF: '', XINXI_PROBE_ONLY: '' },
+    env: { ...process.env, xinxi: '', XSSONF: '', XINXI_PROBE_ONLY: '', XINXI_AUTO_LOGIN: '0' },
     encoding: 'utf8',
   });
   const output = `${child.stdout || ''}\n${child.stderr || ''}`;
@@ -252,6 +362,10 @@ async function main() {
     testUnknownTaskSkips,
     testProbeBackend,
     testProbeBackendRetriesTransientFailure,
+    testAutomaticLoginFlow,
+    testMissingTokenAutoLogin,
+    testExpiredTokenRefreshesOnce,
+    testUnregisteredMemberTasksDoNotFailSignIn,
     testNoAccountIsExplicitSkip,
   ];
   for (const test of tests) {

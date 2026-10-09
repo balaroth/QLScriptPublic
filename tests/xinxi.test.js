@@ -10,6 +10,7 @@ const {
   probeBackend,
   exchangeCodeForToken,
   fetchTokenFromCollector,
+  fetchPhoneFromCollector,
   MINI_APP_ID,
 } = require(process.env.XINXI_CANDIDATE || './xinxi.js');
 
@@ -115,7 +116,7 @@ async function testReadOnlyNeverWrites() {
     async request(options) {
       calls.push({ method: String(options.method || 'GET').toUpperCase(), url: options.url });
       if (options.url.endsWith('/mini/user')) {
-        return response({ code: 0, data: { nickname: '测试', integral: 10 } });
+        return response({ code: 0, data: { nickname: '测试', integral: 10, mobile: '138****0000' } });
       }
       if (options.url.endsWith('/mini/sign/status')) return response({ code: 0, data: false });
       if (options.url.endsWith('/mini/dailyTask/daily')) {
@@ -308,31 +309,86 @@ async function testExpiredTokenRefreshesOnce() {
   assert.strictEqual(tokenCalls, 1);
 }
 
-async function testUnregisteredMemberTasksDoNotFailSignIn() {
+async function testPhoneCollectorContract() {
+  let called = 0;
   const http = {
     async request(options) {
-      if (options.url.endsWith('/mini/user')) return response({ code: 0, data: { nickname: '游客', integral: 1 } });
-      if (options.url.endsWith('/mini/sign/status')) return response({ code: 0, data: true });
-      if (options.url.endsWith('/mini/dailyTask/daily')) {
-        return response({ code: 0, data: [{ code: 'SHARE', taskName: '分享', status: false }] });
+      called += 1;
+      assert.strictEqual(options.url, 'http://collector.test/wx/getphonenumber');
+      assert.strictEqual(options.data.appid, MINI_APP_ID);
+      assert.strictEqual(options.headers.auth, 'auth-value');
+      return response({ status: true, code: 'phone-code', encryptedData: 'enc', iv: 'iv' });
+    },
+  };
+  const result = await fetchPhoneFromCollector({
+    http,
+    logger: silentLogger,
+    wxServer: { url: 'http://collector.test', auth: 'auth-value' },
+    timeout: 10000,
+  });
+  assert.strictEqual(result.code, 'phone-code');
+  assert.strictEqual(called, 1);
+}
+
+async function testUnregisteredIdentityAutoBinds() {
+  let userCalls = 0;
+  let tokenCalls = 0;
+  const http = {
+    async request(options) {
+      if (options.url.endsWith('/mini/user')) {
+        userCalls += 1;
+        return response({
+          code: 0,
+          data: userCalls === 1
+            ? { nickname: '未注册', integral: 1, mobile: null, authorizedPhoneTime: null }
+            : { nickname: '已注册', integral: 2, mobile: '138****0000', authorizedPhoneTime: '2024-01-01' },
+        });
       }
-      if (options.url.endsWith('/mini/dailyTask/share')) return response({ code: 40002, msg: '未注册', data: null });
-      if (options.url.endsWith('/mini/sign/continuous')) return response({ code: 0, data: 1 });
-      if (options.url.includes('/mini/integralGoods?')) {
-        const error = new Error('timeout');
-        error.code = 'ECONNABORTED';
-        throw error;
+      if (options.url.endsWith('/mini/wechat/getNewPhoneNoInfo')) {
+        assert.deepStrictEqual(options.data, { code: 'phone-code', encryptedData: 'enc', ivStr: 'iv' });
+        return response({ code: 0, msg: 'OK', data: true });
       }
       throw new Error(`unexpected ${options.url}`);
     },
   };
   const task = new Task(
-    { token: 'valid', remark: '游客' },
+    { token: 'first-sso', remark: '自动绑定' },
+    {
+      http,
+      logger: silentLogger,
+      maxRetries: 0,
+      wait: async () => {},
+      tokenProvider: async () => { tokenCalls += 1; return 'registered-sso'; },
+      phoneProvider: async () => ({ code: 'phone-code', encryptedData: 'enc', iv: 'iv' }),
+    },
+  );
+  const first = await task.userInfo();
+  const registered = await task.ensureRegistered(first);
+  assert.strictEqual(registered.mobile, '138****0000');
+  assert.strictEqual(task.token, 'registered-sso');
+  assert.strictEqual(userCalls, 2);
+  assert.strictEqual(tokenCalls, 1);
+}
+
+async function testUnregisteredTaskIsFailure() {
+  const http = {
+    async request(options) {
+      if (options.url.endsWith('/mini/user')) return response({ code: 0, data: { nickname: '已注册', mobile: '138****0000', integral: 1 } });
+      if (options.url.endsWith('/mini/sign/status')) return response({ code: 0, data: true });
+      if (options.url.endsWith('/mini/dailyTask/daily')) return response({ code: 0, data: [{ code: 'SHARE', taskName: '分享', status: false }] });
+      if (options.url.endsWith('/mini/dailyTask/share')) return response({ code: 40002, msg: '未注册', data: null });
+      if (options.url.endsWith('/mini/sign/continuous')) return response({ code: 0, data: 1 });
+      if (options.url.includes('/mini/integralGoods?')) return response({ code: 0, data: { list: [] } });
+      throw new Error(`unexpected ${options.url}`);
+    },
+  };
+  const task = new Task(
+    { token: 'valid', remark: '异常身份' },
     { http, logger: silentLogger, maxRetries: 0, wait: async () => {} },
   );
   const result = await task.run();
-  assert.strictEqual(result.ok, true);
-  assert.deepStrictEqual(result.failures, []);
+  assert.strictEqual(result.ok, false);
+  assert.match(result.failures.join('\n'), /未注册/);
 }
 
 async function testNoAccountIsExplicitSkip() {
@@ -365,7 +421,9 @@ async function main() {
     testAutomaticLoginFlow,
     testMissingTokenAutoLogin,
     testExpiredTokenRefreshesOnce,
-    testUnregisteredMemberTasksDoNotFailSignIn,
+    testPhoneCollectorContract,
+    testUnregisteredIdentityAutoBinds,
+    testUnregisteredTaskIsFailure,
     testNoAccountIsExplicitSkip,
   ];
   for (const test of tests) {

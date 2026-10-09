@@ -144,6 +144,27 @@ async function fetchTokenFromCollector(options = {}) {
   return token;
 }
 
+async function fetchPhoneFromCollector(options = {}) {
+  const http = options.http || axios;
+  const logger = options.logger || console;
+  const timeout = options.timeout || intEnv('XINXI_LOGIN_TIMEOUT', 120000, 10000, 180000);
+  const config = options.wxServer || wxServerConfig();
+  if (!config.auth) throw new ApiError('缺少 wx_auth，无法获取手机号授权数据');
+  logger.log('通过 collector 获取心喜手机号授权数据...');
+  const response = await http.request({
+    method: 'POST',
+    url: `${config.url}/wx/getphonenumber`,
+    data: { appid: MINI_APP_ID },
+    timeout,
+    headers: { auth: config.auth, 'Content-Type': 'application/json' },
+  });
+  const body = response && response.data;
+  if (!body || body.status !== true || (!body.code && !body.encryptedData)) {
+    throw new ApiError(`collector 未返回有效手机号授权数据：${JSON.stringify(body || {})}`);
+  }
+  return body;
+}
+
 function createLogger(env) {
   return {
     log: (message) => env.log(message),
@@ -172,7 +193,9 @@ class Task {
     this.authValid = false;
     this.autoLogin = options.autoLogin ?? boolEnv('XINXI_AUTO_LOGIN', true);
     this.tokenProvider = options.tokenProvider || (() => fetchTokenFromCollector({ http: this.http, logger: this.logger }));
+    this.phoneProvider = options.phoneProvider || (() => fetchPhoneFromCollector({ http: this.http, logger: this.logger }));
     this.authRefreshAttempted = false;
+    this.phoneBindAttempted = false;
   }
 
   prefix(message) {
@@ -310,6 +333,35 @@ class Task {
     this.authValid = true;
     this.logger.log(this.prefix(`用户【${data.nickname || '未命名'}】，积分【${data.integral ?? '未知'}】`));
     return data;
+  }
+
+  async ensureRegistered(user) {
+    if (user && (user.mobile || user.authorizedPhoneTime)) return user;
+    if (this.readOnly) {
+      throw new ApiError('当前静默登录身份未关联手机号，且只读模式禁止自动绑定');
+    }
+    if (this.phoneBindAttempted) throw new ApiError('手机号自动绑定后用户仍显示未注册');
+    this.phoneBindAttempted = true;
+    this.logger.log(this.prefix('当前静默登录身份未关联手机号，正在自动恢复已注册身份'));
+    const phone = await this.phoneProvider();
+    const payload = { code: phone.code || '' };
+    if (phone.encryptedData) payload.encryptedData = phone.encryptedData;
+    if (phone.iv) payload.ivStr = phone.iv;
+    const result = await this.request({
+      method: 'POST',
+      url: `${API_BASE}/mini/wechat/getNewPhoneNoInfo`,
+      headers: { 'Content-Type': 'application/json' },
+      data: payload,
+    });
+    this.unwrap(result, '手机号身份恢复');
+    this.logger.log(this.prefix('手机号身份恢复成功，正在刷新 sso'));
+    this.token = await this.tokenProvider();
+    this.authRefreshAttempted = true;
+    const refreshed = await this.userInfo();
+    if (!refreshed.mobile && !refreshed.authorizedPhoneTime) {
+      throw new ApiError('手机号身份恢复接口成功，但用户注册字段仍为空');
+    }
+    return refreshed;
   }
 
   async signStatus() {
@@ -556,7 +608,8 @@ class Task {
   async run() {
     this.logger.log(this.prefix(`开始${this.readOnly ? '只读验证' : '执行任务'}`));
     try {
-      await this.userInfo();
+      let user = await this.userInfo();
+      user = await this.ensureRegistered(user);
       const signState = await this.signStatus();
       if (!signState && !this.readOnly) {
         await this.signIn();
@@ -582,10 +635,6 @@ class Task {
           await this.wait(500);
         } catch (error) {
           const message = `${task.taskName || task.code || '未知任务'}：${errorText(error)}`;
-          if (/未注册|未绑定手机号|请先绑定手机号/.test(message)) {
-            this.logger.warn(this.prefix(`${message}，当前账号未完成手机号注册，已跳过该会员任务`));
-            continue;
-          }
           this.failures.push(message);
           this.logger.error(this.prefix(message));
           if (error instanceof AuthExpiredError) throw error;
@@ -725,6 +774,7 @@ module.exports = {
   generateMd5Signature,
   exchangeCodeForToken,
   fetchTokenFromCollector,
+  fetchPhoneFromCollector,
   probeBackend,
   errorText,
 };

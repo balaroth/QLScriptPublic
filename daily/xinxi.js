@@ -4,7 +4,7 @@
 ------------------------------------------
 @Author: sm / hardened by balaroth
 @Description: 辛喜小程序任务
-cron: 30 7 * * *
+schedule: 由 qlall 统一执行；qlrun 条目仅供手工运行，不设独立周期
 ------------------------------------------
 环境变量：
   xinxi=sso#备注              可选；多账号使用换行或 & 分隔（兼容旧变量 XSSONF）
@@ -377,11 +377,28 @@ class Task {
   }
 
   async signIn() {
-    const result = await this.request({
+    const options = {
       method: 'GET',
       url: `${API_BASE}/mini/sign/in?dailyTaskId=`,
       headers: { 'Content-Type': 'application/json' },
-    });
+    };
+    let result;
+    try {
+      result = await this.request(options);
+    } catch (error) {
+      const status = error.httpStatus || (error.cause && error.cause.response && error.cause.response.status);
+      const transient = !status || status === 408 || status === 429 || status >= 500;
+      if (!transient) throw error;
+
+      this.logger.warn(this.prefix(`签到请求结果不确定，先核对服务端签到状态：${errorText(error)}`));
+      if (await this.signStatus()) {
+        this.logger.log(this.prefix('签到状态：已签到（服务端已落账）'));
+        return { idempotent: true };
+      }
+
+      this.logger.warn(this.prefix('服务端仍显示未签到，受控补偿签到 1 次'));
+      result = await this.request(options);
+    }
     const data = this.unwrap(result, '签到') || {};
     this.logger.log(this.prefix(`签到成功，获得积分【${data.integral ?? '未知'}】`));
     return data;

@@ -114,8 +114,13 @@ while [ $ATT -lt $ATTEMPTS ]; do
     OUT="$OUTD/${NAME}.$$.$ATT.log"
     echo "[$(TS)] [qlrun] ===== 第 ${ATT}/${ATTEMPTS} 次执行：$NAME ====="
 
-    QL_SUPPRESS_NOTIFY=1 ONLY_ERROR_NOTIFY=true \
-      timeout --foreground -s 2 -k 15s $RUN_TIMEOUT /ql/shell/task.sh "$FILE" > "$OUT" 2>&1
+    (
+      # 青龙定时任务会注入这些日志重定向变量；若传给子 task，子日志不会回到 OUT，
+      # qlrun 将看不到 [QLRUN_RESULT] 并把成功误判为失败。
+      unset no_tee real_log_path log_name real_time
+      export QL_SUPPRESS_NOTIFY=1 ONLY_ERROR_NOTIFY=true
+      timeout --foreground -s 2 -k 15s $RUN_TIMEOUT /ql/shell/task.sh "$FILE"
+    ) > "$OUT" 2>&1
     RC=$?
     cat "$OUT"
 

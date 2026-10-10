@@ -391,6 +391,65 @@ async function testUnregisteredTaskIsFailure() {
   assert.match(result.failures.join('\n'), /未注册/);
 }
 
+async function testUncertainSignInVerifiesServerState() {
+  let signCalls = 0;
+  let statusCalls = 0;
+  const http = {
+    async request(options) {
+      if (options.url.includes('/mini/sign/in')) {
+        signCalls += 1;
+        const error = new Error('Request failed with status code 502');
+        error.response = { status: 502, data: 'Bad Gateway' };
+        throw error;
+      }
+      if (options.url.endsWith('/mini/sign/status')) {
+        statusCalls += 1;
+        return response({ code: 0, data: true });
+      }
+      throw new Error(`unexpected ${options.url}`);
+    },
+  };
+  const task = new Task(
+    { token: 'valid', remark: '签到核验' },
+    { http, logger: silentLogger, maxRetries: 0, wait: async () => {} },
+  );
+  const result = await task.signIn();
+  assert.strictEqual(result.idempotent, true);
+  assert.strictEqual(signCalls, 1, '服务端已签到时禁止重复写');
+  assert.strictEqual(statusCalls, 1);
+}
+
+async function testUncertainSignInRetriesOnceWhenNotSigned() {
+  let signCalls = 0;
+  let statusCalls = 0;
+  const http = {
+    async request(options) {
+      if (options.url.includes('/mini/sign/in')) {
+        signCalls += 1;
+        if (signCalls === 1) {
+          const error = new Error('Request failed with status code 502');
+          error.response = { status: 502, data: 'Bad Gateway' };
+          throw error;
+        }
+        return response({ code: 0, data: { integral: 10 } });
+      }
+      if (options.url.endsWith('/mini/sign/status')) {
+        statusCalls += 1;
+        return response({ code: 0, data: false });
+      }
+      throw new Error(`unexpected ${options.url}`);
+    },
+  };
+  const task = new Task(
+    { token: 'valid', remark: '签到补偿' },
+    { http, logger: silentLogger, maxRetries: 0, wait: async () => {} },
+  );
+  const result = await task.signIn();
+  assert.strictEqual(result.integral, 10);
+  assert.strictEqual(signCalls, 2, '服务端未签到时只补偿一次');
+  assert.strictEqual(statusCalls, 1);
+}
+
 async function testNoAccountIsExplicitSkip() {
   const script = process.env.XINXI_CANDIDATE || './xinxi.js';
   const child = spawnSync(process.execPath, [script], {
@@ -424,6 +483,8 @@ async function main() {
     testPhoneCollectorContract,
     testUnregisteredIdentityAutoBinds,
     testUnregisteredTaskIsFailure,
+    testUncertainSignInVerifiesServerState,
+    testUncertainSignInRetriesOnceWhenNotSigned,
     testNoAccountIsExplicitSkip,
   ];
   for (const test of tests) {

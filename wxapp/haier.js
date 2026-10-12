@@ -123,21 +123,33 @@ class Task {
         writeCache(cache);
         this.log("登录成功");
     }
+    clearCachedToken() {
+        const cache = readCache();
+        if (Object.prototype.hasOwnProperty.call(cache, this.account.openid)) {
+            delete cache[this.account.openid];
+            writeCache(cache);
+        }
+        this.token = "";
+    }
     async sign(retry = true) {
         const res = await this.request(EP_SIGN, {});
         if (res?.retCode === "00000") {
             const d = res.data || {};
-            return this.log(`✅ 签到成功${d.totalSignDay !== undefined ? `，已连续 ${d.totalSignDay} 天` : ""}`);
+            this.log(`✅ 签到成功${d.totalSignDay !== undefined ? `，已连续 ${d.totalSignDay} 天` : ""}`);
+            return true;
         }
         const msg = res?.retInfo || res?.message || res?.msg || short(res);
-        if (/已签|签到过|重复|已完成/.test(String(msg))) return this.log(`✅ 今日已签到（${msg}）`);
-        if (retry && /token|登录|未授权|失效|过期|未登录|鉴权/i.test(String(msg))) {
-            this.log("会话失效，重新登录后重试");
-            this.token = "";
+        if (/已签|签到过|重复|已完成/.test(String(msg))) {
+            this.log(`✅ 今日已签到（${msg}）`);
+            return true;
+        }
+        if (retry && /token|登录|未授权|失效|过期|未登录|鉴权|用户信息获取失败/i.test(String(msg))) {
+            this.log(`会话失效（${msg}），清除缓存并重新登录后重试`);
+            this.clearCachedToken();
             await this.login();
             return this.sign(false);
         }
-        this.log(`❌ 签到失败: ${msg}`);
+        throw new Error(`签到失败: ${msg}`);
     }
     async ensureLogin() {
         const cached = readCache()[this.account.openid] || {};
@@ -145,25 +157,36 @@ class Task {
         if (!this.token) await this.login();
     }
     async run() {
-        if (!this.account.openid) { this.log("跳过：变量值里没有 openid"); return; }
+        if (!this.account.openid) { this.log("跳过：变量值里没有 openid"); return false; }
         try {
             await this.ensureLogin();
-            await this.sign();
+            return await this.sign();
         } catch (e) {
             if (String(e.message).startsWith("NO_ACCOUNT")) {
                 this.log("⚠️ 该微信号还没在海尔智家注册会员，先在小程序里登录注册一次再跑");
-                return;
+                return false;
             }
             this.log(`执行失败: ${e.message || e}`);
+            return false;
         }
     }
 }
 
 !(async () => {
     $.checkEnv(ckName);
-    if (!$.userCount) { $.log(`未找到变量 ${ckName}`); return; }
+    if (!$.userCount) {
+        $.log(`未找到变量 ${ckName}`);
+        console.log("[QLRUN_RESULT] FAILURE accounts=0 failed=1 retryable=0");
+        return;
+    }
+    let failed = 0;
     for (let i = 0; i < $.userList.length; i++) {
-        await new Task($.userList[i]).run();
+        if (!(await new Task($.userList[i]).run())) failed += 1;
         if (i < $.userList.length - 1) await $.wait(1500, 3000);
     }
-})().catch((e) => $.log(e.message || e)).finally(() => $.done());
+    if (failed) console.log(`[QLRUN_RESULT] FAILURE accounts=${$.userList.length} failed=${failed} retryable=1`);
+    else console.log(`[QLRUN_RESULT] SUCCESS accounts=${$.userList.length} failed=0`);
+})().catch((e) => {
+    $.log(e.message || e);
+    console.log("[QLRUN_RESULT] FAILURE accounts=0 failed=1 retryable=1");
+}).finally(() => $.done());

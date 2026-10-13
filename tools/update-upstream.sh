@@ -19,10 +19,16 @@ exec > >(tee -a "$LOG") 2>&1
 
 restore_runtime_files() {
   if [ -d "$RUNTIME_BACKUP" ]; then
-    (cd "$RUNTIME_BACKUP" && find . -type f -print0) | while IFS= read -r -d '' rel; do
+    (cd "$RUNTIME_BACKUP" && find . -type f ! -name '.tracked-files' -print0) | while IFS= read -r -d '' rel; do
       mkdir -p "$REPO/$(dirname "$rel")"
       cp "$RUNTIME_BACKUP/$rel" "$REPO/$rel"
     done
+    if [ -f "$RUNTIME_BACKUP/.tracked-files" ]; then
+      while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        git update-index --skip-worktree -- "$rel" > /dev/null 2>&1 || true
+      done < "$RUNTIME_BACKUP/.tracked-files"
+    fi
     rm -rf "$RUNTIME_BACKUP"
   fi
 }
@@ -54,8 +60,12 @@ for runtime_file in wxapp/*_token_cache.json wxapp/*_cache.json daily/*_token_ca
   [ -f "$runtime_file" ] || continue
   mkdir -p "$RUNTIME_BACKUP/$(dirname "$runtime_file")"
   cp "$runtime_file" "$RUNTIME_BACKUP/$runtime_file"
-  if git ls-files --error-unmatch "$runtime_file" >/dev/null 2>&1; then
-    git checkout -- "$runtime_file"
+  if git ls-files --error-unmatch -- "$runtime_file" > /dev/null 2>&1; then
+    # 运行态缓存通常标记为 skip-worktree；checkout 会把这种路径误报为 pathspec 不存在。
+    # 临时解除标记并恢复 HEAD，合并结束后由 trap 还原现场内容及 skip-worktree 状态。
+    printf '%s\n' "$runtime_file" >> "$RUNTIME_BACKUP/.tracked-files"
+    git update-index --no-skip-worktree -- "$runtime_file"
+    git restore --source=HEAD --worktree -- "$runtime_file"
   fi
 done
 if ! git diff --quiet || ! git diff --cached --quiet; then

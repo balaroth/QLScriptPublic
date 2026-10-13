@@ -89,6 +89,7 @@ class Task {
         this.duid = "";
         this.udl = "";
         this.uid = "";
+        this.retryable = true;
     }
     log(text) {
         $.log(`账号[${this.index}]${this.account.remark ? `[${this.account.remark}]` : ""} ${text}`);
@@ -140,6 +141,75 @@ class Task {
         return { status: res.status, data: res.data, text: typeof res.data === "string" ? res.data : JSON.stringify(res.data) };
     }
 
+    // XWeb 桥：经 wx_server /wx/xweb 转发到 d4 hook 模块，在真实微信 WebView 会话内执行 JS
+    // （外部 passport cticket 体系不被 m.ctrip.com/restapi 认可 -> 404001；真实会话内读接口全部成功）
+    async xwebEval(script, urlPrefix) {
+        const serverUrl = (process.env.wx_server_url || "http://192.168.31.196:8787").replace(/\/+$/, "");
+        const res = await axios.post(`${serverUrl}/wx/xweb`, { appid: MINI_APP_ID, script, urlPrefix }, {
+            timeout: 45000,
+            validateStatus: () => true,
+            headers: { "Content-Type": "application/json", auth: process.env.wx_auth || "" },
+        });
+        const data = res.data || {};
+        if (res.status !== 200 || data.status === false) throw new Error(`xweb 桥: ${data.message || res.status}`);
+        return data; // {ok, url, out}
+    }
+
+    // 在真实签到 H5 会话内执行 signToday（页面自身会话 cookie + 动态 GUID），如实拿到服务端判定
+    async signViaXWeb() {
+        const PREFIX = "https://m.ctrip.com/activitysetupapp/mkt/index/membersignin2021";
+        const inj = "(function(){if(window.__xchyR)return window.__xchyR;window.__xchyR='PENDING';" +
+            "var u=document.URL||'';var cid='';var m=u.match(/cid%22%3A%22([0-9]+)/);if(m)cid=m[1];" +
+            "var oid='';m=u.match(/mpopenid=([^&]+)/);if(m){try{oid=decodeURIComponent(m[1]);}catch(e){oid=m[1];}}" +
+            "var body=JSON.stringify({platform:'miniProgram',openId:oid,rmsToken:'',head:{cid:cid,ctok:'',cver:'1.0',lang:'01',sid:'8888',syscode:'09',auth:'',xsid:'',extension:[]}});" +
+            "fetch('https://m.ctrip.com/restapi/soa2/22769/signToday',{method:'POST',headers:{'Content-Type':'application/json'},body:body})" +
+            ".then(function(r){return r.text();}).then(function(t){window.__xchyR=t;})" +
+            ".catch(function(e){window.__xchyR='ERR:'+String(e&&e.message||e);});" +
+            "return 'PENDING';})()";
+        const r1 = await this.xwebEval(inj, PREFIX);
+        if (r1.out && r1.out !== 'PENDING') return parseJsonMaybe(r1.out);
+        for (let i = 0; i < 10; i++) {
+            await new Promise((rs) => setTimeout(rs, 2000));
+            const rr = await this.xwebEval("(function(){return window.__xchyR||'NONE';})()", PREFIX);
+            const out = rr.out || '';
+            if (out && out !== 'PENDING' && out !== 'NONE') return parseJsonMaybe(out);
+        }
+        throw new Error('XWeb 代签超时（20s 无响应）');
+    }
+
+    async fetchMarketOpenId() {
+        const code = await this.getCode();
+        const res = await this.h5Api("/restapi/soa2/13447/getMKTOpenID.json", {
+            appID: MINI_APP_ID,
+            code,
+            platformType: "android",
+            allianceID: "262684",
+            sID: "711465",
+            oUID: "",
+            sourceID: "",
+            exMKTID: "",
+            pageID: "",
+        });
+        const data = res.data || {};
+        const openId = data?.data?.mktOpenID || data?.mktOpenID || "";
+        const resultCode = String(data?.data?.resultCode ?? data?.resultCode ?? "");
+        if (res.status !== 200 || resultCode !== "0" || !openId) {
+            throw new Error(`获取携程市场openId失败[${res.status}]: ${data?.resultMsg || data?.message || short(data)}`);
+        }
+        this.ctripOpenId = String(openId);
+        this.log("携程市场身份获取成功");
+        return this.ctripOpenId;
+    }
+
+    saveCache() {
+        const cache = readCache();
+        cache[this.openid] = {
+            ticket: this.ticket, duid: this.duid, udl: this.udl, uid: this.uid,
+            ctripOpenId: this.ctripOpenId, updatedAt: new Date().toISOString(),
+        };
+        writeCache(cache);
+    }
+
     async login() {
         const code = await this.getCode();
 
@@ -183,14 +253,8 @@ class Task {
         this.duid = login.duid || login.extendedProperties?.duid || "";
         this.udl = login.udl || "";
         this.uid = login.uid || login.extendedProperties?.uid || "";
-        // 若登录响应里带明文 openId，则优先用它做 signToday（否则用账号 openid）
-        this.ctripOpenId = login.openId || login.extendedProperties?.openId || "";
-        const cache = readCache();
-        cache[this.openid] = {
-            ticket: this.ticket, duid: this.duid, udl: this.udl, uid: this.uid,
-            ctripOpenId: this.ctripOpenId, updatedAt: new Date().toISOString(),
-        };
-        writeCache(cache);
+        await this.fetchMarketOpenId();
+        this.saveCache();
         this.log(`登录成功: ${mask(this.uid || this.ticket)}`);
     }
 
@@ -200,6 +264,11 @@ class Task {
             this.ticket = cached.ticket; this.duid = cached.duid || ""; this.udl = cached.udl || "";
             this.uid = cached.uid || ""; this.ctripOpenId = cached.ctripOpenId || "";
             this.log("使用缓存ticket");
+            if (!this.ctripOpenId) {
+                this.log("缓存缺少携程市场身份，正在自动补齐");
+                await this.fetchMarketOpenId();
+                this.saveCache();
+            }
             return;
         }
         if (!this.ticket) await this.login();
@@ -220,15 +289,49 @@ class Task {
 
     async sign(retry = true) {
         const st = await this.querySignStatus();
-        if (st && st.signed) return this.log("✅ 今日已签到");
+        if (st && st.signed) {
+            this.log("✅ 今日已签到");
+            return true;
+        }
 
-        const openId = this.ctripOpenId || this.openid || "";
-        const res = await this.h5Api("/restapi/soa2/22769/signToday", { openId });
+        // ===== 主路径：XWeb 桥代签（真实微信 WebView 会话；外部直连必然 404001 未登录）=====
+        try {
+            const r = await this.signViaXWeb();
+            const message = (r && (r.message || r.Message)) || "";
+            const code = Number(r && r.code);
+            const points = Number(r && (r.baseIntegratedPoint || 0)) + Number(r && (r.extraIntegratedPoint || 0));
+            if (okResponseStatus(r) && (code === 0 || /成功/.test(message))) {
+                this.log(`✅ 签到成功（真实小程序会话）${message ? `：${message}` : ""}${points ? `，积分+${points}` : ""}`);
+                return true;
+            }
+            if (/已签到|已经签到|无法补签|重复/.test(message) || code === 400001) {
+                this.log(`✅ 今日已签到（真实小程序会话：${message || code}）`);
+                return true;
+            }
+            if (code === 404002 || /未满足当前活动参与条件/.test(message)) {
+                throw new Error(`ACCOUNT_RISK:签到失败[404002 账号活动风控]：${message || "未满足当前活动参与条件"}。已由真实手机复现，与脚本、登录态及 VPS 地域无关；该账号当前不可参与活动`);
+            }
+            if (code === 404001 || /未登录|登录失效|请重新登录/.test(message)) {
+                if (retry) { this.log("XWeb 桥会话未登录(404001)，等待后重试"); await new Promise((rs) => setTimeout(rs, 4000)); return this.sign(false); }
+                throw new Error(`签到失败[404001]：${message || ""}`);
+            }
+            if (/^ERR:/.test(String(r))) {
+                this.log(`XWeb 桥注入执行错误：${String(r).slice(0, 200)}，降级外部直连`);
+            } else {
+                this.log(`XWeb 桥返回未识别响应：${short(r, 300)}，降级外部直连`);
+            }
+        } catch (e) {
+            if (/404002|未满足当前活动参与条件/.test(e.message)) throw e;
+            this.log(`XWeb 桥代签不可用：${e.message}，降级外部直连`);
+        }
+
+        // ===== 降级：外部 Cookie 直连（passport cticket 体系；历史验证会被 404001 未登录拦截）=====
+        if (!this.ctripOpenId) throw new Error("缺少携程市场openId，禁止使用账号标签冒充签到身份");
+        const res = await this.h5Api("/restapi/soa2/22769/signToday", { openId: this.ctripOpenId });
         if (DEBUG) this.log(`signToday [${res.status}]: ${short(res.text, 500)}`);
 
         if (res.status === 401 && (res.data?.code === "11001" || res.data?.code === 11001)) {
-            this.log(`❌ 签到接口被携程运行态校验拦截(401/11001)：${res.data.message || ""}`);
-            return { blocked: true };
+            throw new Error(`签到接口被携程运行态校验拦截(401/11001)：${res.data.message || ""}`);
         }
         if (res.status !== 200) {
             // 会话失效重登重试一次
@@ -238,23 +341,24 @@ class Task {
                 await this.login();
                 return this.sign(false);
             }
-            this.log(`❌ 签到请求异常[${res.status}]: ${short(res.text, 500)}`);
-            return;
+            throw new Error(`签到请求异常[${res.status}]: ${short(res.text, 500)}`);
         }
         const d = res.data || {};
         const message = d.message || d.Message || "";
         const code = Number(d.code);
         const points = Number(d.baseIntegratedPoint || 0) + Number(d.extraIntegratedPoint || 0);
         if (okResponseStatus(d) && (code === 0 || /成功/.test(message))) {
-            return this.log(`✅ 签到成功${message ? `：${message}` : ""}${points ? `，积分+${points}` : ""}`);
+            this.log(`✅ 签到成功${message ? `：${message}` : ""}${points ? `，积分+${points}` : ""}`);
+            return true;
         }
         if (/已签到|已经签到|无法补签|重复/.test(message) || code === 400001) {
-            return this.log(`✅ 今日已签到（${message || code}）`);
+            this.log(`✅ 今日已签到（${message || code}）`);
+            return true;
         }
         // 404002「未满足当前活动参与条件」= 携程运行态校验(风控)：真正的签到走 _fxpcqlniredt 代理通道，
         // 需小程序运行态生成的私有签名(n-payload-source/cSign)，Cookie 直连通道拿不到该上下文 -> 被拦。
         if (code === 404002 || /未满足当前活动参与条件/.test(message)) {
-            return this.log(`⚠️ 签到被携程运行态校验(风控)拦截：${message || code}（登录/状态查询正常，写操作需运行态私有签名，无法绕过）`);
+            throw new Error(`签到被携程运行态校验拦截：${message || code}`);
         }
         // 404001「未登录」：携程业务码，HTTP 200 + Ack=Success 时会被下方 okResponseStatus 分支当成
         // 正常返回直接打印，导致缓存 cticket 失效却不触发重登。显式在此拦截并刷新 ticket 重试一次。
@@ -265,7 +369,7 @@ class Task {
                 await this.login();
                 return this.sign(false);
             }
-            return this.log(`❌ 签到失败：${message || code}`);
+            throw new Error(`签到失败：${message || code}`);
         }
         if (okResponseStatus(d)) {
             return this.log(`签到返回：${short(res.text, 500)}`);
@@ -277,29 +381,49 @@ class Task {
             await this.login();
             return this.sign(false);
         }
-        this.log(`❌ 签到失败：${short(res.text, 500)}`);
+        throw new Error(`签到失败：${short(res.text, 500)}`);
     }
 
     async run() {
-        if (!this.openid) { this.log("跳过：变量值里没有 openid"); return; }
+        if (!this.openid) { this.log("跳过：变量值里没有账号标识"); return false; }
         try {
             await this.ensureLogin();
-            await this.sign();
+            return await this.sign();
         } catch (e) {
+            if (String(e.message).startsWith("ACCOUNT_RISK:")) {
+                this.retryable = false;
+                this.log(`执行失败: ${String(e.message).replace(/^ACCOUNT_RISK:/, "")}`);
+                return false;
+            }
             if (String(e.message).startsWith("NO_ACCOUNT")) {
                 this.log("⚠️ 该微信号还没在携程注册/绑定会员，先在小程序里登录一次再跑");
-                return;
+                return false;
             }
             this.log(`执行失败: ${e.message || e}`);
+            return false;
         }
     }
 }
 
 !(async () => {
     $.checkEnv(ckName);
-    if (!$.userCount) { $.log(`未找到变量 ${ckName}`); return; }
+    if (!$.userCount) {
+        $.log(`未找到变量 ${ckName}`);
+        console.log("[QLRUN_RESULT] FAILURE accounts=0 failed=1 retryable=0");
+        return;
+    }
+    let failed = 0, retryableFailed = 0;
     for (let i = 0; i < $.userList.length; i++) {
-        await new Task($.userList[i]).run();
+        const task = new Task($.userList[i]);
+        if (!(await task.run())) {
+            failed += 1;
+            if (task.retryable !== false) retryableFailed += 1;
+        }
         if (i < $.userList.length - 1) await $.wait(1500, 3000);
     }
-})().catch((e) => $.log(e.message || e)).finally(() => $.done());
+    if (failed) console.log(`[QLRUN_RESULT] FAILURE accounts=${$.userList.length} failed=${failed} retryable=${retryableFailed ? 1 : 0}`);
+    else console.log(`[QLRUN_RESULT] SUCCESS accounts=${$.userList.length} failed=0`);
+})().catch((e) => {
+    $.log(e.message || e);
+    console.log("[QLRUN_RESULT] FAILURE accounts=0 failed=1 retryable=1");
+}).finally(() => $.done());

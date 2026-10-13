@@ -18,19 +18,31 @@ RUNTIME_BACKUP="$(mktemp -d "$DATA/.qlrun/update-runtime.XXXXXX")"
 exec > >(tee -a "$LOG") 2>&1
 
 restore_runtime_files() {
+  local restore_failed=0 rel src dst
   if [ -d "$RUNTIME_BACKUP" ]; then
-    (cd "$RUNTIME_BACKUP" && find . -type f ! -name '.tracked-files' -print0) | while IFS= read -r -d '' rel; do
-      mkdir -p "$REPO/$(dirname "$rel")"
-      cp "$RUNTIME_BACKUP/$rel" "$REPO/$rel"
-    done
+    # 使用 process substitution 而不是管道，确保 restore_failed 在当前 shell 生效。
+    while IFS= read -r -d '' rel; do
+      src="$RUNTIME_BACKUP/$rel"
+      dst="$REPO/$rel"
+      mkdir -p "$(dirname "$dst")" || restore_failed=1
+      if ! cp -f -- "$src" "$dst" || ! cmp -s -- "$src" "$dst"; then
+        echo "[updater] failed to restore runtime file: $rel"
+        restore_failed=1
+      fi
+    done < <(cd "$RUNTIME_BACKUP" && find . -type f ! -name '.tracked-files' -print0)
     if [ -f "$RUNTIME_BACKUP/.tracked-files" ]; then
       while IFS= read -r rel; do
         [ -n "$rel" ] || continue
-        git update-index --skip-worktree -- "$rel" > /dev/null 2>&1 || true
+        git update-index --skip-worktree -- "$rel" > /dev/null 2>&1 || restore_failed=1
       done < "$RUNTIME_BACKUP/.tracked-files"
     fi
-    rm -rf "$RUNTIME_BACKUP"
+    if [ "$restore_failed" -eq 0 ]; then
+      rm -rf "$RUNTIME_BACKUP"
+    else
+      echo "[updater] runtime restore failed; backup retained: $RUNTIME_BACKUP"
+    fi
   fi
+  return "$restore_failed"
 }
 
 notify_failure() {
@@ -51,7 +63,15 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   rm -rf "$RUNTIME_BACKUP"
   exit 0
 fi
-trap 'restore_runtime_files; rm -rf "$LOCK_DIR"' EXIT INT TERM
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if ! restore_runtime_files; then rc=90; fi
+  rm -rf "$LOCK_DIR"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 cd "$REPO" || { echo "[updater] repository missing: $REPO"; exit 1; }
 # 运行态文件不得参与代码合并。即使上游曾误跟踪缓存，也先备份并恢复到 HEAD，

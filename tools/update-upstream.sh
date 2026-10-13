@@ -74,18 +74,18 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 cd "$REPO" || { echo "[updater] repository missing: $REPO"; exit 1; }
-# 运行态文件不得参与代码合并。即使上游曾误跟踪缓存，也先备份并恢复到 HEAD，
-# 合并结束或失败后由 trap 原样还原，避免覆盖当前登录态。
+# 运行态文件不得参与代码合并。只做去重备份并保持 tracked cache 为 skip-worktree；
+# 不再在更新前 restore/checkout 缓存，避免任一异常退出先破坏登录态。
+declare -A RUNTIME_SEEN=()
 for runtime_file in wxapp/*_token_cache.json wxapp/*_cache.json daily/*_token_cache.json jd/fruit_helpcode_new; do
   [ -f "$runtime_file" ] || continue
+  [ -z "${RUNTIME_SEEN[$runtime_file]+x}" ] || continue
+  RUNTIME_SEEN[$runtime_file]=1
   mkdir -p "$RUNTIME_BACKUP/$(dirname "$runtime_file")"
-  cp "$runtime_file" "$RUNTIME_BACKUP/$runtime_file"
+  cp -p -- "$runtime_file" "$RUNTIME_BACKUP/$runtime_file"
   if git ls-files --error-unmatch -- "$runtime_file" > /dev/null 2>&1; then
-    # 运行态缓存通常标记为 skip-worktree；checkout 会把这种路径误报为 pathspec 不存在。
-    # 临时解除标记并恢复 HEAD，合并结束后由 trap 还原现场内容及 skip-worktree 状态。
     printf '%s\n' "$runtime_file" >> "$RUNTIME_BACKUP/.tracked-files"
-    git update-index --no-skip-worktree -- "$runtime_file"
-    git restore --source=HEAD --worktree -- "$runtime_file"
+    git update-index --skip-worktree -- "$runtime_file"
   fi
 done
 if ! git diff --quiet || ! git diff --cached --quiet; then

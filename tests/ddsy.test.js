@@ -7,7 +7,9 @@ const path = require('path');
 const scriptPath = process.env.DDSY_UNDER_TEST || path.join(__dirname, 'ddsy.new.js');
 const {
   Task,
+  fetchDdkySession,
   fetchWxCode,
+  main,
   normalizeAccounts,
   parseAccount,
   parseJsonp,
@@ -66,6 +68,56 @@ async function test(name, fn) {
       () => fetchWxCode({ appid: 'wx1234567890abcdef', auth: 'secret', http: { request: async () => ({ status: 200, data: { status: false, message: 'no code' } }) } }),
       /collector 取码失败：no code/
     );
+  });
+
+  await test('collector ddky-session returns complete business session', async () => {
+    const session = await fetchDdkySession({
+      appid: 'wxc2edadc87077fa2a',
+      auth: 'secret',
+      url: 'http://collector',
+      http: { request: async (config) => {
+        assert.strictEqual(config.url, 'http://collector/wx/ddky-session');
+        assert.strictEqual(config.timeout, 180000);
+        return { status: 200, data: { status: true, via: 'runtime-code-openid-checkband', data: { loginToken: 'fresh-token', userId: '1234567890', uDate: '20261015134806', login: '18812341257' } } };
+      } },
+    });
+    assert.deepStrictEqual({ token: session.token, userId: session.userId, uDate: session.uDate, via: session.via }, {
+      token: 'fresh-token', userId: '1234567890', uDate: '20261015134806', via: 'runtime-code-openid-checkband',
+    });
+    assert.match(session.remark, /188\*{4}1257/);
+    await assert.rejects(
+      () => fetchDdkySession({ appid: 'wxc2edadc87077fa2a', auth: 'secret', http: { request: async () => ({ status: 200, data: { status: false, message: 'not bound' } }) } }),
+      /collector 自动登录失败：not bound/
+    );
+  });
+
+  await test('main prefers collector session over legacy variable', async () => {
+    const logs = [];
+    const collectorHttp = { request: async () => ({ status: 200, data: { status: true, via: 'runtime-code-openid-checkband', data: { loginToken: 'fresh-token', userId: 'fresh-user', uDate: 'fresh-date', login: '18812341257' } } }) };
+    let apiCalls = 0;
+    const http = { request: async (config) => {
+      apiCalls += 1;
+      assert.strictEqual(config.params.loginToken, 'fresh-token');
+      assert.strictEqual(config.params.userId, 'fresh-user');
+      return { status: 200, data: jsonp(config, { code: 0, result: { signDayVo: { isSingn: true, rewardsInfo: '12叮当币' } } }) };
+    } };
+    const results = await main({ raw: 'old-token#old-user#old-date', autoLogin: true, auth: 'secret', collectorHttp, http, logger: (x) => logs.push(x), noWait: true });
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].ok, true);
+    assert.strictEqual(apiCalls, 1);
+    assert(logs.some((line) => /collector 自动登录成功/.test(line)));
+  });
+
+  await test('main explicitly falls back to legacy after collector failure', async () => {
+    const logs = [];
+    const collectorHttp = { request: async () => ({ status: 200, data: { status: false, message: 'temporary failure' } }) };
+    const http = { request: async (config) => {
+      assert.strictEqual(config.params.loginToken, 'old-token');
+      return { status: 200, data: jsonp(config, { code: 0, result: { signDayVo: { isSingn: true } } }) };
+    } };
+    const results = await main({ raw: 'old-token#old-user#old-date', autoLogin: true, auth: 'secret', collectorHttp, http, logger: (x) => logs.push(x), noWait: true });
+    assert.strictEqual(results[0].ok, true);
+    assert(logs.some((line) => /自动登录失败.*回退旧 ddky 变量/.test(line)));
   });
 
   await test('pageinfo signature matches legacy ordering', async () => {

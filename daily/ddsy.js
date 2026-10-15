@@ -8,13 +8,14 @@
  *   ddky=loginToken#userId#uDate，多账号用换行或 & 分隔。
  *   旧说明里的 loginToken&userId&uDate 也会自动识别为单账号。
  *
- * collector 取码（可选诊断/后续自动登录入口）：
- *   DDKY_APPID=<叮当快药主小程序 AppID>
+ * collector 自动登录（默认优先）：
+ *   DDKY_APPID=wxc2edadc87077fa2a（可省略，脚本内置目标主小程序 AppID）
  *   wx_server_url=http://d4.dqf.cc.cd:8787
  *   wx_auth=<collector auth>
  *
- * 注意：wx.login code 只是一次性凭证，仍需叮当登录接口兑换 loginToken/userId/uDate。
- * 当前公开资料和现有仓库未提供可验证的兑换接口，因此脚本不会把“取到 code”误报成业务登录成功。
+ * 脚本会让 collector 在目标小程序 runtime 内完成：
+ *   wx.login → openId/unionId → ddsy.user.wx.checkband → loginToken/userId/uDate。
+ * 若自动登录失败且仍配置了旧 ddky 变量，则明确记录失败原因后回退旧变量；不会把仅取到 code 误报为登录成功。
  */
 
 const axios = require('axios');
@@ -28,7 +29,8 @@ const SIGN_SECRET = '6C57AB91A1308E26B797F4CD382AC79D';
 const VERSION_NAME = '4.9.0';
 const WX_SERVER_URL = String(process.env.wx_server_url || 'http://d4.dqf.cc.cd:8787').replace(/\/+$/, '');
 const WX_AUTH = String(process.env.wx_auth || '');
-const DDKY_APPID = String(process.env.DDKY_APPID || '').trim();
+const DDKY_APPID = String(process.env.DDKY_APPID || 'wxc2edadc87077fa2a').trim();
+const DDKY_DISABLE_COLLECTOR = String(process.env.DDKY_DISABLE_COLLECTOR || '') === '1';
 const HTTP_TIMEOUT = Math.min(60000, Math.max(3000, Number(process.env.DDKY_HTTP_TIMEOUT || 20000)));
 
 class DdkyError extends Error {
@@ -103,6 +105,36 @@ function parseAccount(raw, index = 1) {
   return { token: parts[0], userId: parts[1], uDate: parts[2], remark: parts.slice(3).join('#') };
 }
 
+async function fetchDdkySession(options = {}) {
+  const appid = String(options.appid || DDKY_APPID).trim();
+  const url = String(options.url || WX_SERVER_URL).replace(/\/+$/, '');
+  const auth = options.auth === undefined ? WX_AUTH : String(options.auth || '');
+  const http = options.http || axios;
+  if (!appid) throw new DdkyError('未配置 DDKY_APPID，无法让 collector 拉起叮当快药主小程序');
+  if (!auth) throw new DdkyError('未配置 wx_auth，无法调用 collector');
+  const response = await http.request({
+    method: 'POST',
+    url: `${url}/wx/ddky-session`,
+    data: { appid },
+    headers: { auth, 'Content-Type': 'application/json' },
+    timeout: Number(options.timeout || 180000),
+    validateStatus: () => true,
+  });
+  const body = response?.data || {};
+  const session = body?.data || {};
+  if (response?.status !== 200 || body.status !== true || !session.loginToken || !session.userId || !session.uDate) {
+    throw new DdkyError(`collector 自动登录失败：${body.message || `HTTP ${response?.status || 'unknown'}`}`);
+  }
+  return {
+    token: String(session.loginToken),
+    userId: String(session.userId),
+    uDate: String(session.uDate),
+    remark: session.login ? `collector:${String(session.login).replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')}` : 'collector',
+    via: body.via || '',
+    appid,
+  };
+}
+
 async function fetchWxCode(options = {}) {
   const appid = String(options.appid || DDKY_APPID).trim();
   const url = String(options.url || WX_SERVER_URL).replace(/\/+$/, '');
@@ -129,7 +161,10 @@ async function fetchWxCode(options = {}) {
 class Task {
   constructor(raw, options = {}) {
     this.index = options.index || $.userIdx++;
-    this.account = parseAccount(raw, this.index);
+    this.account = raw && typeof raw === 'object'
+      ? { token: String(raw.token || ''), userId: String(raw.userId || ''), uDate: String(raw.uDate || ''), remark: String(raw.remark || '') }
+      : parseAccount(raw, this.index);
+    if (!this.account.token || !this.account.userId || !this.account.uDate) throw new DdkyError(`账号[${this.index}] 缺少完整业务会话`);
     this.http = options.http || axios;
     this.now = options.now || (() => new Date());
     this.logger = options.logger || ((message) => $.log(message));
@@ -208,28 +243,41 @@ class Task {
   }
 }
 
-async function main() {
-  const raw = process.env[CK_NAME] || '';
-  const accounts = normalizeAccounts(raw);
-  if (!accounts.length) {
-    $.log(`未找到变量 ${CK_NAME}`);
-    if (DDKY_APPID) {
-      try {
-        const got = await fetchWxCode();
-        $.log(`collector 已为 ${got.appid} 取得 wx.login code（${got.via || 'unknown'}），但缺少 ddky 业务会话兑换配置，未执行签到`);
-      } catch (error) {
-        $.log(`collector 取码失败：${error.message || error}`);
-      }
+async function main(options = {}) {
+  const raw = options.raw === undefined ? (process.env[CK_NAME] || '') : options.raw;
+  const legacyAccounts = normalizeAccounts(raw);
+  const accounts = [];
+  const logger = options.logger || ((message) => $.log(message));
+  const autoLoginEnabled = options.autoLogin === undefined ? (!DDKY_DISABLE_COLLECTOR && Boolean(options.auth === undefined ? WX_AUTH : options.auth)) : options.autoLogin;
+
+  if (autoLoginEnabled) {
+    try {
+      const session = await fetchDdkySession({
+        http: options.collectorHttp,
+        auth: options.auth,
+        url: options.url,
+        appid: options.appid,
+        timeout: options.collectorTimeout,
+      });
+      logger(`collector 自动登录成功（${session.via || 'ddky-session'}），已取得最新叮当业务会话`);
+      accounts.push(session);
+    } catch (error) {
+      logger(`collector 自动登录失败：${error.message || error}${legacyAccounts.length ? '；将回退旧 ddky 变量' : ''}`);
     }
+  }
+
+  if (!accounts.length) accounts.push(...legacyAccounts);
+  if (!accounts.length) {
+    logger(`未取得可用账号：请配置 wx_auth 以启用 collector 自动登录，或临时保留变量 ${CK_NAME}`);
     return [];
   }
 
-  $.log(`共找到 ${accounts.length} 个账号`);
+  logger(`共找到 ${accounts.length} 个账号`);
   const results = [];
   for (let index = 0; index < accounts.length; index += 1) {
-    const task = new Task(accounts[index], { index: index + 1 });
+    const task = new Task(accounts[index], { index: index + 1, http: options.http, now: options.now, logger: options.taskLogger || logger });
     results.push(await task.run());
-    if (index < accounts.length - 1) await $.wait(1000, 2000);
+    if (index < accounts.length - 1 && !options.noWait) await $.wait(1000, 2000);
   }
   return results;
 }
@@ -243,6 +291,7 @@ if (require.main === module) {
 module.exports = {
   DdkyError,
   Task,
+  fetchDdkySession,
   fetchWxCode,
   formatDay,
   formatTime,

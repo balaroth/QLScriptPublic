@@ -269,6 +269,7 @@ async function main(options = {}) {
   if (!accounts.length) accounts.push(...legacyAccounts);
   if (!accounts.length) {
     logger(`未取得可用账号：请配置 wx_auth 以启用 collector 自动登录，或临时保留变量 ${CK_NAME}`);
+    if (options.emitResult !== false) logger('[QLRUN_RESULT] FAILURE reason=ddky_no_account retryable=1');
     return [];
   }
 
@@ -279,12 +280,22 @@ async function main(options = {}) {
     results.push(await task.run());
     if (index < accounts.length - 1 && !options.noWait) await $.wait(1000, 2000);
   }
+  if (options.emitResult !== false) {
+    if (results.length > 0 && results.every((result) => result && result.ok === true)) {
+      logger('[QLRUN_RESULT] SUCCESS');
+    } else {
+      logger('[QLRUN_RESULT] FAILURE reason=ddky_signin_unverified retryable=1');
+    }
+  }
   return results;
 }
 
 if (require.main === module) {
   main()
-    .catch((error) => $.log(`❌ 主流程异常：${error.message || error}`))
+    .catch((error) => {
+      $.log(`❌ 主流程异常：${error.message || error}`);
+      $.log('[QLRUN_RESULT] FAILURE reason=ddky_main_exception retryable=1');
+    })
     .finally(() => $.done());
 }
 

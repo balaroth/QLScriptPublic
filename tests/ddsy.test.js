@@ -118,6 +118,15 @@ async function test(name, fn) {
     const results = await main({ raw: 'old-token#old-user#old-date', autoLogin: true, auth: 'secret', collectorHttp, http, logger: (x) => logs.push(x), noWait: true });
     assert.strictEqual(results[0].ok, true);
     assert(logs.some((line) => /自动登录失败.*回退旧 ddky 变量/.test(line)));
+    assert(logs.some((line) => line === '[QLRUN_RESULT] SUCCESS'));
+    assert(!logs.some((line) => /\[QLRUN_RESULT\] FAILURE/.test(line)));
+  });
+
+  await test('main emits structured failure when no account is available', async () => {
+    const logs = [];
+    const results = await main({ raw: '', autoLogin: false, logger: (x) => logs.push(x), noWait: true });
+    assert.deepStrictEqual(results, []);
+    assert(logs.some((line) => /^\[QLRUN_RESULT\] FAILURE reason=ddky_no_account/.test(line)));
   });
 
   await test('pageinfo signature matches legacy ordering', async () => {

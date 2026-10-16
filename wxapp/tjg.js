@@ -122,7 +122,7 @@ async function apiRequest(method, endpoint, token, params = {}) {
     return body;
 }
 
-async function collectorSecureNetworkInit(label) {
+async function collectorSecureNetworkInit(label, includeCode = false) {
     if (!process.env.wx_auth) {
         const error = new Error("缺少 wx_auth，无法初始化签到安全网络");
         error.retryable = false;
@@ -132,6 +132,7 @@ async function collectorSecureNetworkInit(label) {
     const response = await axios.post(`${WX_SERVER_URL}/wx/secure-network-init`, {
         appid: MINI_APP_ID,
         openid: nonce,
+        includeCode,
     }, {
         headers: { auth: process.env.wx_auth, "Content-Type": "application/json" },
         timeout: 180000,
@@ -139,9 +140,18 @@ async function collectorSecureNetworkInit(label) {
     });
     const body = response.data || {};
     if (response.status !== 200 || body.status !== true) {
-        const error = new Error(`安全网络初始化失败: ${body.message || short(body)}`);
-        error.retryable = true;
+        const error = new Error(`安全网络初始化失败: ${String(body.message || short(body)).replace(/^安全网络初始化失败:\s*/, "")}`);
+        error.retryable = response.status !== 401 && response.status !== 403;
         throw error;
+    }
+    if (includeCode) {
+        const code = body?.data?.code;
+        if (typeof code !== "string" || !code.trim()) {
+            const error = new Error("安全网络已初始化，但未返回同一运行态的全新 wx_code");
+            error.retryable = true;
+            throw error;
+        }
+        return code;
     }
     return true;
 }
@@ -284,10 +294,20 @@ class Task {
         }
 
         let lastBody = null;
-        await collectorSecureNetworkInit(this.index);
         for (let attempt = 1; attempt <= 2; attempt++) {
-            const wxCode = await collectorRuntimeCode(`sign-${this.index}-${attempt}`);
-            const body = await apiRequest("GET", EP.sign, this.token, { wx_code: wxCode });
+            const wxCode = await collectorSecureNetworkInit(`sign-${this.index}-${attempt}`, true);
+            let body;
+            try {
+                body = await apiRequest("GET", EP.sign, this.token, { wx_code: wxCode });
+            } catch (error) {
+                // A lost response may still have committed. Never replay the consumed code.
+                const committed = await this.verifySignDone(3);
+                if (isSignTaskDone(committed)) {
+                    this.log(`签到完成（响应异常后官方任务回查 ${committed.now}/${committed.daily_limit}）`);
+                    return "signed";
+                }
+                throw error;
+            }
             lastBody = body;
 
             const after = await this.verifySignDone(Number(body.code) === 1 ? 3 : 1);

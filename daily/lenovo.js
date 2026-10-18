@@ -26,6 +26,7 @@ let ckName = `lenovo`;
 const strSplitor = "#";
 const axios = require("axios");
 const defaultUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.31(0x18001e31) NetType/WIFI Language/zh_CN miniProgram"
+const isAlreadySigned = (text = "") => /请勿重复签到|重复签到|已签到|already/i.test(String(text));
 
 
 class Task {
@@ -39,15 +40,11 @@ class Task {
     }
     async main() {
         await this.ssoCheck()
-        if (this.ck && this.token) {
-            await this.userInfo()
-            await this.checkIn()
-            await this.getUserTaskList();
-
-        }
-
-
-
+        if (!this.ck || !this.token) return false;
+        const userOk = await this.userInfo()
+        const signOk = await this.checkIn()
+        await this.getUserTaskList();
+        return userOk && signOk;
     }
     async userInfo() {
         let options = { method: "POST", url: `https://mmembership.lenovo.com.cn/member-hp-webapi/v1/userBenefit/getMyAssets`, headers: this.headers }
@@ -55,11 +52,11 @@ class Task {
         if (result.code == "0") {
             $.log(`✅账号[${this.index}]  获取用户信息成功===>[${result.data.userId}]乐豆[${result.data.ledouNum}]`);
             this.ckStatus = true
-        } else {
-            $.log(`❌账号[${this.index}]  获取用户状态失败`);
-            this.ckStatus = false
-
+            return true;
         }
+        $.log(`获取用户状态失败[${result.msg || result.message || result.code}]`);
+        this.ckStatus = false
+        return false;
     }
     async isSignIn() {
         let options = { method: "POST", url: `https://mmembership.lenovo.com.cn/member-hp-task-center/v1/task/getCheckInList?lenovoId=${this.ck}`, headers: this.headers }
@@ -82,10 +79,14 @@ class Task {
         //
         if (result.code == "0") {
             $.log(`✅账号[${this.index}]  签到成功🎉`)
-        } else {
-            $.log(`❌账号[${this.index}]  签到失败[${result.msg}]`);
-
+            return true;
         }
+        if (isAlreadySigned(result.msg || result.message)) {
+            $.log(`✅账号[${this.index}]  今日已签到[${result.msg || result.message}]`);
+            return true;
+        }
+        $.log(`签到失败[${result.msg || result.message || JSON.stringify(result)}]`);
+        return false;
     }
     getSignKey() {
         global["window"] = {}
@@ -222,12 +223,35 @@ class Task {
 !(async () => {
     await getNotice()
     $.checkEnv(ckName);
+    if (!$.userCount) {
+        $.log("[QLRUN_RESULT] FAILURE retryable=0 reason=missing_lenovo_env");
+        process.exitCode = 1;
+        return;
+    }
 
+    let success = 0;
+    let failed = 0;
     for (let user of $.userList) {
-        await new Task(user).main();
+        try {
+            if (await new Task(user).main()) success++;
+            else failed++;
+        } catch (e) {
+            failed++;
+            $.log(`账号执行失败: ${e.message || e}`);
+        }
+    }
+    if (failed === 0 && success === $.userList.length) {
+        $.log(`[QLRUN_RESULT] SUCCESS core=${success}/${$.userList.length}`);
+    } else {
+        $.log(`[QLRUN_RESULT] FAILURE retryable=1 core=${success}/${$.userList.length} failed=${failed}`);
+        process.exitCode = 1;
     }
 })()
-    .catch((e) => console.log(e))
+    .catch((e) => {
+        $.log(`运行失败: ${e.message || e}`);
+        $.log("[QLRUN_RESULT] FAILURE retryable=1 reason=lenovo_main_failed");
+        process.exitCode = 1;
+    })
     .finally(() => $.done());
 
 async function getNotice() {

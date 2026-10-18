@@ -113,11 +113,36 @@ fi
 
 BACKUP_REF="backup/pre-upstream-$(date '+%Y%m%d-%H%M%S')"
 git branch "$BACKUP_REF" "$LOCAL_HEAD"
+MERGE_CONFLICTS=''
 if ! git merge --no-edit "$UPSTREAM/$BRANCH"; then
-  CONFLICTS=$(git diff --name-only --diff-filter=U | sed -n '1,40p')
-  git merge --abort || true
-  notify_failure '【青龙更新】上游代码冲突' "仓库：$REPO\n本地提交：$LOCAL_HEAD\n上游提交：$REMOTE_HEAD\n冲突文件：\n${CONFLICTS:-未识别}\n已中止合并并保留当前可运行版本。\n备份分支：$BACKUP_REF\n日志：$LOG"
-  exit 2
+  MERGE_CONFLICTS=$(git diff --name-only --diff-filter=U | sed -n '1,80p')
+  if [ -z "$MERGE_CONFLICTS" ]; then
+    git merge --abort || true
+    notify_failure '【青龙更新】上游合并异常' "仓库：$REPO\n本地提交：$LOCAL_HEAD\n上游提交：$REMOTE_HEAD\n合并失败但未识别冲突文件，已中止并保留当前可运行版本。\n备份分支：$BACKUP_REF\n日志：$LOG"
+    exit 2
+  fi
+
+  # 生产仓库包含已经真实验收的定制增强。发生同文件冲突时整文件保留本地版本，
+  # 非冲突文件仍正常接收上游；禁止使用 -X ours 将两套逻辑半拼接到同一文件。
+  RESOLVE_FAILED=0
+  while IFS= read -r conflict_file; do
+    [ -n "$conflict_file" ] || continue
+    echo "[updater] conflict keeps verified local file: $conflict_file"
+    git checkout --ours -- "$conflict_file" || RESOLVE_FAILED=1
+    git add -- "$conflict_file" || RESOLVE_FAILED=1
+  done <<< "$MERGE_CONFLICTS"
+
+  REMAINING_CONFLICTS=$(git diff --name-only --diff-filter=U | sed -n '1,80p')
+  if [ "$RESOLVE_FAILED" -ne 0 ] || [ -n "$REMAINING_CONFLICTS" ]; then
+    git merge --abort || true
+    notify_failure '【青龙更新】冲突自动解析失败' "仓库：$REPO\n本地提交：$LOCAL_HEAD\n上游提交：$REMOTE_HEAD\n原始冲突：\n$MERGE_CONFLICTS\n剩余冲突：\n${REMAINING_CONFLICTS:-无}\n已中止并保留当前可运行版本。\n备份分支：$BACKUP_REF\n日志：$LOG"
+    exit 2
+  fi
+  if ! git commit --no-edit; then
+    git merge --abort || git reset --hard "$LOCAL_HEAD"
+    notify_failure '【青龙更新】冲突解析后提交失败' "仓库：$REPO\n本地提交：$LOCAL_HEAD\n上游提交：$REMOTE_HEAD\n已回滚到同步前版本。\n备份分支：$BACKUP_REF\n日志：$LOG"
+    exit 2
+  fi
 fi
 
 CHECK_FAIL=''
@@ -137,6 +162,36 @@ if [ -n "$CHECK_FAIL" ]; then
   git reset --hard "$LOCAL_HEAD"
   notify_failure '【青龙更新】合并后语法检查失败' "仓库：$REPO\n失败合并：$FAILED_HEAD\n已回滚到：$LOCAL_HEAD\n失败文件：$CHECK_FAIL\n备份分支：$BACKUP_REF\n日志：$LOG"
   exit 3
+fi
+
+# 对仓库内已有的重点回归测试做更新门禁；失败必须回滚，不能把半可用代码发布到生产。
+TEST_FAIL=''
+for test_file in \
+  tests/test_qyqd.js \
+  tests/test_tjg.js \
+  tests/test_changhongmeiling.py \
+  tests/hdl.test.js; do
+  [ -f "$test_file" ] || continue
+  case "$test_file" in
+    *.js)
+      node "$test_file" >/dev/null 2>&1 || TEST_FAIL="$TEST_FAIL\n$test_file"
+      ;;
+    *.py)
+      python3 "$test_file" >/dev/null 2>&1 || TEST_FAIL="$TEST_FAIL\n$test_file"
+      ;;
+  esac
+done
+
+if [ -n "$TEST_FAIL" ]; then
+  FAILED_HEAD=$(git rev-parse HEAD)
+  git reset --hard "$LOCAL_HEAD"
+  notify_failure '【青龙更新】合并后回归测试失败' "仓库：$REPO\n失败合并：$FAILED_HEAD\n已回滚到：$LOCAL_HEAD\n失败测试：$TEST_FAIL\n备份分支：$BACKUP_REF\n日志：$LOG"
+  exit 5
+fi
+
+if [ -n "$MERGE_CONFLICTS" ]; then
+  echo "[updater] upstream merged; verified local versions kept for conflicts:"
+  printf '%s\n' "$MERGE_CONFLICTS"
 fi
 
 # —— 自动恢复：本次上游 diff 命中、且原本被面板禁用的业务脚本，恢复为"手动执行"任务 ——

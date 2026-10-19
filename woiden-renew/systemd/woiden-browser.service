@@ -1,0 +1,18 @@
+[Unit]
+Description=Persistent visible Chromium for Woiden renewal
+After=network-online.target tigervncserver@:1.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=DISPLAY=:1
+Environment=XAUTHORITY=/home/ubuntu/.Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/1001
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+ExecStart=/snap/bin/chromium --no-sandbox --disable-dev-shm-usage --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --remote-allow-origins=http://127.0.0.1:9222 --user-data-dir=/opt/woiden-renew/profile --new-window https://woiden.id/vps-info
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target

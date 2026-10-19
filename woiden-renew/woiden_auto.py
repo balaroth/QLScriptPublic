@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+"""
+woiden_auto.py — Woiden 免费 VPS 全自动续期执行器（宿主侧）
+
+【运行位置】
+    d3 宿主操作系统层，以 ubuntu 身份执行，由 woiden_worker.py 通过 subprocess 调起。
+    一次运行完成一轮「检查」或「续期」，跑完即退出，不常驻。
+
+【为什么必须跑在宿主，而不是青龙容器里】
+    续期依赖一个 7x24 常驻的 Chromium（woiden-browser.service），其中保存着
+    woiden.id 的登录 Cookie 和 web.telegram.org 的会话。青龙容器内没有浏览器、
+    没有 playwright，也访问不到宿主的 127.0.0.1:9222，所以浏览器动作只能落在宿主侧。
+    容器只负责调度和发通知，通过共享文件（request/result.json）与本脚本通信。
+
+【依赖】
+    - 常驻 Chromium 的 CDP 端口 127.0.0.1:9222，profile 在 /opt/woiden-renew/profile
+    - digit_templates.json：9 类数字位图模板，用于解两道数学验证码
+    - secrets/chatgpt2api.key：调用本机视觉模型解 reCAPTCHA v2 的密钥
+
+【输出契约】
+    标准输出最后一行必须是 JSON（worker 只读这一行）。status 取值：
+        ok                        仅检查，VPS 状态正常
+        not_due                   未到续期窗口
+        renewed                   续期成功
+        uncertain                 服务端有成功迹象但到期日未变，需人工核对
+        failed                    服务端明确拒绝
+        error                     执行异常（stage 字段标明阶段）
+        needs_login               登录态失效
+        needs_human_verification  需要人工过验证（Cloudflare / reCAPTCHA / Telegram）
+        needs_manual_renewal      验证码解不出，需人工续期
+    退出码见文件末尾 if __name__ 块。
+
+【标签页管理】
+    每轮会打开 woiden 页面和 Telegram 页面。清理做三层兜底：
+        1. emit()            —— 所有正常终态都经过这里
+        2. with 块内 except  —— 异常时趁 CDP 连接还活着先清再抛
+        3. atexit            —— 覆盖 sys.exit 等路径
+    SIGKILL（worker 520s 超时）无法捕获，残留标签由下次运行复用并清理，自愈。
+"""
+import argparse, atexit, base64, json, os, re, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+# ---------------------------------------------------------------------------
+# 路径与外部服务
+# ---------------------------------------------------------------------------
+BASE = Path("/opt/woiden-renew")          # 宿主工作目录，与本文件同级
+ART = BASE / "artifacts"                  # 失败时的证据截图，供人工排查
+STATE = BASE / "state"                    # 预留状态目录
+TPL_PATH = BASE / "digit_templates.json"  # 数学验证码数字模板
+KEY_PATH = BASE / "secrets" / "chatgpt2api.key"  # 视觉模型密钥（不入 git）
+CDP = "http://127.0.0.1:9222"             # 常驻 Chromium 的调试端口，只监听本机
+URL_INFO = "https://woiden.id/vps-info"       # 状态页，读到期日
+URL_RENEW = "https://woiden.id/vps-renew"     # 续期第一步
+URL_CODE = "https://woiden.id/vps-renew-code"  # 续期第二步，填 Telegram 收到的码
+VISION_API = "http://127.0.0.1:40337/v1/chat/completions"  # d3 本机的视觉模型服务
+VISION_MODEL = "gpt-5.6"
+
+# 剩余天数低于此值才真正提交续期。
+# 关键业务事实：Woiden 续期后到期日不是「原到期日 + 2 天」，而是重置为
+# 「续期当天 + 2 天的 00:00」。实测剩 3.12 天时续期，到期日反而从
+# 2026-10-22 13:58 变成 2026-10-21 00:00，净损失约 1.5 天。
+# 因此每天跑一次、阈值 2.0，续期后余量约 1.75 天，刚好够次日再跑一轮。
+DUE_DAYS = 2.0
+
+# ---------------------------------------------------------------------------
+# 注入到页面里执行的 JS
+# ---------------------------------------------------------------------------
+
+# 把两道数学验证码的 <img> 画到 canvas 上做二值化，输出每行的 0/1 字符串。
+# 阈值 128 是对 RGB 均值取的，实测对 Woiden 这两张 25x20 的位图稳定。
+# 同时把验证码容器里的文字（运算符 + 或 X）一并取回。
+JS_BITMAP = """() => {
+  const out = [];
+  document.querySelectorAll('#form-submit img').forEach(im => {
+    const c = document.createElement('canvas');
+    c.width = im.naturalWidth; c.height = im.naturalHeight;
+    const g = c.getContext('2d'); g.drawImage(im, 0, 0);
+    const d = g.getImageData(0, 0, c.width, c.height).data;
+    const rows = [];
+    for (let y = 0; y < c.height; y++) {
+      let line = '';
+      for (let x = 0; x < c.width; x++) {
+        const k = (y * c.width + x) * 4;
+        line += ((d[k] + d[k+1] + d[k+2]) / 3 < 128) ? '1' : '0';
+      }
+      rows.push(line);
+    }
+    out.push(rows);
+  });
+  const box = document.querySelector('#form-submit .form-group.row');
+  return {imgs: out, opText: box ? box.innerText : ''};
+}"""
+
+# 直接 fetch /vps-info 再正则，而不是读 DOM：
+# 页面结构改动频繁，而 HTML 里的 "Valid until" 文本一直存在，正则更抗改版。
+# challenge 字段用于识别 Cloudflare 拦截页。
+JS_INFO = """async () => {
+  const r = await fetch('/vps-info', {credentials: 'include', cache: 'no-store'});
+  const t = await r.text();
+  const m = t.match(/Valid until[\\s\\S]{0,120}?(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})/);
+  const s = t.match(/Status[\\s\\S]{0,300}?(ACTIVE|INACTIVE|SUSPENDED)/i);
+  const host = t.match(/Hostname[\\s\\S]{0,80}?([0-9]+)-woiden/i);
+  return {expiry: m ? m[1] : null, status: s ? s[1].toUpperCase() : null, vps_id: host ? host[1] : null,
+          challenge: /Just a moment|security verification/i.test(t), len: t.length};
+}"""
+
+# 读取提交后服务端返回的提示文本（#response 里的 alert）
+JS_RESPONSE = """() => { const a = document.querySelector('#response .alert'); return a ? (a.innerText || '').trim() : ''; }"""
+
+
+# ---------------------------------------------------------------------------
+# 基础设施
+# ---------------------------------------------------------------------------
+
+def now_iso():
+    """当前时间的 ISO 8601 字符串，带本地时区偏移，写进结果 JSON。"""
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def shot(page, name):
+    """截一张全页图存到 artifacts/，返回路径；失败返回 None（截图不能影响主流程）。"""
+    ART.mkdir(parents=True, exist_ok=True)
+    p = ART / ("%s-%s.png" % (datetime.now().strftime("%Y%m%d-%H%M%S"), name))
+    try:
+        page.screenshot(path=str(p), full_page=True)
+        return str(p)
+    except Exception:
+        return None
+
+
+# 保存当前 browser context 和「本轮必须保留的页面」。
+# 放在模块级，是为了让 emit() 和 atexit 兜底都能拿到，而不必层层传参。
+_TIDY = {"ctx": None, "keep": set()}
+
+
+def _tidy_final():
+    """最后一层兜底：解释器退出时（含未捕获异常、sys.exit）尝试清理标签。"""
+    try:
+        ctx = _TIDY.get("ctx")
+        if ctx is not None:
+            tidy_tabs(ctx, _TIDY.get("keep") or set())
+    except Exception:
+        pass
+
+
+atexit.register(_tidy_final)
+
+
+def emit(status, **extra):
+    """
+    唯一的终态出口。
+
+    所有 return 都必须走这里，原因有二：
+      1. 保证标签清理一定执行（趁 CDP 连接还活着）
+      2. 保证标准输出最后一行是 worker 能解析的 JSON
+    额外的业务字段通过 **extra 透传，写进结果供入口脚本拼邮件正文。
+    """
+    obj = {"status": status, "at": now_iso(), **extra}
+    try:
+        ctx = _TIDY.get("ctx")
+        if ctx is not None:
+            tidy_tabs(ctx, _TIDY.get("keep") or set())
+    except Exception:
+        pass
+    print(json.dumps(obj, ensure_ascii=False))
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# 数学验证码：模板匹配
+# ---------------------------------------------------------------------------
+
+def load_templates():
+    """读取 digit_templates.json：{数字: {"rows": [位图行字符串...]}}，共 9 类（1-9，无 0）。"""
+    return json.loads(TPL_PATH.read_text())
+
+
+def recognize(rows, tpl):
+    """
+    把一张位图和 9 个模板逐一比对，返回 (数字, 汉明距离) 中距离最小的那个。
+
+    位图只有 25x20 像素，且字体固定，所以精确模板匹配就够用，不需要 OCR 模型。
+    实测生产环境距离恒为 0；调用方会再卡一道 dist <= 12 的上限。
+    """
+    best = None
+    for digit, t in tpl.items():
+        tr = t["rows"]
+        if len(tr) != len(rows):
+            continue
+        dist = sum(1 for r1, r2 in zip(rows, tr) for a, b in zip(r1, r2) if a != b)
+        if best is None or dist < best[1]:
+            best = (digit, dist)
+    return best
+
+
+def solve_math(page, tpl, timeout=20):
+    """
+    等待两道验证码图片渲染完成，识别后按运算符算出答案。
+
+    返回 {"op","a","b","answer","dist"} 或 None（超时/识别不可信）。
+    几个防御点：
+      - 图片可能还没加载完，所以循环轮询直到两张都有足够墨迹
+      - ink > 10 用来排除空白图（占位图）
+      - dist <= 12 用来排除识别不可信的情况，宁可失败也不乱填
+      - 运算符来自页面文字：'+' 做加法，其它（X/x/*）一律按乘法处理
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            data = page.evaluate(JS_BITMAP)
+        except Exception:
+            data = {"imgs": [], "opText": ""}
+        imgs = data.get("imgs") or []
+        if len(imgs) >= 2:
+            ink = [sum(r.count("1") for r in rows) for rows in imgs[:2]]
+            if all(n > 10 for n in ink):
+                ds = [recognize(r, tpl) for r in imgs[:2]]
+                if all(d is not None and d[1] <= 12 for d in ds):
+                    op = re.sub(r"\s", "", data.get("opText") or "")
+                    if op:
+                        a, b = int(ds[0][0]), int(ds[1][0])
+                        ans = a + b if op.startswith("+") else a * b
+                        return {"op": op, "a": a, "b": b, "answer": ans,
+                                "dist": [ds[0][1], ds[1][1]]}
+        page.wait_for_timeout(800)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 页面导航辅助
+# ---------------------------------------------------------------------------
+
+def wait_cf(page, timeout=60):
+    """等 Cloudflare 的 "Just a moment..." 拦截页自己放行；超时返回 False。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if "just a moment" not in page.title().lower():
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+    return False
+
+
+def goto(page, url, timeout=60):
+    """导航到指定 URL，并顺带处理可能出现的 Cloudflare 挑战。"""
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+    ok = wait_cf(page, timeout)
+    page.wait_for_timeout(1500)
+    return ok
+
+
+def wait_alert(page, timeout=60):
+    """轮询等 #response 出现文本（表单提交后的服务端提示），超时返回空串。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            txt = page.evaluate(JS_RESPONSE)
+        except Exception:
+            txt = ""
+        if txt:
+            return txt
+        page.wait_for_timeout(1500)
+    return ""
+
+
+def js_click_submit(page):
+    """
+    用 JS 直接点提交按钮，而不是 Playwright 的 click()。
+
+    原因：按钮可能被固定的页脚遮住，Playwright 会判定不可点击而超时；
+    这里先 scrollIntoView 再原生 click()，绕开可见性检查。
+    """
+    page.evaluate("""() => { const b = document.querySelector("button[name='submit_button']"); if (b) { b.scrollIntoView({block:'center'}); b.click(); } }""")
+
+
+# ---------------------------------------------------------------------------
+# Telegram：读取续期验证码
+# ---------------------------------------------------------------------------
+
+def ensure_telegram(ctx):
+    """
+    拿到 Telegram Web 页面：已存在就复用，不存在就新开并等它加载完。
+
+    登录态保存在 Chromium profile 里，所以正常情况下不需要重新登录。
+    打开后主动点一下 "HAX Bot" 会话，确保消息列表已渲染。
+    """
+    tg = None
+    for pg in ctx.pages:
+        if "web.telegram.org" in pg.url:
+            tg = pg
+            break
+    if tg is None:
+        tg = ctx.new_page()
+        tg.goto("https://web.telegram.org/k/", wait_until="domcontentloaded", timeout=90000)
+        tg.wait_for_timeout(6000)
+    tg.bring_to_front()
+    try:
+        tg.locator(".chatlist-chat", has_text="HAX Bot").first.click(timeout=15000)
+        tg.wait_for_timeout(1200)
+    except Exception:
+        pass
+    return tg
+
+
+def tg_codes(tg):
+    """
+    从当前会话的所有气泡里提取续期码。
+
+    Bot 消息形如 "Your Code is\\n<base64>"，取 base64 部分。
+    返回的是「当前可见的全部码」，新旧混在一起，由调用方做差集。
+    """
+    try:
+        txts = tg.evaluate("""() => Array.from(document.querySelectorAll('.bubble')).map(e => (e.innerText || '').trim()).filter(Boolean)""")
+    except Exception:
+        return []
+    out = []
+    for t in txts:
+        m = re.search(r"Your Code is\s*\n?\s*([A-Za-z0-9+/=]{16,})", t)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def tg_wait_new_code(tg, before, timeout=120):
+    """
+    等待「提交第一步之后新出现」的验证码。
+
+    before 是提交前抓到的码集合，这里只返回不在其中的码。
+    这一步很关键：Bot 会保留历史消息，直接用最新的码有可能拿到上一轮的旧码，
+    导致第二步必然失败，所以必须做差集。
+    轮询期间会重复点一次会话，防止 Telegram Web 掉线后列表不再刷新。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        codes = tg_codes(tg)
+        fresh = [c for c in codes if c not in before]
+        if fresh:
+            return fresh[-1]
+        tg.wait_for_timeout(2000)
+        try:
+            tg.locator(".chatlist-chat", has_text="HAX Bot").first.click(timeout=5000)
+        except Exception:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# reCAPTCHA v2：截图交给本机视觉模型判断该点哪些格子
+# ---------------------------------------------------------------------------
+
+def ask_vision(png_bytes, n=9):
+    """
+    把 reCAPTCHA 的挑战图片发给 d3 本机的视觉模型，拿回该点的格子编号。
+
+    返回 {"instruction": "...", "cells": [1,5], "notes": "..."} 或 None。
+    两个已知坑：
+      - 模型常把 JSON 包在 <escape>...</escape> 里，要先剥掉标签
+      - 输出可能夹带解释文字，用最外层 {...} 正则捞出 JSON
+    """
+    key = KEY_PATH.read_text().strip()
+    img = base64.b64encode(png_bytes).decode()
+    cols = 3 if n == 9 else 4
+    prompt = (
+        "Look at this image. It shows a short instruction line at the top and a %dx%d grid of photos below it. "
+        "Number the grid cells 1-%d in reading order: 1=top-left, then left-to-right and top-to-bottom, %d=bottom-right. "
+        "Report the instruction text, then list every cell whose photo clearly contains the object named in the instruction. "
+        'Answer strictly as JSON: {"instruction":"...","cells":[1,5],"notes":"..."}'
+    ) % (cols, cols, n, n)
+    payload = {"model": VISION_MODEL, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}},
+    ]}]}
+    import urllib.request
+    req = urllib.request.Request(VISION_API, data=json.dumps(payload).encode(),
+                                headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    r = urllib.request.urlopen(req, timeout=180)
+    body = json.loads(r.read().decode())
+    content = body.get("choices", [{}])[0].get("message", {}).get("content") or ""
+    content = re.sub(r"</?escape>", "", content).strip()
+    m = re.search(r"\{.*\}", content, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def solve_recaptcha_v2(page, max_rounds=3):
+    """
+    完成 reCAPTCHA v2，成功后 token 会自动写进页面隐藏的 textarea。
+
+    流程：
+      1. 点 iframe 里的 #recaptcha-anchor（没触发挑战就直接出 token）
+      2. 出现 bframe 挑战时，统计格子数（只接受 9 或 16，其它视为未加载）
+      3. 截图 → ask_vision() → 按返回的编号依次点 td → 点 verify
+      4. 最多 3 轮；每轮都重新检查 textarea 是否已有 token
+
+    返回 {"ok", "token_len", "rounds", "log"}，log 记录每轮细节便于事后排查。
+    失败时不抛异常，交给上层判为 needs_human_verification 并发邮件。
+    """
+    log = []
+    try:
+        page.frame_locator("iframe[title='reCAPTCHA']").locator("#recaptcha-anchor").click(timeout=15000)
+        log.append("anchor_clicked")
+    except Exception as e:
+        log.append("anchor_click_err:" + str(e)[:80])
+    for rnd in range(max_rounds):
+        page.wait_for_timeout(2500)
+        tok = page.evaluate("""() => { const e = document.querySelector('textarea[name="g-recaptcha-response"]'); return e ? (e.value || '') : ''; }""")
+        if tok:
+            return {"ok": True, "token_len": len(tok), "rounds": rnd, "log": log}
+        frame = page.locator("iframe[src*='bframe']")
+        if frame.count() == 0:
+            log.append("no_bframe_round_%d" % rnd)
+            page.wait_for_timeout(3000)
+            continue
+        bf = page.frame_locator("iframe[src*='bframe']")
+        try:
+            n_td = bf.locator("td").count()
+        except Exception:
+            n_td = 0
+        log.append({"round": rnd, "td_count": n_td})
+        if n_td not in (9, 16):
+            page.wait_for_timeout(2000)
+            continue
+        try:
+            png = frame.first.screenshot()
+        except Exception as e:
+            log.append("shot_err:" + str(e)[:80])
+            break
+        try:
+            ans = ask_vision(png, n_td)
+        except Exception as e:
+            log.append("vision_err:" + str(e)[:120])
+            break
+        log.append({"round": rnd, "answer": ans})
+        if not ans:
+            break
+        cells = []
+        for c in ans.get("cells", []):
+            try:
+                c = int(c)
+            except Exception:
+                continue
+            if 1 <= c <= n_td:
+                cells.append(c)
+        log.append({"round": rnd, "click": cells})
+        for c in cells:
+            try:
+                bf.locator("td").nth(c - 1).click(timeout=8000)
+                page.wait_for_timeout(350)
+            except Exception as e:
+                log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
+        try:
+            bf.locator("#recaptcha-verify-button").click(timeout=10000)
+        except Exception as e:
+            log.append("verify_err:" + str(e)[:80])
+            break
+        page.wait_for_timeout(4500)
+    tok = page.evaluate("""() => { const e = document.querySelector('textarea[name="g-recaptcha-response"]'); return e ? (e.value || '') : ''; }""")
+    return {"ok": bool(tok), "token_len": len(tok) if tok else 0, "rounds": max_rounds, "log": log}
+
+
+# ---------------------------------------------------------------------------
+# 日期与浏览器连接
+# ---------------------------------------------------------------------------
+
+def parse_days(expiry):
+    """把 "YYYY-MM-DD HH:MM:SS" 换算成「距现在还有多少天」（可为负），解析失败返回 None。"""
+    if not expiry:
+        return None
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            d = datetime.strptime(expiry, f).replace(tzinfo=datetime.now().astimezone().tzinfo)
+            return (d - datetime.now().astimezone()).total_seconds() / 86400
+        except ValueError:
+            pass
+    return None
+
+
+def connect_cdp(p, timeout=150):
+    """
+    连接常驻 Chromium，失败则每 3 秒重试，最长等 timeout 秒。
+
+    存在的理由：Chromium 被 SIGKILL 后 systemd 大约 20 秒才拉起
+    （Restart=always + RestartSec=10）。如果定时任务正好落在这个窗口里，
+    裸调 connect_over_cdp 会立刻抛异常，导致当天整轮报废且没有第二次机会。
+    这里把「等它回来」变成正常流程的一部分。
+    注意还要等 contexts 非空：端口通了不代表 browser 已经能提供 context。
+    """
+    deadline = time.time() + timeout
+    last = None
+    while True:
+        try:
+            b = p.chromium.connect_over_cdp(CDP)
+            if b.contexts:
+                return b
+            last = RuntimeError("cdp up but no browser context yet")
+        except Exception as e:
+            last = e
+        if time.time() >= deadline:
+            raise RuntimeError("CDP not ready after %ss: %s" % (timeout, last))
+        time.sleep(3)
+
+
+def find_woiden_page(ctx):
+    """复用已有的 woiden 页面（/vps-info 或 /vps-renew），没有就新开一个。"""
+    for pg in ctx.pages:
+        if "/vps-renew" in pg.url or "/vps-info" in pg.url:
+            return pg
+    return ctx.new_page()
+
+
+def tidy_tabs(ctx, keep):
+    """
+    关掉多余的 woiden 标签，只保留 keep 集合里的页面。
+
+    刻意只处理 URL 含 /vps-info 或 /vps-renew 的页面：
+    用户在同一个 Chromium 里可能还开着别的站点，那些一律不动。
+    """
+    for pg in list(ctx.pages):
+        try:
+            if pg in keep:
+                continue
+            if "/vps-info" in pg.url or "/vps-renew" in pg.url:
+                pg.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+
+def main():
+    """
+    一轮执行。所有分支都必须 return emit(...)，不允许裸 return 或静默退出。
+
+    --mode check    只读状态并输出，不提交续期（用于日常巡检和故障演练）
+    --mode auto     默认。剩余天数 <= DUE_DAYS 时走完整续期流程
+    --mode prepare  预留模式
+    --force         忽略到期阈值，强制走续期
+    """
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["check", "auto", "prepare"], default="auto")
+    ap.add_argument("--force", action="store_true", help="ignore due-window check")
+    a = ap.parse_args()
+    tpl = load_templates()
+    ART.mkdir(parents=True, exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as p:
+        b = connect_cdp(p)
+        ctx = b.contexts[0]
+        wd = find_woiden_page(ctx)
+        # 先登记清理上下文：从这里开始，任何退出路径都能找到要保留的页面
+        _TIDY["ctx"] = ctx
+        _TIDY["keep"] = {wd}
+        try:
+            wd.bring_to_front()
+            if "/vps-info" not in wd.url and "/vps-renew" not in wd.url:
+                goto(wd, URL_INFO)
+            # 读状态：用 fetch + 正则，避免依赖 DOM 结构
+            try:
+                info = wd.evaluate(JS_INFO)
+            except Exception as e:
+                return emit("error", stage="info", error="%s: %s" % (type(e).__name__, e))
+            # Cloudflare 拦截页：给它 60 秒自己放行，过不去就交人工
+            if info.get("challenge"):
+                if not wait_cf(wd, 60):
+                    return emit("needs_human_verification", stage="info", screenshot=shot(wd, "cf"))
+                info = wd.evaluate(JS_INFO)
+            expiry0 = info.get("expiry")
+            days = parse_days(expiry0)
+            # check 模式到此为止：只读，不产生任何副作用
+            if a.mode == "check":
+                try:
+                    wd.goto(URL_INFO, wait_until="domcontentloaded", timeout=60000)
+                except Exception:
+                    pass
+                tidy_tabs(ctx, {wd})
+                return emit("ok", status_text=info.get("status"), expiry=expiry0,
+                            days_remaining=round(days, 2) if days is not None else None, vps_id=info.get("vps_id"))
+            if not info.get("status") or info["status"] != "ACTIVE":
+                return emit("error", stage="info", error="vps not active", status_text=info.get("status"), expiry=expiry0)
+            if days is None:
+                return emit("error", stage="info", error="cannot parse expiry", raw=expiry0)
+            # 未到窗口就早退，避免每天都消耗一次 Telegram 发码和 reCAPTCHA 额度
+            if days > DUE_DAYS and not a.force:
+                tidy_tabs(ctx, {wd})
+                return emit("not_due", expiry=expiry0, days_remaining=round(days, 2))
+
+            # 先把 Telegram 页面准备好，并记录「提交前已有哪些码」，后面做差集
+            tg = ensure_telegram(ctx)
+            _TIDY["keep"].add(tg)
+            before = set(tg_codes(tg))
+
+            # ---- 第一步 /vps-renew：填 web_address + 勾协议 + 数学验证码 + reCAPTCHA v3 ----
+            wd.bring_to_front()
+            if not goto(wd, URL_RENEW):
+                return emit("needs_human_verification", stage="stage1", screenshot=shot(wd, "cf-stage1"))
+            cap1 = solve_math(wd, tpl)
+            if not cap1:
+                return emit("needs_manual_renewal", stage="stage1", error="math captcha unreadable",
+                            screenshot=shot(wd, "stage1-captcha"))
+            # 直接写 value 再派发 input 事件，让页面自己的校验逻辑认为用户输入过
+            wd.evaluate("""(ans) => {
+              document.querySelector('#web_address').value = 'woiden.id';
+              const cb = document.querySelector('input[name="agreement"]');
+              if (cb && !cb.checked) cb.checked = true;
+              const c = document.querySelector('#captcha');
+              if (c) { c.value = String(ans); c.dispatchEvent(new Event('input', {bubbles: true})); }
+            }""", cap1["answer"])
+            js_click_submit(wd)
+            r1 = wait_alert(wd, 75)
+            # 只有出现这句才说明服务端已把码发到 Telegram；其它提示一律判人工
+            if "verification code has been sent" not in r1.lower():
+                return emit("needs_manual_renewal", stage="stage1", response=r1[:300], captcha=cap1,
+                            screenshot=shot(wd, "stage1-response"))
+
+            # ---- 等 Telegram 里的新码 ----
+            code = tg_wait_new_code(tg, before, timeout=120)
+            if not code:
+                return emit("needs_human_verification", stage="telegram", error="no new telegram code",
+                            screenshot=shot(tg, "telegram"))
+
+            # ---- 第二步 /vps-renew-code：填码 + 第二个数学验证码 + reCAPTCHA v2 ----
+            wd.bring_to_front()
+            if not goto(wd, URL_CODE):
+                return emit("needs_human_verification", stage="stage2", screenshot=shot(wd, "cf-stage2"))
+            cap2 = solve_math(wd, tpl)
+            if not cap2:
+                return emit("needs_manual_renewal", stage="stage2", error="math captcha unreadable",
+                            screenshot=shot(wd, "stage2-captcha"))
+            wd.evaluate("""([code, ans]) => {
+              document.querySelector('#code').value = code;
+              const c = document.querySelector('#captcha');
+              if (c) { c.value = String(ans); c.dispatchEvent(new Event('input', {bubbles: true})); }
+            }""", [code, cap2["answer"]])
+            v2 = solve_recaptcha_v2(wd)
+            if not v2.get("ok"):
+                return emit("needs_human_verification", stage="recaptcha_v2", captcha=cap2, v2=v2,
+                            screenshot=shot(wd, "v2-fail"))
+            js_click_submit(wd)
+            r2 = wait_alert(wd, 90)
+
+            # ---- 复核：重新读到到期日才算数，不信页面提示 ----
+            info2 = wd.evaluate(JS_INFO)
+            expiry1 = info2.get("expiry")
+            new_days = parse_days(expiry1)
+            renewed = bool(expiry0 and expiry1 and expiry1 != expiry0 and (new_days or 0) > (days or 0) + 0.5)
+            out = {
+                "expiry_before": expiry0,
+                "expiry_after": expiry1,
+                "days_before": round(days, 2) if days is not None else None,
+                "days_after": round(new_days, 2) if new_days is not None else None,
+                "stage1_captcha": cap1,
+                "stage2_captcha": cap2,
+                "recaptcha_v2": {"rounds": v2.get("rounds"), "token_len": v2.get("token_len")},
+                "stage2_response": r2[:400],
+                "vps_id": info2.get("vps_id"),
+                "screenshot": shot(wd, "final"),
+            }
+            server_ok = bool(re.search(r"has been renewed until|successfully renewed|renewed until", r2, re.I))
+            # 服务端明确说续期成功，且到期日读得出来 → 成功
+            if server_ok and expiry1:
+                try:
+                    wd.goto(URL_INFO, wait_until="domcontentloaded", timeout=60000)
+                except Exception:
+                    pass
+                tidy_tabs(ctx, {wd, tg})
+                return emit("renewed", **out)
+            # 服务端没明说，但到期日确实往后跳了 → 也算成功
+            if renewed:
+                tidy_tabs(ctx, {wd, tg})
+                return emit("renewed", **out)
+            # 有成功迹象但到期日没变 → 不下结论，交人工核对
+            if server_ok or "success" in r2.lower():
+                return emit("uncertain", **out)
+            return emit("failed", **out)
+        except BaseException:
+            # 关键：趁 CDP 连接还没关闭先清理，否则出了 with 块就再也清不掉了
+            try:
+                tidy_tabs(ctx, _TIDY.get("keep") or set())
+            except Exception:
+                pass
+            raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as e:
+        # 兜住所有未预期异常：仍要输出一行 JSON，否则 worker 会报 "missing JSON output"，
+        # 入口脚本也就拿不到 stage 信息，排查会失去线索。
+        emit("error", stage="crash", error="%s: %s" % (type(e).__name__, e))
+        sys.exit(30)

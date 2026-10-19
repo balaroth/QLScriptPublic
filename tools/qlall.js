@@ -302,7 +302,13 @@ async function sendSummary(report, totalMs) {
         const failed = report.filter((r) => r.verdict === "fail");
         const failN = failed.length;
         const unkN = report.filter((r) => r.wasUnknown).length;
-        const mins = Math.round(totalMs / 60000);
+        const mins = Math.max(1, Math.round(totalMs / 60000));
+        if (failN === 0) {
+            const desp = `<p>全部成功 <b>${okN}/${report.length}</b>｜耗时约 ${mins} 分钟</p>`;
+            await sendNotify(`【青龙签到完成】全部成功 ${okN}/${report.length}`, desp, {});
+            console.log("[qlall] 全部成功简报邮件已发送");
+            return;
+        }
         let desp = `<p>统一签到执行完成（北京时间 ${ts()}，耗时约 ${mins} 分钟）</p>`;
         desp += `<p>共 <b>${report.length}</b> 个脚本：<span style="color:green">成功 ${okN}</span> ｜ <span style="color:red">失败 ${failN}</span>`;
         if (unkN) desp += `（其中 <b>${unkN}</b> 个无明确成功结论，已按失败计）`;
@@ -356,7 +362,7 @@ async function sendSummary(report, totalMs) {
     const skippedDisabled = beforeFilter - rels.length;
     if (skippedDisabled) console.log(`[qlall] 按面板禁用状态跳过 ${skippedDisabled} 个已禁用脚本`);
     if (LIMIT > 0) rels = rels.slice(0, LIMIT);
-    console.log(`[qlall] ${ts()} 发现 ${rels.length} 个业务脚本，开始串行执行（每个最多 ${ATTEMPTS} 次，全程静默，仅存在最终失败时发送一封报告）`);
+    console.log(`[qlall] ${ts()} 发现 ${rels.length} 个业务脚本，开始串行执行（每个最多 ${ATTEMPTS} 次，全程抑制子任务通知，完成后发送一封汇总）`);
     const report = [];
     const start = Date.now();
     for (let i = 0; i < rels.length; i++) {
@@ -386,14 +392,12 @@ async function sendSummary(report, totalMs) {
     const failN = report.filter((r) => r.verdict === "fail").length;
     fs.writeFileSync(path.join(STATE_DIR, "last-summary.json"), JSON.stringify({ time: ts(), total: report.length, ok: okN, fail: failN, report }, null, 1));
     console.log(`[qlall] 全部完成：成功 ${okN} / 失败 ${failN}，共 ${report.length}`);
-    if (!stopped && failN > 0 && process.env.QL_NO_MAIL !== '1') {
+    if (!stopped && process.env.QL_NO_MAIL !== '1') {
         await sendSummary(report, Date.now() - start);
     } else if (stopped) {
-        console.log('[qlall] 已停止，不发送失败报告');
-    } else if (process.env.QL_NO_MAIL === '1') {
-        console.log('[qlall] QL_NO_MAIL=1 跳过失败报告');
+        console.log('[qlall] 已停止，不发送汇总邮件');
     } else {
-        console.log('[qlall] 全部业务成功，按失败专报策略不发送邮件');
+        console.log('[qlall] QL_NO_MAIL=1 跳过汇总邮件');
     }
     await markIdle();
     // 退出码：有失败=1（便于面板状态识别），全成功=0

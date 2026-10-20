@@ -84,10 +84,21 @@ git pull fork main   # 或 upstream 同步后确认 daily/woiden_auto_renew.py �
 | 症状 | 定位 |
 |---|---|
 | `status=needs_human_verification` | Telegram Web 登录态被踢，或 reCAPTCHA v2 视觉接口不可用；VNC 重登 |
+| `status=needs_login` | Telegram OAuth 自动重登也失败了（widget 未出现或未登录 Telegram），需人工登录一次 |
 | `browser=not-ready` | Chromium 起不来，查 `journalctl -u woiden-browser`、profile 是否损坏 |
 | `stage=stage1` | 数学验证码或 Cloudflare 拦截 |
 | `stage=telegram` | 读码超时（120s） |
-| `stage=recaptcha_v2` | 视觉模型返回不可用 / 点选失败 |
+| `stage=recaptcha_v2` 且日志 `td_count:0` | 勾选框没点上：广告遮罩拦截，或点击坐标在视口外 |
+| `stage=login` | 自动重登流程失败，看 `login.log` 里的 `fired` 值 |
+
+## 踩过的坑（2026-10-20 实战）
+
+| 现象 | 根因 | 处理 |
+|---|---|---|
+| 汇总邮件多报两条失败 | 宿主侧 `.py` 放在仓库根被 qlall 当业务脚本扫到 | 移到 `tools/`（在 `EXCLUDE_DIR` 里） |
+| `error / vps not active` | PHPSESSID 寿命短，一天内失效；页面变登录墙后正则读不到 Status | `JS_INFO` 加 `login_wall`，失效时 `ensure_login()` 走 Telegram OAuth 自动重登 |
+| reCAPTCHA 三轮 `td_count:0`、`token_len:0` | ① `fc-dialog-overlay` 广告遮罩吃掉点击 ② 勾选框在视口下方，`bounding_box` 给的是页面坐标，`mouse.click` 点到空气 | ① `clear_overlays()` 每次点击前清遮罩 ② `scroll_into_view_if_needed()` 后再取坐标点击 |
+| 勾选后仍无 token | bframe 出现但内容还在加载，`td` 数为 0 | 点完后 `td.first.wait_for(timeout=8000)` |
 
 标签清理：所有终态经 `emit()` 调 `tidy_tabs()`；with 块内异常也会趁连接存活先清再抛；另有 `atexit` 兜底。SIGKILL（worker 520s 超时）无法捕获，残留标签由下次运行复用 + 清理自愈。
 

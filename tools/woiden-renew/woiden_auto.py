@@ -103,7 +103,8 @@ JS_INFO = """async () => {
   const s = t.match(/Status[\\s\\S]{0,300}?(ACTIVE|INACTIVE|SUSPENDED)/i);
   const host = t.match(/Hostname[\\s\\S]{0,80}?([0-9]+)-woiden/i);
   return {expiry: m ? m[1] : null, status: s ? s[1].toUpperCase() : null, vps_id: host ? host[1] : null,
-          challenge: /Just a moment|security verification/i.test(t), len: t.length};
+          challenge: /Just a moment|security verification/i.test(t),
+          login_wall: /Please login using your telegram account/i.test(t), len: t.length};
 }"""
 
 # 读取提交后服务端返回的提示文本（#response 里的 alert）
@@ -267,6 +268,114 @@ def wait_alert(page, timeout=60):
     return ""
 
 
+def clear_overlays(page):
+    """
+    移除挡住页面交互的广告遮罩层。
+
+    woiden.id 会随机弹出 "Unlock more content" 弹层和 Google vignette 插页广告，
+    它们是 position:fixed 的高 z-index 覆盖层，会拦截 pointer events。
+    实测后果：reCAPTCHA 的勾选框看起来点到了（Playwright 不报错），
+    实际点击被遮罩吃掉，三轮都拿不到 token，td_count 恒为 0。
+
+    纯 DOM 移除，不点广告、不等待，失败静默（遮罩不存在是常态）。
+    """
+    try:
+        page.evaluate("""() => {
+            const sels = ['.fc-dialog-overlay', '.fc-message-root', '[class*=fc-dialog]',
+                          '#google_vignette', '[id*=google_vignette]', '.modal-backdrop'];
+            for (const s of sels) {
+                for (const el of document.querySelectorAll(s)) { try { el.remove(); } catch (e) {} }
+            }
+            // 兜底：找含 "Unlock more content" 的块，向上定位到 fixed 祖先一起删掉
+            for (const el of document.querySelectorAll('div,section,aside')) {
+                const t = el.innerText || '';
+                if (t.includes('Unlock more content') && t.length < 800) {
+                    let n = el;
+                    for (let i = 0; i < 6 && n.parentElement; i++) {
+                        if (getComputedStyle(n).position === 'fixed') break;
+                        n = n.parentElement;
+                    }
+                    try { n.remove(); } catch (e) {}
+                }
+            }
+            if (document.body) document.body.style.overflow = 'auto';
+        }""")
+    except Exception:
+        pass
+
+
+def ensure_login(page):
+    """
+    用 Telegram OAuth 一键重登。
+
+    为什么需要：woiden.id 的 PHPSESSID 寿命很短，实测一天内就会失效，
+    失效后 /vps-info 返回登录墙（"Please login using your telegram account"）。
+    2026-10-20 早上就是因为这个，脚本把"未登录"误判成 "vps not active" 而失败。
+
+    登录方式：/login 页面嵌入 Telegram Login Widget（bot = LoginWoidenBot）。
+    由于同一个 Chromium profile 里 web.telegram.org 仍处于登录状态，
+    widget 会直接显示 "Log in as <name>"，调用 TWidgetLogin.auth() 即完成 OAuth。
+
+    三个坑，都踩过了：
+      1. 广告遮罩（fc-dialog-overlay / Unlock more content）会吃掉点击
+         → 先 clear_overlays，再用 JS 直接调函数，绕开 pointer events
+      2. 按钮点击后页面会导航，evaluate 可能抛 execution-context-destroyed
+         → 后续操作全部容错
+      3. iframe 加载慢（页面广告多），要轮询等它出现
+
+    返回 {"ok": bool, "log": [...]}，调用方重新读 /vps-info 验证结果。
+    """
+    log = []
+    try:
+        page.goto("https://woiden.id/login", wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        return {"ok": False, "log": ["goto_err:" + str(e)[:60]]}
+
+    got = False
+    for _ in range(20):
+        page.wait_for_timeout(1000)
+        try:
+            if page.locator("iframe[src*='oauth.telegram.org']").count():
+                got = True
+                break
+        except Exception:
+            pass
+    if not got:
+        return {"ok": False, "log": ["no_telegram_iframe"]}
+
+    clear_overlays(page)
+    page.wait_for_timeout(600)
+
+    fired = "nothing"
+    try:
+        frames = [f for f in page.frames if "oauth.telegram.org" in f.url]
+        if frames:
+            fired = frames[0].evaluate("""() => {
+                try {
+                    if (window.TWidgetLogin && typeof TWidgetLogin.auth === 'function') {
+                        TWidgetLogin.auth(); return 'TWidgetLogin.auth';
+                    }
+                } catch (e) {}
+                const b = document.querySelector('button.tgme_widget_login_button');
+                if (b) { b.click(); return 'btn.click'; }
+                return 'nothing';
+            }""")
+    except Exception as e:
+        fired = "err:" + str(e)[:60]
+    log.append("fired:" + str(fired))
+
+    # 等离开 /login（OAuth 回调完成后会跳走）
+    for _ in range(20):
+        page.wait_for_timeout(1500)
+        try:
+            if "/login" not in page.url:
+                log.append("left_login")
+                break
+        except Exception:
+            pass
+    return {"ok": True, "log": log}
+
+
 def js_click_submit(page):
     """
     用 JS 直接点提交按钮，而不是 Playwright 的 click()。
@@ -404,13 +513,52 @@ def solve_recaptcha_v2(page, max_rounds=3):
     失败时不抛异常，交给上层判为 needs_human_verification 并发邮件。
     """
     log = []
+    # 先清遮罩：广告弹层会吃掉对 iframe 内勾选框的点击，导致 token 永远为 0
+    clear_overlays(page)
+    page.wait_for_timeout(500)
+    # 用真实鼠标事件点勾选框。
+    # frame_locator().click() 在跨域 iframe 里经常"报告成功但没生效"
+    # （合成事件没落到 #recaptcha-anchor 上，勾选框仍为空），
+    # 所以优先取 bounding_box 后用 page.mouse 打真实点击。
+    anchor = page.frame_locator("iframe[title='reCAPTCHA']").locator("#recaptcha-anchor")
+    hit = False
+    # 关键：bounding_box 给的是页面坐标，元素在视口下方时 mouse.click 会点到空气。
+    # 先把 reCAPTCHA 的 iframe 滚进视口，再取坐标。
     try:
-        page.frame_locator("iframe[title='reCAPTCHA']").locator("#recaptcha-anchor").click(timeout=15000)
-        log.append("anchor_clicked")
+        page.locator("iframe[title='reCAPTCHA']").first.scroll_into_view_if_needed(timeout=8000)
+        page.wait_for_timeout(500)
     except Exception as e:
-        log.append("anchor_click_err:" + str(e)[:80])
+        log.append("scroll_err:" + str(e)[:60])
+    try:
+        box = anchor.bounding_box()
+        log.append({"anchor_box": [round(box["x"]), round(box["y"])] if box else None})
+        if box and box.get("width"):
+            vh = page.evaluate("() => window.innerHeight")
+            cy = box["y"] + box["height"] / 2
+            if cy > vh:
+                # 仍然在视口外，按差值再滚一次
+                page.mouse.wheel(0, cy - vh / 2)
+                page.wait_for_timeout(600)
+                box = anchor.bounding_box() or box
+                cy = box["y"] + box["height"] / 2
+            cx = box["x"] + box["width"] / 2
+            page.mouse.move(cx, cy)
+            page.wait_for_timeout(200)
+            page.mouse.click(cx, cy)
+            hit = True
+            log.append("anchor_mouse_click@%.0f,%.0f" % (cx, cy))
+    except Exception as e:
+        log.append("anchor_box_err:" + str(e)[:80])
+    if not hit:
+        try:
+            anchor.click(timeout=15000)
+            log.append("anchor_clicked")
+        except Exception as e:
+            log.append("anchor_click_err:" + str(e)[:80])
     for rnd in range(max_rounds):
         page.wait_for_timeout(2500)
+        # 每轮再清一次：广告是随机插入的，可能在验证过程中弹出
+        clear_overlays(page)
         tok = page.evaluate("""() => { const e = document.querySelector('textarea[name="g-recaptcha-response"]'); return e ? (e.value || '') : ''; }""")
         if tok:
             return {"ok": True, "token_len": len(tok), "rounds": rnd, "log": log}
@@ -420,6 +568,11 @@ def solve_recaptcha_v2(page, max_rounds=3):
             page.wait_for_timeout(3000)
             continue
         bf = page.frame_locator("iframe[src*='bframe']")
+        # bframe 出现不代表内容已渲染，等第一个格子出现，避免把加载中误判成 0 格
+        try:
+            bf.locator("td").first.wait_for(timeout=8000)
+        except Exception:
+            pass
         try:
             n_td = bf.locator("td").count()
         except Exception:
@@ -575,6 +728,18 @@ def main():
                 if not wait_cf(wd, 60):
                     return emit("needs_human_verification", stage="info", screenshot=shot(wd, "cf"))
                 info = wd.evaluate(JS_INFO)
+            # 登录态失效：先自动用 Telegram OAuth 重登，失败才交人工。
+            # 不能只看 login_wall：页面结构变动时 expiry 读不到但没有登录墙文案，
+            # 一并当作会话问题处理，避免误报 "vps not active"。
+            if info.get("login_wall") or not info.get("expiry"):
+                lg = ensure_login(wd)
+                if not goto(wd, URL_INFO):
+                    return emit("needs_human_verification", stage="login", login=lg,
+                                screenshot=shot(wd, "cf-login"))
+                info = wd.evaluate(JS_INFO)
+                if info.get("login_wall") or not info.get("expiry"):
+                    return emit("needs_login", stage="login", login=lg,
+                                screenshot=shot(wd, "login"))
             expiry0 = info.get("expiry")
             days = parse_days(expiry0)
             # check 模式到此为止：只读，不产生任何副作用
@@ -604,6 +769,7 @@ def main():
             wd.bring_to_front()
             if not goto(wd, URL_RENEW):
                 return emit("needs_human_verification", stage="stage1", screenshot=shot(wd, "cf-stage1"))
+            clear_overlays(wd)
             cap1 = solve_math(wd, tpl)
             if not cap1:
                 return emit("needs_manual_renewal", stage="stage1", error="math captcha unreadable",
@@ -633,6 +799,7 @@ def main():
             wd.bring_to_front()
             if not goto(wd, URL_CODE):
                 return emit("needs_human_verification", stage="stage2", screenshot=shot(wd, "cf-stage2"))
+            clear_overlays(wd)
             cap2 = solve_math(wd, tpl)
             if not cap2:
                 return emit("needs_manual_renewal", stage="stage2", error="math captcha unreadable",

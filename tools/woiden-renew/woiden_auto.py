@@ -300,17 +300,21 @@ def clear_overlays(page):
                             try { el.remove(); } catch (e) {}
                         }
                     }
-                    // 兜底：找含 "Unlock more content" 的块，向上定位到 fixed 祖先一起删掉
-                    for (const el of document.querySelectorAll('div,section,aside')) {
-                        const t = el.innerText || '';
-                        if (t.includes('Unlock more content') && t.length < 800) {
-                            let n = el;
-                            for (let i = 0; i < 6 && n.parentElement; i++) {
-                                if (getComputedStyle(n).position === 'fixed') break;
-                                n = n.parentElement;
+                    // 兜底：找含 "Unlock more content" 的块，向上定位到 fixed 祖先一起删掉。
+                    // 先做廉价判断：这个清理器每 400ms 跑一次，若无条件对整页
+                    // div/section/aside 读 innerText，会强制 reflow 拖慢页面。
+                    if ((document.body.textContent || '').includes('Unlock more content')) {
+                        for (const el of document.querySelectorAll('div,section,aside')) {
+                            const t = el.innerText || '';
+                            if (t.includes('Unlock more content') && t.length < 800) {
+                                let n = el;
+                                for (let i = 0; i < 6 && n.parentElement; i++) {
+                                    if (getComputedStyle(n).position === 'fixed') break;
+                                    n = n.parentElement;
+                                }
+                                try { n.style.pointerEvents = 'none'; } catch (e) {}
+                                try { n.remove(); } catch (e) {}
                             }
-                            try { n.style.pointerEvents = 'none'; } catch (e) {}
-                            try { n.remove(); } catch (e) {}
                         }
                     }
                     // 残留的全屏空覆盖层（Google vignette 容器，z-index 2e9）

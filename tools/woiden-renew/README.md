@@ -1,5 +1,11 @@
 # woiden-auto-renew
 
+> **本目录必须位于 `QLScriptPublic` 仓库的 `tools/woiden-renew/`。**
+> 原因：`tools/qlall.js` 的 `EXCLUDE_DIR` 包含 `tools`，只有放在这里，
+> 下面的 `.py` 才不会被 qlall 当成青龙业务脚本扫描执行。
+> 2026-10-20 曾放在仓库根 `woiden-renew/`，qlall 把 `woiden_auto.py` 和
+> `woiden_worker.py` 当任务跑了各 3 次，汇总邮件里因此多出两条失败记录。
+
 Woiden 免费 VPS（d11）的全自动续期，跑在 d3 的常驻 Chromium 上，通过 CDP 复用已登录会话。
 
 ## 架构

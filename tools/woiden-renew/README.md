@@ -88,7 +88,7 @@ git pull fork main   # 或 upstream 同步后确认 daily/woiden_auto_renew.py �
 | `browser=not-ready` | Chromium 起不来，查 `journalctl -u woiden-browser`、profile 是否损坏 |
 | `stage=stage1` | 数学验证码或 Cloudflare 拦截 |
 | `stage=telegram` | 读码超时（120s） |
-| `stage=recaptcha_v2` 且日志 `td_count:0` | 勾选框没点上：广告遮罩拦截，或点击坐标在视口外 |
+| `stage=recaptcha_v2` 且日志 `td_count:0` | 勾选框没点上。先看日志里的 `top` 字段：`DIV|` 表示广告覆盖层又插回来了（常驻清理器没生效，或页面已导航）；`IFRAME|reCAPTCHA` 才是坐标问题 |
 | `stage=login` | 自动重登流程失败，看 `login.log` 里的 `fired` 值 |
 
 ## 踩过的坑（2026-10-20 实战）
@@ -98,6 +98,7 @@ git pull fork main   # 或 upstream 同步后确认 daily/woiden_auto_renew.py �
 | 汇总邮件多报两条失败 | 宿主侧 `.py` 放在仓库根被 qlall 当业务脚本扫到 | 移到 `tools/`（在 `EXCLUDE_DIR` 里） |
 | `error / vps not active` | PHPSESSID 寿命短，一天内失效；页面变登录墙后正则读不到 Status | `JS_INFO` 加 `login_wall`，失效时 `ensure_login()` 走 Telegram OAuth 自动重登 |
 | reCAPTCHA 三轮 `td_count:0`、`token_len:0` | ① `fc-dialog-overlay` 广告遮罩吃掉点击 ② 勾选框在视口下方，`bounding_box` 给的是页面坐标，`mouse.click` 点到空气 | ① `clear_overlays()` 每次点击前清遮罩 ② `scroll_into_view_if_needed()` 后再取坐标点击 |
+| 清了遮罩仍然 `td_count:0`，日志里 `top:"DIV\|"` | ① `.fc-monetization-dialog-container`（z-index 2147483647）会被页面脚本**持续再插入**，清一次根本压不住 ② 它顺手给 `body` 设 `overflow:hidden` 干掉滚动条；清掉后视口宽 1440→1425，整页横向偏移约 8px，先前取的 `bounding_box` 当场过期，鼠标落在勾选框右侧空白 | ① `clear_overlays()` 改成装 `setInterval` 常驻清理（400ms 一轮，页面导航后自动重建） ② 显式还原 `overflow` / `position` ③ `_point()` 每轮「清 → 等布局稳定 → 重取坐标」，并用 `elementFromPoint` 校验落点最顶层必须是 reCAPTCHA iframe，不符就重试（最多 3 轮） |
 | 勾选后仍无 token | bframe 出现但内容还在加载，`td` 数为 0 | 点完后 `td.first.wait_for(timeout=8000)` |
 
 标签清理：所有终态经 `emit()` 调 `tidy_tabs()`；with 块内异常也会趁连接存活先清再抛；另有 `atexit` 兜底。SIGKILL（worker 520s 超时）无法捕获，残留标签由下次运行复用 + 清理自愈。

@@ -278,27 +278,68 @@ def clear_overlays(page):
     实际点击被遮罩吃掉，三轮都拿不到 token，td_count 恒为 0。
 
     纯 DOM 移除，不点广告、不等待，失败静默（遮罩不存在是常态）。
+
+    2026-10-20 补充（reCAPTCHA 反复点不中的真因）：
+    广告弹层除了拦截点击，还会给 body 设 overflow:hidden 把滚动条干掉。
+    滚动条有无会改变视口宽度（1440 ↔ 1425），整页横向偏移约 8px。
+    如果先取 bounding_box 再清广告，坐标就过期了，鼠标落在勾选框右侧空白，
+    reCAPTCHA 收到了点击却没勾上，于是 td_count 恒为 0、token 永远拿不到。
+    因此这里必须把 overflow 一起还原，且调用方要在清除「之后」再取坐标。
     """
     try:
         page.evaluate("""() => {
-            const sels = ['.fc-dialog-overlay', '.fc-message-root', '[class*=fc-dialog]',
-                          '#google_vignette', '[id*=google_vignette]', '.modal-backdrop'];
-            for (const s of sels) {
-                for (const el of document.querySelectorAll(s)) { try { el.remove(); } catch (e) {} }
-            }
-            // 兜底：找含 "Unlock more content" 的块，向上定位到 fixed 祖先一起删掉
-            for (const el of document.querySelectorAll('div,section,aside')) {
-                const t = el.innerText || '';
-                if (t.includes('Unlock more content') && t.length < 800) {
-                    let n = el;
-                    for (let i = 0; i < 6 && n.parentElement; i++) {
-                        if (getComputedStyle(n).position === 'fixed') break;
-                        n = n.parentElement;
+            // 广告是「持续再插入」的：清掉之后页面脚本会重新建 overlay，
+            // 所以装一个常驻清理器，每 400ms 扫一遍，页面导航后自动失效重建。
+            if (!window.__etaClean) {
+                window.__etaClean = () => {
+                    const sels = ['.fc-dialog-overlay', '.fc-message-root', '[class*=fc-dialog]',
+                                  '#google_vignette', '[id*=google_vignette]', '.modal-backdrop'];
+                    for (const s of sels) {
+                        for (const el of document.querySelectorAll(s)) {
+                            try { el.style.pointerEvents = 'none'; } catch (e) {}
+                            try { el.remove(); } catch (e) {}
+                        }
                     }
-                    try { n.remove(); } catch (e) {}
-                }
+                    // 兜底：找含 "Unlock more content" 的块，向上定位到 fixed 祖先一起删掉
+                    for (const el of document.querySelectorAll('div,section,aside')) {
+                        const t = el.innerText || '';
+                        if (t.includes('Unlock more content') && t.length < 800) {
+                            let n = el;
+                            for (let i = 0; i < 6 && n.parentElement; i++) {
+                                if (getComputedStyle(n).position === 'fixed') break;
+                                n = n.parentElement;
+                            }
+                            try { n.style.pointerEvents = 'none'; } catch (e) {}
+                            try { n.remove(); } catch (e) {}
+                        }
+                    }
+                    // 残留的全屏空覆盖层（Google vignette 容器，z-index 2e9）
+                    const vw = window.innerWidth, vh = window.innerHeight;
+                    for (const el of document.querySelectorAll('body > div, body > section')) {
+                        const cs = getComputedStyle(el);
+                        if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+                        if (parseInt(cs.zIndex || '0', 10) < 1000000000) continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width < vw * 0.8 || r.height < vh * 0.6) continue;
+                        if ((el.innerText || '').trim()) continue;
+                        try { el.remove(); } catch (e) {}
+                    }
+                    // 关键：还原被广告锁死的滚动，否则视口宽度差 15px，坐标全偏
+                    for (const n of [document.documentElement, document.body]) {
+                        if (!n) continue;
+                        if (n.style.overflow === 'hidden') n.style.removeProperty('overflow');
+                        if (n.style.overflowY === 'hidden') n.style.removeProperty('overflow-y');
+                        if (n.style.position === 'fixed') {
+                            n.style.removeProperty('position');
+                            n.style.removeProperty('top');
+                            n.style.removeProperty('left');
+                            n.style.removeProperty('width');
+                        }
+                    }
+                };
+                window.__etaTimer = setInterval(() => { try { window.__etaClean(); } catch (e) {} }, 400);
             }
-            if (document.body) document.body.style.overflow = 'auto';
+            window.__etaClean();
         }""")
     except Exception:
         pass
@@ -513,42 +554,80 @@ def solve_recaptcha_v2(page, max_rounds=3):
     失败时不抛异常，交给上层判为 needs_human_verification 并发邮件。
     """
     log = []
-    # 先清遮罩：广告弹层会吃掉对 iframe 内勾选框的点击，导致 token 永远为 0
-    clear_overlays(page)
-    page.wait_for_timeout(500)
-    # 用真实鼠标事件点勾选框。
-    # frame_locator().click() 在跨域 iframe 里经常"报告成功但没生效"
-    # （合成事件没落到 #recaptcha-anchor 上，勾选框仍为空），
-    # 所以优先取 bounding_box 后用 page.mouse 打真实点击。
+    # 勾选框在 reCAPTCHA iframe 内的固定位置：左上各 28px 处是 checkbox 中心。
+    # 这个偏移比 #recaptcha-anchor 的 bounding_box 更稳（后者受布局偏移影响）。
     anchor = page.frame_locator("iframe[title='reCAPTCHA']").locator("#recaptcha-anchor")
-    hit = False
-    # 关键：bounding_box 给的是页面坐标，元素在视口下方时 mouse.click 会点到空气。
-    # 先把 reCAPTCHA 的 iframe 滚进视口，再取坐标。
-    try:
-        page.locator("iframe[title='reCAPTCHA']").first.scroll_into_view_if_needed(timeout=8000)
-        page.wait_for_timeout(500)
-    except Exception as e:
-        log.append("scroll_err:" + str(e)[:60])
-    try:
-        box = anchor.bounding_box()
-        log.append({"anchor_box": [round(box["x"]), round(box["y"])] if box else None})
-        if box and box.get("width"):
+
+    def _point():
+        """
+        取一个「确实落在 reCAPTCHA iframe 上」的点击坐标。
+
+        为什么不能直接 anchor.bounding_box() 点下去：
+          广告弹层在时 body 是 overflow:hidden，清掉广告后滚动条回来，
+          视口宽度从 1440 变 1425，整页横向偏移约 8px，之前取的坐标就点空了。
+          所以每次都：清遮罩 → 等布局稳定 → 重新取坐标 → 用
+          elementFromPoint 校验该点最顶层确实是 reCAPTCHA iframe。
+        """
+        for _ in range(3):
+            # 每次取坐标前都重新清一遍：广告脚本会在滚动时把 overlay 再插回来
+            clear_overlays(page)
+            page.wait_for_timeout(350)
+            page.locator("iframe[title='reCAPTCHA']").first.scroll_into_view_if_needed(timeout=8000)
+            page.wait_for_timeout(350)
+            fbox = page.locator("iframe[title='reCAPTCHA']").first.bounding_box()
+            try:
+                abox = anchor.bounding_box()
+            except Exception:
+                abox = None
+            cands = []
+            if abox and abox.get("width"):
+                cands.append((abox["x"] + abox["width"] / 2, abox["y"] + abox["height"] / 2, "anchor"))
+            if fbox:
+                cands.append((fbox["x"] + 28, fbox["y"] + 28, "iframe+28"))
             vh = page.evaluate("() => window.innerHeight")
-            cy = box["y"] + box["height"] / 2
-            if cy > vh:
-                # 仍然在视口外，按差值再滚一次
-                page.mouse.wheel(0, cy - vh / 2)
-                page.wait_for_timeout(600)
-                box = anchor.bounding_box() or box
-                cy = box["y"] + box["height"] / 2
-            cx = box["x"] + box["width"] / 2
-            page.mouse.move(cx, cy)
-            page.wait_for_timeout(200)
-            page.mouse.click(cx, cy)
-            hit = True
-            log.append("anchor_mouse_click@%.0f,%.0f" % (cx, cy))
-    except Exception as e:
-        log.append("anchor_box_err:" + str(e)[:80])
+            for x, y, how in cands:
+                if y > vh - 5:
+                    continue
+                top = page.evaluate(
+                    "([x, y]) => { const e = document.elementFromPoint(x, y);"
+                    " return e ? (e.tagName + '|' + (e.title || '')) : 'NULL'; }", [x, y])
+                log.append({"cand": how, "at": [round(x), round(y)], "top": top})
+                if top.startswith("IFRAME") and "reCAPTCHA" in top:
+                    return x, y, how
+            page.wait_for_timeout(250)
+        return None, None, None
+
+    def _reacted():
+        """点击是否被接受：出了 token，或挑战格子渲染出来了。"""
+        tok = page.evaluate("""() => { const e = document.querySelector('textarea[name="g-recaptcha-response"]'); return e ? (e.value || '') : ''; }""")
+        if tok:
+            return True
+        try:
+            return page.frame_locator("iframe[src*='bframe']").locator("td").count() > 0
+        except Exception:
+            return False
+
+    hit = False
+    for attempt in range(2):
+        # 顺序不能反：先清遮罩并等布局稳定，再取坐标（理由见 _point）
+        clear_overlays(page)
+        page.wait_for_timeout(600)
+        try:
+            cx, cy, how = _point()
+        except Exception as e:
+            log.append("point_err:" + str(e)[:80])
+            cx = None
+        if cx is None:
+            break
+        page.mouse.move(cx, cy)
+        page.wait_for_timeout(250)
+        page.mouse.click(cx, cy)
+        hit = True
+        log.append("click@%s %.0f,%.0f" % (how, cx, cy))
+        page.wait_for_timeout(2500)
+        if _reacted():
+            break
+        log.append("no_reaction_retry_%d" % attempt)
     if not hit:
         try:
             anchor.click(timeout=15000)

@@ -17,6 +17,7 @@ const fs = require("fs");
 const path = require("path");
 const WeChatServer = require("./wcs.js");
 
+const SCRIPT_NAME = "yz9d.js";
 const MINI_APP_ID = "wx9d46d96c4c35a53a";
 const CLIENT_BIZ = "weapp_wsc";
 const KDT_ID = "46323516";
@@ -59,6 +60,35 @@ function pickToken(data = {}) {
     return data.accessToken || data.access_token || "";
 }
 
+const TOKEN_RE = /access_token|token|登录|授权|invalid session/i;
+
+// —— 聚合结果：整脚本只输出一条 [QLRUN_RESULT]，写请求一旦尝试即禁止外层重放 ——
+const summary = { accounts: 0, ok: 0, failed: 0, writeAttempted: false, retryable: true, rows: [] };
+
+function safeShort(text, max = 160) {
+    return String(text == null ? "" : text).replace(/[\r\n]+/g, " ").slice(0, max);
+}
+
+function emitResult(status, extra = {}) {
+    const payload = {
+        script: SCRIPT_NAME,
+        status,
+        retryable: status === "FAILURE" ? (summary.retryable && !summary.writeAttempted ? 1 : 0) : 0,
+        accounts: `${summary.ok}/${summary.accounts}`,
+        writeAttempted: summary.writeAttempted ? 1 : 0,
+        ...extra,
+    };
+    // 结构化结果行；不含 token/code/手机号
+    $.log(`[QLRUN_RESULT] ${status} ${JSON.stringify(payload)}`);
+}
+
+async function finish() {
+    try { await $.sendMsg(); } catch (_) {}
+    const secs = ((Date.now() - $.startTime) / 1000).toFixed(1);
+    $.log(`🔔${$.name},结束!🕛 ${secs}秒`);
+    process.exit(summary.failed > 0 ? 1 : 0);
+}
+
 class Task {
     constructor(openid) {
         this.index = $.userIdx++;
@@ -68,9 +98,16 @@ class Task {
         this.cookie = "";
         this.kdtId = KDT_ID;
         this.userInfo = {};
+        this.checkinId = "";
+        this.isShow = undefined; // undefined=未知(页面接口未成功)，true/false=服务端权威结论
+        this.writeAttempted = false;
+        this.checkinOutcome = "";
+        this.readFailed = false;
     }
 
     async run() {
+        const outcome = { index: this.index, login: "unknown", checkin: "not_attempted", isShow: this.isShow, writeAttempted: false, hardFail: false, retryableFail: false, reason: "" };
+
         const cached = this.getCachedToken();
         if (cached) {
             this.applyToken(cached);
@@ -83,12 +120,31 @@ class Task {
 
         if (!this.token) {
             await this.loginByWxCode();
-            if (!this.token) return;
+            if (!this.token) {
+                outcome.login = "failed";
+                outcome.hardFail = true;
+                outcome.retryableFail = true;
+                outcome.reason = "login_failed";
+                return outcome;
+            }
+            outcome.login = "relogin";
+        } else {
+            outcome.login = "ok";
         }
 
         await this.showCheckinPage();
         await this.doCheckin();
         await this.getPoints();
+
+        outcome.isShow = this.isShow;
+        outcome.checkin = this.checkinOutcome || "not_attempted";
+        outcome.writeAttempted = this.writeAttempted;
+        // 写结果未知/已尝试时不允许外层整脚本重放
+        if (this.writeAttempted) summary.retryable = false;
+        if (this.readFailed && !this.writeAttempted) {
+            outcome.retryableFail = true;
+        }
+        return outcome;
     }
 
     getCachedToken() {
@@ -156,24 +212,39 @@ class Task {
         };
     }
 
-    async request({ method = "GET", path: apiPath, params = {}, data = {}, skipToken = false }) {
-        const options = {
-            method,
-            url: `${API_BASE}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`,
-            headers: this.getHeaders(method === "POST" ? { "Content-Type": "application/json" } : {}),
-            timeout: 15000,
-            validateStatus: () => true,
-        };
-        options.params = skipToken ? params : this.getBaseParams(params);
-        if (method !== "GET") options.data = data;
+    // 只读 GET 有界重试(最多2次)；写动作(write=true)只尝试一次，结果未知也不重放
+    async request({ method = "GET", path: apiPath, params = {}, data = {}, skipToken = false, write = false }) {
+        const maxAttempts = write ? 1 : 2;
+        let lastError;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const options = {
+                    method,
+                    url: `${API_BASE}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`,
+                    headers: this.getHeaders(method === "POST" ? { "Content-Type": "application/json" } : {}),
+                    timeout: 15000,
+                    validateStatus: () => true,
+                };
+                options.params = skipToken ? params : this.getBaseParams(params);
+                if (method !== "GET") options.data = data;
 
-        const { data: result, status, headers } = await axios.request(options);
-        if (headers["set-cookie"]) {
-            this.cookie = headers["set-cookie"].map((item) => item.split(";")[0]).join("; ");
+                const { data: result, status, headers } = await axios.request(options);
+                if (headers["set-cookie"]) {
+                    this.cookie = headers["set-cookie"].map((item) => item.split(";")[0]).join("; ");
+                }
+                if (status !== 200) throw new Error(`HTTP ${status}: ${JSON.stringify(result)}`);
+                if (!result || result.code !== 0) throw new Error(result?.msg || JSON.stringify(result));
+                return result.data;
+            } catch (e) {
+                lastError = e;
+                const msg = String(e.message || e);
+                const transient = /timeout of|ECONN|ENOTFOUND|EAI_AGAIN|HTTP\s*5\d\d|429|网络|超时|稍后再试|系统繁忙/i.test(msg);
+                if (write || !transient || attempt === maxAttempts) throw e;
+                await new Promise((r) => setTimeout(r, 800 * attempt));
+                $.log(`账号[${this.index}] 只读请求临时失败，${800 * attempt}ms 后重试(${attempt}/${maxAttempts - 1})`);
+            }
         }
-        if (status !== 200) throw new Error(`HTTP ${status}: ${JSON.stringify(result)}`);
-        if (!result || result.code !== 0) throw new Error(result?.msg || JSON.stringify(result));
-        return result.data;
+        throw lastError;
     }
 
     async getLoginCode() {
@@ -219,34 +290,51 @@ class Task {
         try {
             const data = await this.request({ path: "/wscump/checkin/show_checkin_page_v2.json" });
             this.checkinId = data?.checkinId;
-            this.isShow = !!data?.isShow;
+            this.isShow = data?.isShow === true; // 仅在页面接口成功时记录权威布尔值
             $.log(`账号[${this.index}] 签到活动: checkinId=${this.checkinId || "未获取"} isShow=${this.isShow}`);
         } catch (e) {
+            this.readFailed = true;
             $.log(`账号[${this.index}] 获取签到活动失败: ${e.message || e}`);
-            if (/access_token|token|登录|授权|invalid session/i.test(String(e.message || e))) this.removeCachedToken();
+            if (TOKEN_RE.test(String(e.message || e))) this.removeCachedToken();
         }
     }
 
     async doCheckin() {
-        if (!this.checkinId) {
-            $.log(`账号[${this.index}] 未获取到 checkinId，跳过签到`);
+        // 权威门控：服务端明确 isShow=false（活动未展示/未开启）时，禁止强制调用 checkinV2 写请求
+        if (this.isShow === false) {
+            this.checkinOutcome = "skipped_not_displayed";
+            $.log(`账号[${this.index}] 当前无每日签到活动可展示(isShow=false)，按权威状态跳过，未发起签到写请求`);
             return;
         }
+        // 页面状态未知(接口失败)时不冒险写；无 checkinId 也不写
+        if (this.isShow !== true || !this.checkinId) {
+            this.checkinOutcome = this.isShow === undefined ? "skipped_unknown" : "skipped_no_checkin";
+            $.log(`账号[${this.index}] 签到状态未明确(${this.checkinOutcome})，按安全策略不发起签到写请求`);
+            return;
+        }
+        // 以下为唯一写请求路径，只尝试一次
+        this.writeAttempted = true;
+        summary.writeAttempted = true;
         try {
             const data = await this.request({
                 path: "/wscump/checkin/checkinV2.json",
                 params: { checkinId: this.checkinId },
+                write: true,
             });
+            this.checkinOutcome = "signed";
             const awards = (data?.list || []).map((item) => item?.infos?.title).filter(Boolean).join(", ");
             $.log(`账号[${this.index}] 签到成功: ${data?.desc || ""}${awards ? ` ${awards}` : ""}`);
         } catch (e) {
             const message = String(e.message || e);
             if (/已达最大参与次数|已签到|重复签到/.test(message)) {
+                this.checkinOutcome = "already_signed";
                 $.log(`账号[${this.index}] 今日已签到`);
                 return;
             }
+            this.checkinOutcome = "failed";
             $.log(`账号[${this.index}] 签到失败: ${message}`);
-            if (/access_token|token|登录|授权|invalid session/i.test(message)) this.removeCachedToken();
+            if (TOKEN_RE.test(message)) this.removeCachedToken();
+            throw new Error(message);
         }
     }
 
@@ -255,6 +343,7 @@ class Task {
             const data = await this.request({ path: "/wscump/integral/user_points.json" });
             $.log(`账号[${this.index}] 当前积分: ${data?.current_points ?? data?.real_points ?? "未知"}`);
         } catch (e) {
+            this.readFailed = true;
             $.log(`账号[${this.index}] 查询积分失败: ${e.message || e}`);
         }
     }
@@ -262,9 +351,50 @@ class Task {
 
 !(async () => {
     $.checkEnv(ckName);
+    summary.accounts = $.userList.length;
+    if (!$.userCount) {
+        emitResult("SKIP", { reason: "no_accounts", configured: 0, phases: { checkinV2: "not_run" } });
+        return finish();
+    }
     for (const openid of $.userList) {
-        await new Task(openid).run();
+        let oc;
+        try {
+            oc = await new Task(openid).run();
+        } catch (e) {
+            oc = { index: summary.accounts, hardFail: true, retryableFail: !summary.writeAttempted, reason: safeShort(e.message || e), checkin: "failed" };
+        }
+        summary.rows.push(oc);
+        if (oc.hardFail || oc.checkin === "failed") {
+            summary.failed += 1;
+            if (!oc.retryableFail) summary.retryable = false;
+        } else {
+            summary.ok += 1;
+        }
+    }
+
+    if (summary.failed > 0) {
+        emitResult("FAILURE", {
+            reason: "account_failed",
+            phases: { login: "attempted", show_checkin_page_v2: "read", checkinV2: summary.writeAttempted ? "attempted_once" : "skipped", points: "read" },
+            rows: summary.rows.map((r) => ({ index: r.index, checkin: r.checkin, isShow: r.isShow, reason: r.reason || undefined })),
+        });
+    } else if (summary.rows.every((r) => r.checkin === "skipped_not_displayed")) {
+        emitResult("SKIP", {
+            reason: "activity_not_displayed",
+            phases: { login: "ok", show_checkin_page_v2: "isShow=false", checkinV2: "skipped_not_displayed", points: "read" },
+            rows: summary.rows.map((r) => ({ index: r.index, checkin: r.checkin, isShow: r.isShow })),
+        });
+    } else {
+        emitResult("SUCCESS", {
+            phases: { login: "ok", show_checkin_page_v2: "read", checkinV2: summary.writeAttempted ? "done" : "skipped", points: "read" },
+            rows: summary.rows.map((r) => ({ index: r.index, checkin: r.checkin, isShow: r.isShow })),
+        });
     }
 })()
-    .catch((e) => $.log(e.message || e))
-    .finally(() => $.done());
+    .catch((e) => {
+        summary.failed += 1;
+        summary.retryable = !summary.writeAttempted;
+        $.log(`运行异常: ${e.message || e}`);
+        emitResult("FAILURE", { reason: "unhandled_exception", error: safeShort(e.message || e), phases: { checkinV2: summary.writeAttempted ? "attempted_once" : "not_run" } });
+    })
+    .finally(() => finish());

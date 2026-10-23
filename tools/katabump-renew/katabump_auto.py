@@ -3,9 +3,9 @@
 
 Safety and ownership rules:
 - Credentials are read only from /opt/katabump-renew/login.json.
-- The script reuses one page carrying its private window.name ownership marker.
-- Cleanup closes only duplicate pages carrying that same marker; it never closes
-  Woiden, Telegram, unmarked Katabump, or unrelated tabs.
+- The script persists its Chromium CDP targetId in a local state file and reuses
+  exactly that page across runs and cross-site navigations.
+- It never closes Woiden, Telegram, unowned Katabump, or unrelated tabs.
 - Cloudflare Turnstile is never bypassed. If verification is required, the run
   leaves its owned page visible for manual completion and reports
   needs_human_verification.
@@ -22,7 +22,8 @@ LOGIN = BASE / "login.json"
 CDP = "http://127.0.0.1:9222"
 LOGIN_URL = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
-OWNER_MARK = "__ql_katabump_owned_v1__"
+STATE = BASE / "state"
+TARGET_FILE = STATE / "page-target-id"
 
 
 def now_iso():
@@ -143,25 +144,30 @@ def renew_one(page, username, password):
     return {"account": account, "status": "failed", "reason": "确认窗口仍未关闭，未取得成功证据"}
 
 
+def page_target_id(ctx, page):
+    client = ctx.new_cdp_session(page)
+    try:
+        return client.send("Target.getTargetInfo")["targetInfo"]["targetId"]
+    finally:
+        client.detach()
+
+
 def owned_page(ctx):
-    """Return the single page owned by this script and close only owned duplicates."""
-    found = []
-    for page in ctx.pages:
-        try:
-            if page.evaluate("() => window.name") == OWNER_MARK:
-                found.append(page)
-        except Exception:
-            pass
-    if found:
-        page = found[0]
-        for duplicate in found[1:]:
+    """Reuse exactly the locally persisted CDP page target; otherwise create one."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    wanted = TARGET_FILE.read_text().strip() if TARGET_FILE.exists() else ""
+    if wanted:
+        for page in ctx.pages:
             try:
-                duplicate.close()
+                if page_target_id(ctx, page) == wanted:
+                    return page
             except Exception:
                 pass
-        return page
     page = ctx.new_page()
-    page.evaluate("mark => { window.name = mark; }", OWNER_MARK)
+    target = page_target_id(ctx, page)
+    tmp = TARGET_FILE.with_suffix(".tmp")
+    tmp.write_text(target + "\n")
+    tmp.replace(TARGET_FILE)
     return page
 
 

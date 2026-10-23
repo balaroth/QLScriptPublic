@@ -5,7 +5,7 @@
 - 青龙 `daily/katabump_auto_renew.py` 由 `qlall` 每日统一调用，也可通过 `qlrun` 手动运行。
 - 容器入口通过 `/ql/data/config/katabump-renew` 文件信箱调用宿主 `katabump-renew-worker.service`。
 - 宿主复用 `woiden-browser.service` 的 Chromium（CDP `127.0.0.1:9222`）与 `/opt/woiden-renew/venv` 的 Playwright。
-- 每次运行复用带私有 `window.name` 标记的 Katabump 专属页面；只会清理带相同标记的重复页，不扫描或关闭 Woiden、Telegram、无标记 Katabump 或其他既有页面。遇到人工验证时保留并置前该专属页面。
+- 每次运行复用本地 `state/page-target-id` 记录的 Chromium CDP `targetId`；该标识跨站导航保持稳定。脚本不按 URL 扫描清理，也不关闭 Woiden、Telegram、未登记的 Katabump 或其他既有页面。遇到人工验证时保留并置前该专属页面。
 - 脚本独立调用青龙 `sendNotify.js` 发邮件，不受 `qlall` 子任务通知抑制影响。
 
 ## 凭据

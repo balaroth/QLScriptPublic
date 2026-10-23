@@ -14,6 +14,8 @@ Safety and ownership rules:
 import json
 import re
 import sys
+import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -221,20 +223,43 @@ def renew_one(page, username, password, force_logout=False):
     except Exception:
         return {"account": account, "status": "failed", "reason": "无法点击续期确认"}
 
-    page.wait_for_timeout(2500)
+    # 提交确认后是整页跳转（带 renew-error / renew-success 查询串），不是弹窗动画。
+    # 固定等 2.5 秒不够 —— 2026-10-23 就是这样把「未到续期时间」误判成
+    # "确认窗口仍未关闭，未取得成功证据"。改成轮询 URL 和弹窗状态。
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        page.wait_for_timeout(800)
+        if "renew-error" in page.url or "renew-success" in page.url:
+            break
+        try:
+            if page.locator("#renew-modal").count() == 0 or not page.locator("#renew-modal").first.is_visible():
+                break
+        except Exception:
+            break
+    page.wait_for_timeout(1200)
+
     text = body_text(page)
-    if "Please complete the captcha to continue" in text or has_turnstile(page):
+    url = page.url
+    # 查询串里的空格被编码成 +，引号是 %27，两种形式都要能匹配
+    decoded = urllib.parse.unquote(url).replace("+", " ")
+
+    if "Please complete the captcha to continue" in text:
         return {"account": account, "status": "needs_human_verification", "reason": "服务端要求完成验证码"}
-    if "You can't renew your server yet" in text or "renew-error" in page.url:
-        m = re.search(r"as of\s+([^\(\n\r&]+)", text, re.I)
-        if not m:
-            try:
-                decoded = page.url.replace("+", " ")
-                m = re.search(r"as of\s+([^\(\n\r&]+)", decoded, re.I)
-            except Exception:
-                m = None
-        return {"account": account, "status": "not_due", "next_renewal": m.group(1).strip() if m else "未知"}
-    if not modal.is_visible():
+
+    if "renew-error" in url or "You can't renew your server yet" in text:
+        m = (re.search(r"as of\s+([^\(\n\r&]+)", text, re.I)
+             or re.search(r"as of\s+([^\(\n\r&]+)", decoded, re.I))
+        return {"account": account, "status": "not_due",
+                "next_renewal": m.group(1).strip() if m else "未知"}
+
+    if "renew-success" in url:
+        return {"account": account, "status": "renewed"}
+
+    try:
+        still_open = bool(page.locator("#renew-modal").count()) and page.locator("#renew-modal").first.is_visible()
+    except Exception:
+        still_open = False
+    if not still_open:
         return {"account": account, "status": "renewed"}
     return {"account": account, "status": "failed", "reason": "确认窗口仍未关闭，未取得成功证据"}
 

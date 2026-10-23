@@ -33,6 +33,21 @@
 
 **诊断方法：先截图，再读 DOM。** 这次如果一开始就截图，能省掉六轮排查。
 
+## 续期结果判定
+
+提交确认后页面是**整页跳转**（`/servers/edit?id=...&renew-error=...` 或 `&renew-success=...`），不是弹窗动画。所以判据必须看 URL，不能只看 `#renew-modal` 是否还在：
+
+| 现象 | 结论 |
+|---|---|
+| URL 含 `renew-error`，正文 "You can't renew your server yet" | `not_due`，从正文或解码后的 URL 里抓 `as of <日期>` 作为下次可续期时间 |
+| URL 含 `renew-success` | `renewed` |
+| 弹窗已关闭且无 error | `renewed` |
+| 弹窗仍开着 | `failed`（未取得证据，不臆断成功） |
+
+**2026-10-23 的第四个误判**：原来点完确认固定 `wait_for_timeout(2500)` 就检查，此时整页跳转还没完成，`#renew-modal` 仍可见、正文里也没有 "can't renew"，于是落到 `failed / 确认窗口仍未关闭`。实际服务端早就返回了 `renew-error`。改为轮询 URL 与弹窗状态，最多 25 秒。
+
+当前账号实测：服务器 `frc`（id 404205），到期 `2026-10-27`，续期周期 **4 天**，可续期日 `10-26`。所以平时跑出来的正常结果就是 `not_due`。
+
 ## 登录错误码
 
 | URL | 含义 |

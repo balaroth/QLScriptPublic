@@ -3,10 +3,12 @@
 
 Safety and ownership rules:
 - Credentials are read only from /opt/katabump-renew/login.json.
-- Every run creates dedicated pages and closes exactly those pages in finally.
-- Existing Woiden, Telegram, Katabump, or unrelated tabs are never closed.
+- The script reuses one page carrying its private window.name ownership marker.
+- Cleanup closes only duplicate pages carrying that same marker; it never closes
+  Woiden, Telegram, unmarked Katabump, or unrelated tabs.
 - Cloudflare Turnstile is never bypassed. If verification is required, the run
-  stops before submission and reports needs_human_verification.
+  leaves its owned page visible for manual completion and reports
+  needs_human_verification.
 """
 import json
 import re
@@ -20,6 +22,7 @@ LOGIN = BASE / "login.json"
 CDP = "http://127.0.0.1:9222"
 LOGIN_URL = "https://dashboard.katabump.com/auth/login"
 LOGOUT_URL = "https://dashboard.katabump.com/auth/logout"
+OWNER_MARK = "__ql_katabump_owned_v1__"
 
 
 def now_iso():
@@ -140,26 +143,43 @@ def renew_one(page, username, password):
     return {"account": account, "status": "failed", "reason": "确认窗口仍未关闭，未取得成功证据"}
 
 
+def owned_page(ctx):
+    """Return the single page owned by this script and close only owned duplicates."""
+    found = []
+    for page in ctx.pages:
+        try:
+            if page.evaluate("() => window.name") == OWNER_MARK:
+                found.append(page)
+        except Exception:
+            pass
+    if found:
+        page = found[0]
+        for duplicate in found[1:]:
+            try:
+                duplicate.close()
+            except Exception:
+                pass
+        return page
+    page = ctx.new_page()
+    page.evaluate("mark => { window.name = mark; }", OWNER_MARK)
+    return page
+
+
 def main():
     users = load_users()
-    owned_pages = []
     results = []
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(CDP)
         if not browser.contexts:
             raise RuntimeError("shared Chromium has no browser context")
         ctx = browser.contexts[0]
-        try:
-            for username, password in users:
-                page = ctx.new_page()
-                owned_pages.append(page)
-                page.set_default_timeout(60000)
-                results.append(renew_one(page, username, password))
-        finally:
-            # Ownership-based cleanup: close only pages created by this run.
-            for page in reversed(owned_pages):
+        page = owned_page(ctx)
+        page.set_default_timeout(60000)
+        for username, password in users:
+            results.append(renew_one(page, username, password))
+            if results[-1]["status"] == "needs_human_verification":
                 try:
-                    page.close()
+                    page.bring_to_front()
                 except Exception:
                     pass
 

@@ -13,8 +13,10 @@ wx_auth        必填，wx_server 鉴权值
 
 可选开关（均有安全默认值，不配即保持原行为）：
 TRSJ_READ_ONLY=1        只读验证：只登录+查询，不发起任何写请求（核心签到/播种/石斛签到/阅读上报均跳过）
-TRSJ_MAX_RETRIES=2      只读(GET/幂等)请求最大重试次数 0..5，写请求绝不自动重试
+TRSJ_MAX_RETRIES=2      只读(GET/幂等)请求最大重试次数 0..5，写请求不做请求层自动重试
 TRSJ_HTTP_TIMEOUT=20000 请求超时毫秒 3000..60000
+TRSJ_UNKNOWN_RETRY_AFTER_MS=1800000 核心写结果未知后至少等待多久，才允许最后一次恢复尝试（5分钟..12小时）
+TRSJ_UNKNOWN_CONFIRM_DELAY_MS=3000 恢复前两次权威状态查询的间隔（1..30秒）
 TRSJ_DENDRobium=0       关闭可选石斛模块（默认 1 开启；该模块成败不影响核心签到结论）
 
 契约（appid wx210e40a77dbe7a27，host m.ahzyssl.com）：
@@ -36,8 +38,9 @@ TRSJ_DENDRobium=0       关闭可选石斛模块（默认 1 开启；该模块�
   浏览  GET  /applet/game/dendrobium/article/completeRead -> code==200成功
 
 安全约定：
-- 只读/幂等 GET 在网络错误/超时/408/429/5xx 下有界重试；写请求只发起一次，结果未知(502/超时/断连)
-  绝不自动重试，也不允许外层整脚本重放重复发起；同日结果未知会落盘并在重入时跳过写，转人工核对。
+- 只读/幂等 GET 在网络错误/超时/408/429/5xx 下有界重试；普通写请求只发起一次，结果未知(502/超时/断连)
+  会先落盘并阻止外层整脚本重放。仅核心签到允许一次受控恢复：冷却期后连续两次权威查询均明确未签到，
+  且状态落盘可靠时，才允许第二次也是最后一次写入；之后无论结果如何都不再自动发起。
 - 核心签到成功(服务端记录或 code==200)才报 SUCCESS；502/失败/未知一律如实报 FAILURE，不伪装成功。
 - 全程不输出 token / code / 手机号。
 ------------------------------------------
@@ -103,7 +106,17 @@ function readJsonFile(file, fallback) {
     }
 }
 function writeJsonFile(file, obj) {
-    try { fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf8"); } catch (e) { /* 状态落盘失败不阻断主流程 */ }
+    const dir = path.dirname(file);
+    const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+    try {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { encoding: "utf8", mode: 0o600 });
+        fs.renameSync(tmp, file);
+        return true;
+    } catch (e) {
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+        return false;
+    }
 }
 function parseAccount(raw = "") {
     const [id, remark] = String(raw).split("#").map((s) => (s || "").trim());
@@ -134,6 +147,9 @@ class Task {
         this.readOnly = options.readOnly ?? boolEnv("TRSJ_READ_ONLY", false);
         this.maxRetries = options.maxRetries ?? intEnv("TRSJ_MAX_RETRIES", 2, 0, 5);
         this.timeout = options.timeout || intEnv("TRSJ_HTTP_TIMEOUT", 20000, 3000, 60000);
+        this.unknownRetryAfterMs = options.unknownRetryAfterMs ?? intEnv("TRSJ_UNKNOWN_RETRY_AFTER_MS", 1800000, 300000, 43200000);
+        this.unknownConfirmDelayMs = options.unknownConfirmDelayMs ?? intEnv("TRSJ_UNKNOWN_CONFIRM_DELAY_MS", 3000, 1000, 30000);
+        this.now = options.now || (() => Date.now());
         this.denEnabled = options.denEnabled ?? boolEnv("TRSJ_DENDRobium", true);
         this.tokenCacheFile = options.tokenCacheFile || TOKEN_CACHE_FILE;
         this.writeStateFile = options.writeStateFile || WRITE_STATE_FILE;
@@ -155,18 +171,45 @@ class Task {
     }
     warn(text) { this.logger.warn ? this.logger.warn(`账号[${this.index}] ${text}`) : this.log(text); }
 
-    // 状态落盘：记录每个写动作当日 outcome=success|unknown，供外层整脚本重入时防重复写
+    // 状态落盘：记录每个写动作当日 outcome=attempting|success|unknown，供重入防重复写
     _state() { return readJsonFile(this.writeStateFile, {}) || {}; }
-    _saveState(s) { writeJsonFile(this.writeStateFile, s); }
+    _saveState(s) { return writeJsonFile(this.writeStateFile, s); }
+    _stateKey(action) { return `${this.account.openid}::${action}`; }
     stateFor(action) {
         const all = this._state();
-        const key = `${this.account.openid}::${action}`;
-        return (all[key] && all[key].date === chinaToday()) ? all[key] : { date: chinaToday(), outcome: null };
+        const key = this._stateKey(action);
+        if (!all[key] || all[key].date !== chinaToday()) return { date: chinaToday(), outcome: null, attempts: 0 };
+        const current = Object.assign({}, all[key]);
+        current.attempts = Number(current.attempts || (current.outcome ? 1 : 0));
+        return current;
+    }
+    stateTimeMs(st) {
+        const parsed = Date.parse(st && st.lastAttemptAt || "");
+        if (Number.isFinite(parsed)) return parsed;
+        try { return fs.statSync(this.writeStateFile).mtimeMs; } catch (_) { return 0; }
     }
     recordState(action, entry) {
         const all = this._state();
-        all[`${this.account.openid}::${action}`] = Object.assign({ date: chinaToday() }, entry);
-        this._saveState(all);
+        const key = this._stateKey(action);
+        all[key] = Object.assign({ date: chinaToday() }, all[key] || {}, entry);
+        if (!this._saveState(all)) throw new ApiError(`${action} 防重放状态落盘失败，已阻止写请求`, { statePersistFailed: true, retryable: false });
+        const saved = this._state()[key];
+        if (!saved || saved.date !== all[key].date || saved.outcome !== all[key].outcome || Number(saved.attempts || 0) !== Number(all[key].attempts || 0)) {
+            throw new ApiError(`${action} 防重放状态回读校验失败，已阻止写请求`, { statePersistFailed: true, retryable: false });
+        }
+        return saved;
+    }
+    isSignedRecord(rec, today = chinaToday()) {
+        return !!(rec && rec.code === 200 && (rec.data?.userSignInList || []).some((i) => i.signInDate === today && i.signInStatus === 1));
+    }
+    async authoritativeCoreStatusTwice(today) {
+        const first = await this.call("GET", EP_SIGN_LOG, { idempotent: true });
+        if (!first || first.code !== 200) return { confirmed: false, signed: false };
+        if (this.isSignedRecord(first, today)) return { confirmed: true, signed: true };
+        await this.wait(this.unknownConfirmDelayMs);
+        const second = await this.call("GET", EP_SIGN_LOG, { idempotent: true });
+        if (!second || second.code !== 200) return { confirmed: false, signed: false };
+        return { confirmed: true, signed: this.isSignedRecord(second, today) };
     }
 
     // 统一请求：idempotent(GET/幂等) 才有界重试；写请求单次发起，transient 标记供上层判定未知
@@ -292,22 +335,45 @@ class Task {
         }
     }
 
-    // 写动作单次执行：成功落盘 success；transient/未知落盘 unknown 并抛出，绝不内部重试
-    async writeOnce(action, fn) {
+    // 写动作默认仅一次。发请求前先持久化 attempting，避免进程在途退出造成无锁重放。
+    // allowRecovery 仅供核心签到：状态机明确批准后允许第二次且最后一次尝试。
+    async writeOnce(action, fn, { allowRecovery = false } = {}) {
         const st = this.stateFor(action);
+        const attempts = Number(st.attempts || 0);
         if (st.outcome === "success") return { cached: true };
-        if (st.outcome === "unknown") {
-            throw new WriteUnknownError(`${action} 今日此前结果未知，按安全策略不再重复发起，需人工核对服务端状态`);
+        if (st.outcome === "attempting" && !allowRecovery) {
+            throw new WriteUnknownError(`${action} 此前请求可能仍在途或进程异常退出，按安全策略不再发起`);
         }
+        if (st.outcome === "unknown" && !allowRecovery) {
+            throw new WriteUnknownError(`${action} 今日此前结果未知，按安全策略不再重复发起，需核对服务端状态`);
+        }
+        if (st.outcome !== "failed" && attempts >= (allowRecovery ? 2 : 1)) {
+            throw new WriteUnknownError(`${action} 今日已达到安全尝试上限，不再自动发起`);
+        }
+        const attemptNo = attempts + 1;
+        const startedAt = new Date(this.now()).toISOString();
+        this.recordState(action, { outcome: "attempting", attempts: attemptNo, lastAttemptAt: startedAt });
         this.writeAttempted = true;
         try {
             const result = await fn();
-            this.recordState(action, { outcome: "success" });
+            const msg = result?.msg || result?.message || "";
+            if (result && (result.code === 200 || ALREADY_SIGNED_RE.test(String(msg)))) {
+                this.recordState(action, { outcome: "success", attempts: attemptNo, lastAttemptAt: startedAt, confirmedAt: new Date(this.now()).toISOString() });
+            } else {
+                this.recordState(action, { outcome: "failed", attempts: attemptNo, lastAttemptAt: startedAt });
+            }
             return result;
         } catch (e) {
             if (e instanceof WriteUnknownError) throw e;
             if (e.transient) {
-                this.recordState(action, { outcome: "unknown" });
+                try {
+                    this.recordState(action, { outcome: "unknown", attempts: attemptNo, lastAttemptAt: startedAt });
+                } catch (stateError) {
+                    throw new WriteUnknownError(`${action} 写请求结果未知且状态更新失败，禁止自动重试：${short(stateError.message)}`);
+                }
+            } else {
+                // 已收到确定业务响应，允许由上层解释；仍保留尝试次数审计。
+                this.recordState(action, { outcome: "failed", attempts: attemptNo, lastAttemptAt: startedAt });
             }
             throw e;
         }
@@ -323,8 +389,12 @@ class Task {
         }
         const list = (rec.data && rec.data.userSignInList) || [];
         const today = chinaToday();
-        if (list.some((i) => i.signInDate === today && i.signInStatus === 1)) {
+        if (this.isSignedRecord(rec, today)) {
             this.core = "already";
+            const st = this.stateFor("coreSign");
+            if (st.outcome && st.outcome !== "success") {
+                this.recordState("coreSign", { outcome: "success", attempts: st.attempts, lastAttemptAt: st.lastAttemptAt, confirmedAt: new Date(this.now()).toISOString(), source: "authoritative-log" });
+            }
             this.log("✅ 签到有奖：今日已签到（服务端记录）");
             return;
         }
@@ -333,15 +403,43 @@ class Task {
             this.log("只读模式：服务端今日无签到记录，未发起签到");
             return;
         }
-        // 重入守卫：今日此前结果未知 → 不再发起，转人工
+        let recovery = false;
         const st = this.stateFor("coreSign");
-        if (st.outcome === "unknown") {
-            this.core = "unknown";
-            throw new WriteUnknownError("核心签到今日此前结果未知，不再自动发起，请人工核对服务端签到记录");
+        if (st.outcome === "attempting" || st.outcome === "unknown") {
+            const attempts = Number(st.attempts || 1);
+            const ageMs = this.now() - this.stateTimeMs(st);
+            if (attempts >= 2) {
+                this.core = "unknown";
+                throw new WriteUnknownError("核心签到今日已完成两次安全尝试且结果未知，不再自动发起");
+            }
+            if (ageMs < this.unknownRetryAfterMs) {
+                this.core = "unknown";
+                const source = st.outcome === "attempting" ? "请求可能仍在途或进程异常退出" : "结果未知";
+                throw new WriteUnknownError(`核心签到${source}，仍在冷却期（剩余约${Math.ceil((this.unknownRetryAfterMs - ageMs) / 60000)}分钟），未重复发起`);
+            }
+            const authority = await this.authoritativeCoreStatusTwice(today);
+            if (!authority.confirmed) {
+                this.core = "unknown";
+                throw new WriteUnknownError("核心签到结果未知，权威状态未能连续确认，未重复发起");
+            }
+            if (authority.signed) {
+                this.recordState("coreSign", { outcome: "success", attempts, lastAttemptAt: st.lastAttemptAt, confirmedAt: new Date(this.now()).toISOString(), source: "authoritative-log" });
+                this.core = "already";
+                this.log("✅ 签到有奖：未知写入已由服务端记录确认");
+                return;
+            }
+            recovery = true;
+            this.log("ℹ️ 核心签到：冷却期已过且两次权威查询均确认未签到，执行最后一次恢复尝试");
+        } else if (st.outcome === "success") {
+            this.core = "success";
+            this.log("✅ 签到有奖：今日已签到（本日成功状态）");
+            return;
+        } else if (st.outcome === "failed") {
+            this.log("ℹ️ 核心签到：此前收到明确失败响应，本次允许重新尝试，不按未知结果处理");
         }
         let doSign;
         try {
-            doSign = await this.writeOnce("coreSign", () => this.call("POST", EP_SIGN, { data: {}, idempotent: false }));
+            doSign = await this.writeOnce("coreSign", () => this.call("POST", EP_SIGN, { data: {}, idempotent: false }), { allowRecovery: recovery });
             if (doSign && doSign.cached) {
                 this.core = "success";
                 this.log("✅ 签到有奖：今日已签到（本日已成功记录）");
@@ -349,12 +447,22 @@ class Task {
             }
         } catch (e) {
             if (e.transient) {
-                // 写已尝试但结果未知：再查一次服务端权威记录，能确认已签才算成功
-                const recheck = await this.call("GET", EP_SIGN_LOG, { idempotent: true }).catch(() => null);
-                const signed = recheck && (recheck.data?.userSignInList || []).some((i) => i.signInDate === today && i.signInStatus === 1);
-                if (signed) { this.core = "already"; this.log("✅ 签到有奖：写入后经服务端记录确认今日已签"); return; }
+                // 写已尝试但结果未知：有界轮询权威记录；能确认已签才算成功，绝不在本进程重发。
+                let signed = false;
+                for (const delay of [1000, 3000, 7000]) {
+                    await this.wait(delay);
+                    const recheck = await this.call("GET", EP_SIGN_LOG, { idempotent: true }).catch(() => null);
+                    if (this.isSignedRecord(recheck, today)) { signed = true; break; }
+                }
+                if (signed) {
+                    const current = this.stateFor("coreSign");
+                    this.recordState("coreSign", { outcome: "success", attempts: current.attempts, lastAttemptAt: current.lastAttemptAt, confirmedAt: new Date(this.now()).toISOString(), source: "authoritative-log" });
+                    this.core = "already";
+                    this.log("✅ 签到有奖：写入后经服务端记录确认今日已签");
+                    return;
+                }
                 this.core = "unknown";
-                throw new WriteUnknownError(`核心签到发起后结果未知（${short(e.message)}），未重复发起，请人工核对`);
+                throw new WriteUnknownError(`核心签到第${recovery ? 2 : 1}次发起后结果未知（${short(e.message)}），未在本进程重复发起`);
             }
             throw e;
         }

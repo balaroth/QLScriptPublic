@@ -84,7 +84,7 @@ git pull fork main   # 或 upstream 同步后确认 daily/woiden_auto_renew.py �
 | 症状 | 定位 |
 |---|---|
 | `status=needs_human_verification` | Telegram Web 登录态被踢，或 reCAPTCHA v2 视觉接口不可用；VNC 重登 |
-| `status=needs_login` | Telegram OAuth 自动重登也失败了（widget 未出现或未登录 Telegram），需人工登录一次 |
+| `status=needs_login` | 自动重登两轮都失败。先看 `login.log`：`fired:TWidgetLogin.auth` 但 `verify_failed` 说明点了没生效；`fired:nothing` 说明 widget 没渲染出按钮，紧接着的 `widget` 字段里有它的 url / text / htmlLen，据此判断是 Telegram 会话失效还是 widget 报错 |
 | `browser=not-ready` | Chromium 起不来，查 `journalctl -u woiden-browser`、profile 是否损坏 |
 | `stage=stage1` | 数学验证码或 Cloudflare 拦截 |
 | `stage=telegram` | 读码超时（120s） |
@@ -99,6 +99,7 @@ git pull fork main   # 或 upstream 同步后确认 daily/woiden_auto_renew.py �
 | `error / vps not active` | PHPSESSID 寿命短，一天内失效；页面变登录墙后正则读不到 Status | `JS_INFO` 加 `login_wall`，失效时 `ensure_login()` 走 Telegram OAuth 自动重登 |
 | reCAPTCHA 三轮 `td_count:0`、`token_len:0` | ① `fc-dialog-overlay` 广告遮罩吃掉点击 ② 勾选框在视口下方，`bounding_box` 给的是页面坐标，`mouse.click` 点到空气 | ① `clear_overlays()` 每次点击前清遮罩 ② `scroll_into_view_if_needed()` 后再取坐标点击 |
 | 清了遮罩仍然 `td_count:0`，日志里 `top:"DIV\|"` | ① `.fc-monetization-dialog-container`（z-index 2147483647）会被页面脚本**持续再插入**，清一次根本压不住 ② 它顺手给 `body` 设 `overflow:hidden` 干掉滚动条；清掉后视口宽 1440→1425，整页横向偏移约 8px，先前取的 `bounding_box` 当场过期，鼠标落在勾选框右侧空白 | ① `clear_overlays()` 改成装 `setInterval` 常驻清理（400ms 一轮，页面导航后自动重建） ② 显式还原 `overflow` / `position` ③ `_point()` 每轮「清 → 等布局稳定 → 重取坐标」，并用 `elementFromPoint` 校验落点最顶层必须是 reCAPTCHA iframe，不符就重试（最多 3 轮） |
+| `needs_login` 且日志只有一句 `fired:nothing` | Telegram widget 里既没有 `TWidgetLogin.auth` 也没有 `button.tgme_widget_login_button`。原实现不管点没点上一律 `return {"ok": True}`，于是"登录成功"是假的，重读 `/vps-info` 仍是登录墙，最终报 `needs_login` 却查不到任何证据 | `ensure_login` 改为最多 2 轮；`fired == nothing` 时把 widget 的 `url` / `text` / `htmlLen` 记进日志；每轮结束都回 `/vps-info` 实地验证（`_info_readable`），读不到就重试，两轮都不行才 `ok=False`。另外 `/login` 若直接跳走说明会话仍有效，不再白跑 OAuth |
 | 勾选后仍无 token | bframe 出现但内容还在加载，`td` 数为 0 | 点完后 `td.first.wait_for(timeout=8000)` |
 
 标签清理：所有终态经 `emit()` 调 `tidy_tabs()`；with 块内异常也会趁连接存活先清再抛；另有 `atexit` 兜底。SIGKILL（worker 520s 超时）无法捕获，残留标签由下次运行复用 + 清理自愈。

@@ -355,70 +355,120 @@ def ensure_login(page):
 
     为什么需要：woiden.id 的 PHPSESSID 寿命很短，实测一天内就会失效，
     失效后 /vps-info 返回登录墙（"Please login using your telegram account"）。
-    2026-10-20 早上就是因为这个，脚本把"未登录"误判成 "vps not active" 而失败。
 
     登录方式：/login 页面嵌入 Telegram Login Widget（bot = LoginWoidenBot）。
     由于同一个 Chromium profile 里 web.telegram.org 仍处于登录状态，
     widget 会直接显示 "Log in as <name>"，调用 TWidgetLogin.auth() 即完成 OAuth。
 
-    三个坑，都踩过了：
+    踩过的坑：
       1. 广告遮罩（fc-dialog-overlay / Unlock more content）会吃掉点击
          → 先 clear_overlays，再用 JS 直接调函数，绕开 pointer events
       2. 按钮点击后页面会导航，evaluate 可能抛 execution-context-destroyed
          → 后续操作全部容错
       3. iframe 加载慢（页面广告多），要轮询等它出现
+      4. 2026-10-23：widget 里既没有 TWidgetLogin.auth 也没有登录按钮，
+         原实现照样返回 ok=True，于是"登录成功"是假的，最后报 needs_login
+         却没有任何可查的证据（日志只有一句 fired:nothing）。
+         现在 fired==nothing 会 dump widget 内容，并且每轮结束都回 /vps-info
+         实地验证，读不到就重试。
 
-    返回 {"ok": bool, "log": [...]}，调用方重新读 /vps-info 验证结果。
+    返回 {"ok": bool, "log": [...]}。ok=True 表示 /vps-info 已能读到内容。
     """
     log = []
-    try:
-        page.goto("https://woiden.id/login", wait_until="domcontentloaded", timeout=60000)
-    except Exception as e:
-        return {"ok": False, "log": ["goto_err:" + str(e)[:60]]}
-
-    got = False
-    for _ in range(20):
-        page.wait_for_timeout(1000)
+    for attempt in range(2):
         try:
-            if page.locator("iframe[src*='oauth.telegram.org']").count():
-                got = True
-                break
-        except Exception:
-            pass
-    if not got:
-        return {"ok": False, "log": ["no_telegram_iframe"]}
-
-    clear_overlays(page)
-    page.wait_for_timeout(600)
-
-    fired = "nothing"
-    try:
-        frames = [f for f in page.frames if "oauth.telegram.org" in f.url]
-        if frames:
-            fired = frames[0].evaluate("""() => {
-                try {
-                    if (window.TWidgetLogin && typeof TWidgetLogin.auth === 'function') {
-                        TWidgetLogin.auth(); return 'TWidgetLogin.auth';
-                    }
-                } catch (e) {}
-                const b = document.querySelector('button.tgme_widget_login_button');
-                if (b) { b.click(); return 'btn.click'; }
-                return 'nothing';
-            }""")
-    except Exception as e:
-        fired = "err:" + str(e)[:60]
-    log.append("fired:" + str(fired))
-
-    # 等离开 /login（OAuth 回调完成后会跳走）
-    for _ in range(20):
+            page.goto("https://woiden.id/login", wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            log.append("goto_err:" + str(e)[:60])
+            continue
         page.wait_for_timeout(1500)
+
+        # 会话还有效时 /login 会直接跳走，不必再走 OAuth
         try:
             if "/login" not in page.url:
-                log.append("left_login")
-                break
+                log.append("already_logged_in")
+                if _info_readable(page, log):
+                    return {"ok": True, "log": log}
+                continue
         except Exception:
             pass
-    return {"ok": True, "log": log}
+
+        got = False
+        for _ in range(20):
+            page.wait_for_timeout(1000)
+            try:
+                if page.locator("iframe[src*='oauth.telegram.org']").count():
+                    got = True
+                    break
+            except Exception:
+                pass
+        if not got:
+            log.append("no_telegram_iframe_%d" % attempt)
+            continue
+
+        clear_overlays(page)
+        page.wait_for_timeout(600)
+
+        fired = "nothing"
+        try:
+            frames = [f for f in page.frames if "oauth.telegram.org" in f.url]
+            if frames:
+                fired = frames[0].evaluate("""() => {
+                    try {
+                        if (window.TWidgetLogin && typeof TWidgetLogin.auth === 'function') {
+                            TWidgetLogin.auth(); return 'TWidgetLogin.auth';
+                        }
+                    } catch (e) {}
+                    const b = document.querySelector('button.tgme_widget_login_button');
+                    if (b) { b.click(); return 'btn.click'; }
+                    return 'nothing';
+                }""")
+        except Exception as e:
+            fired = "err:" + str(e)[:60]
+        log.append("fired:" + str(fired))
+
+        if fired == "nothing":
+            # 记下 widget 的真实内容，否则下次还是只有一句没信息量的 fired:nothing
+            try:
+                frames = [f for f in page.frames if "oauth.telegram.org" in f.url]
+                if frames:
+                    log.append({"widget": frames[0].evaluate(
+                        "() => ({url: location.href,"
+                        " text: (document.body ? document.body.innerText : '').slice(0, 200),"
+                        " htmlLen: document.body ? document.body.innerHTML.length : -1})")})
+            except Exception as e:
+                log.append("widget_dump_err:" + str(e)[:60])
+
+        # 等 OAuth 回调把页面带走
+        for _ in range(20):
+            page.wait_for_timeout(1500)
+            try:
+                if "/login" not in page.url:
+                    log.append("left_login")
+                    break
+            except Exception:
+                pass
+
+        if _info_readable(page, log):
+            return {"ok": True, "log": log}
+        log.append("verify_failed_%d" % attempt)
+
+    return {"ok": False, "log": log}
+
+
+def _info_readable(page, log):
+    """回 /vps-info 实地确认登录态：能读到 Status 才算真登录。"""
+    try:
+        page.goto(URL_INFO, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2000)
+        txt = page.locator("body").inner_text(timeout=10000)
+    except Exception as e:
+        log.append("verify_err:" + str(e)[:60])
+        return False
+    if "Please login" in txt:
+        return False
+    log.append("verified")
+    return True
 
 
 def js_click_submit(page):

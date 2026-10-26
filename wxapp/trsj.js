@@ -41,6 +41,9 @@ TRSJ_DENDRobium=0       关闭可选石斛模块（默认 1 开启；该模块�
 - 只读/幂等 GET 在网络错误/超时/408/429/5xx 下有界重试；普通写请求只发起一次，结果未知(502/超时/断连)
   会先落盘并阻止外层整脚本重放。仅核心签到允许一次受控恢复：冷却期后连续两次权威查询均明确未签到，
   且状态落盘可靠时，才允许第二次也是最后一次写入；之后无论结果如何都不再自动发起。
+- 登录(appletLogin)按只读请求有界重试：遇网关 502/超时/断连时每轮重新向 collector 取全新 wx code 后重试
+  （code 一次性，绝不跨轮复用）；重试耗尽仍瞬态失败则报 retryable=1，交由外层重跑（新进程、新 code）。
+- 状态记录日期强制为当日，旧记录的日期字段不会跨日残留，避免同日重入误判。
 - 核心签到成功(服务端记录或 code==200)才报 SUCCESS；502/失败/未知一律如实报 FAILURE，不伪装成功。
 - 全程不输出 token / code / 手机号。
 ------------------------------------------
@@ -191,7 +194,7 @@ class Task {
     recordState(action, entry) {
         const all = this._state();
         const key = this._stateKey(action);
-        all[key] = Object.assign({ date: chinaToday() }, all[key] || {}, entry);
+        all[key] = Object.assign({ date: chinaToday() }, all[key] || {}, entry, { date: chinaToday() });
         if (!this._saveState(all)) throw new ApiError(`${action} 防重放状态落盘失败，已阻止写请求`, { statePersistFailed: true, retryable: false });
         const saved = this._state()[key];
         if (!saved || saved.date !== all[key].date || saved.outcome !== all[key].outcome || Number(saved.attempts || 0) !== Number(all[key].attempts || 0)) {
@@ -277,30 +280,59 @@ class Task {
     }
 
     async login() {
-        const code = await this.getCode();
-        const res = await this.http.request({
-            method: "GET", url: `${API_HOST}${EP_LOGIN}`, params: { code },
-            headers: {
-                Host: "m.ahzyssl.com", "User-Agent": LOGIN_UA, Accept: "*/*",
-                Referer: `https://servicewechat.com/${MINI_APP_ID}/page-frame.html`,
-            },
-            timeout: this.timeout, validateStatus: () => true,
-        });
-        const body = res.data || {};
-        if (body.code === 200 && body.data) {
-            this.token = String(body.data);
-            const cache = readJsonFile(this.tokenCacheFile, {}) || {};
-            cache[this.account.openid] = { token: this.token, updatedAt: new Date().toISOString() };
-            writeJsonFile(this.tokenCacheFile, cache);
-            this.log("登录成功");
-            return;
+        // 登录(appletLogin)属令牌获取，按只读请求做有界重试：上游网关间歇 502/超时/断连时，
+        // 每轮重新向 collector 取一个全新 wx code（code 一次性，绝不跨轮复用），退避后重试。
+        // 仅在所有轮次都因瞬态失败而耗尽时，才抛 transient/retryable=1，交由外层整脚本重跑（新进程、新 code）。
+        const attempts = this.maxRetries + 1;
+        let lastErr;
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            const code = await this.getCode();
+            let res;
+            try {
+                res = await this.http.request({
+                    method: "GET", url: `${API_HOST}${EP_LOGIN}`, params: { code },
+                    headers: {
+                        Host: "m.ahzyssl.com", "User-Agent": LOGIN_UA, Accept: "*/*",
+                        Referer: `https://servicewechat.com/${MINI_APP_ID}/page-frame.html`,
+                    },
+                    timeout: this.timeout, validateStatus: () => true,
+                });
+            } catch (e) {
+                // 网络层异常（超时/断连/DNS）：瞬态，换新 code 重试
+                const transient = e.code === "ECONNABORTED" || e.code === "ETIMEDOUT" || /timeout|network|ENOTFOUND|ECONNRESET|EAI_AGAIN/i.test(String(e.message || ""));
+                lastErr = new ApiError(`登录请求失败: ${short(e.message)}`, { authFail: true, transient, retryable: transient });
+                if (transient && attempt < attempts) {
+                    this.warn(`登录遇到网关抖动，${attempt}/${attempts - 1} 后换新 code 重试`);
+                    await this.wait(Math.min(3000, 300 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 150));
+                    continue;
+                }
+                throw lastErr;
+            }
+            const body = res.data || {};
+            if (body.code === 200 && body.data) {
+                this.token = String(body.data);
+                const cache = readJsonFile(this.tokenCacheFile, {}) || {};
+                cache[this.account.openid] = { token: this.token, updatedAt: new Date().toISOString() };
+                writeJsonFile(this.tokenCacheFile, cache);
+                this.log("登录成功");
+                return;
+            }
+            const msg = body.msg || body.message || short(body);
+            if (/未注册|未绑定|未激活|不存在|请先|注册/.test(String(msg))) {
+                this.unregistered = true;
+                throw new ApiError("NO_ACCOUNT:未注册甜润世界", { noAccount: true });
+            }
+            // 502 HTML 网关页等非 JSON 瞬态响应：换新 code 重试；已收到 JSON 业务响应则不重试。
+            const transient = res.status !== 200 && !(body && typeof body === "object") && TRANSIENT_STATUS(res.status);
+            lastErr = new ApiError(`登录失败(HTTP ${res.status}): ${msg}`, { authFail: true, transient, retryable: transient });
+            if (transient && attempt < attempts) {
+                this.warn(`登录遇到网关抖动(HTTP ${res.status})，${attempt}/${attempts - 1} 后换新 code 重试`);
+                await this.wait(Math.min(3000, 300 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 150));
+                continue;
+            }
+            throw lastErr;
         }
-        const msg = body.msg || body.message || short(body);
-        if (/未注册|未绑定|未激活|不存在|请先|注册/.test(String(msg))) {
-            this.unregistered = true;
-            throw new ApiError("NO_ACCOUNT:未注册甜润世界", { noAccount: true });
-        }
-        throw new ApiError(`登录失败(HTTP ${res.status}): ${msg}`, { authFail: true });
+        throw lastErr;
     }
 
     async verify() {

@@ -103,6 +103,7 @@ EP_SIGN_DAYS = "/fundex-activity/point/sign/getSignDays"
 EP_SIGN_RECORD = "/fundex-activity/point/sign/getRecordList"
 EP_SIGN_IN = "/fundex-activity/point/sign/userSignIn"
 EP_TOTAL_POINT = "/fundex-activity/point/account/getTotalPoint"
+EP_SECURE_LIST = "/fundex-material/knowledgeBase/findKnowledgeInfoListByKeyList"
 
 # smallcat / wx_server 配置 (机密, 只从环境变量读取)
 WX_SERVER_URL = os.getenv("wx_server_url", "http://192.168.31.196:8787").rstrip("/")
@@ -111,6 +112,66 @@ VERSION = os.getenv("hshj_ver", "1.46.0")
 ALLOW_PHONE_LOGIN = os.getenv("hshj_phone_login", "1").strip().lower() not in ("0", "false", "no")
 
 TOKEN_CACHE_PATH = Path(__file__).with_name("hongsehuojian_token_cache.json")
+
+# --- 防重放/结果契约 (与 JS 脚本同一语义, 不把失败伪装成成功) -----------------
+# HSHJ_READ_ONLY=1: 只登录+只读权威状态(getRecordList/getTotalPoint),
+#   绝不调用写接口 userSignIn, 也不写状态文件; 用于上线后只读/权威验证。
+# 状态文件 hongsehuojian_sign_state.json: 按 日期 -> account 记录
+#   success / failed / attempting / unknown + attempts(当日写次数) +
+#   not_signed_confirms(写后未知后连续权威确认未签的次数)。
+# 写前必须原子落盘 attempting 并回读校验成功才允许出网;
+# 写后结果未知(网络/超时/5xx)只做只读权威收敛, 本进程不重发;
+# 冷却期 + 连续两次权威确认未签后, 当日最多再恢复写一次(硬上限)。
+READ_ONLY = os.getenv("HSHJ_READ_ONLY", "0").strip().lower() in ("1", "true", "yes")
+STATE_PATH = Path(__file__).with_name("hongsehuojian_sign_state.json")
+COOLDOWN_SEC = 1800        # 写后未知后的冷却期(秒), 期间不恢复写
+MAX_WRITE_ATTEMPTS = 2      # 当日写次数硬上限: 首次 + 最多一次恢复写
+RESULT_LINE_TAG = "[QLRUN_RESULT]"
+
+
+def _today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def load_state():
+    try:
+        if STATE_PATH.exists():
+            return json.loads(STATE_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def save_state_atomic(state):
+    """临时文件 + os.replace 原子落盘, 并回读校验; 失败抛错(写前必须阻断)。"""
+    tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, STATE_PATH)
+    back = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    if back != state:
+        raise RuntimeError("状态文件回读校验不一致")
+
+
+def _rec(state, account_id):
+    return (state.setdefault(_today(), {}).get(account_id)) or {}
+
+
+def _set_rec(state, account_id, rec):
+    state.setdefault(_today(), {})[account_id] = rec
+    save_state_atomic(state)
+
+
+def _is_transient(exc):
+    """只读 GET 的瞬态故障(连接/超时/408/425/429/5xx); 写 POST 不在此重试。"""
+    if isinstance(exc, (requests.exceptions.ConnectionError,
+                       requests.exceptions.Timeout,
+                       requests.exceptions.ChunkedEncodingError)):
+        return True
+    resp = getattr(exc, "response", None)
+    if resp is not None and getattr(resp, "status_code", 0) in (408, 425, 429, 500, 502, 503, 504):
+        return True
+    return False
+
 
 session = requests.Session()
 
@@ -160,6 +221,94 @@ def make_signature(body, nonce, timestamp, app_secret, ticket=None):
 def make_nonce():
     # 源码: "" + (1e6*Math.random()).toFixed(0) + (1e6*Math.random()).toFixed(0)
     return f"{random.randint(0, 1000000)}{random.randint(0, 1000000)}"
+
+
+# ---------------------------------------------------------------------------
+# 国密 SM4-128-ECB 加密 (vendor.js 模块 5c57, secure path 请求体加密)
+# 实测(2026-10-27 设备 wxapkg 还原):
+#   - key = base64decode(encrypt_key)(16 字节); PKCS#7 填充; ECB(无 iv)
+#   - 明文 = JSON.stringify(原始 body); 输出 = 小写 hex
+#   - 信封 = {"msg": hex密文}; signature 覆盖该加密后信封
+# ---------------------------------------------------------------------------
+_SM4_SBOX = [
+    0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7, 0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
+    0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3, 0xaa, 0x44, 0x13, 0x26, 0x49, 0x86, 0x06, 0x99,
+    0x9c, 0x42, 0x50, 0xf4, 0x91, 0xef, 0x98, 0x7a, 0x33, 0x54, 0x0b, 0x43, 0xed, 0xcf, 0xac, 0x62,
+    0xe4, 0xb3, 0x1c, 0xa9, 0xc9, 0x08, 0xe8, 0x95, 0x80, 0xdf, 0x94, 0xfa, 0x75, 0x8f, 0x3f, 0xa6,
+    0x47, 0x07, 0xa7, 0xfc, 0xf3, 0x73, 0x17, 0xba, 0x83, 0x59, 0x3c, 0x19, 0xe6, 0x85, 0x4f, 0xa8,
+    0x68, 0x6b, 0x81, 0xb2, 0x71, 0x64, 0xda, 0x8b, 0xf8, 0xeb, 0x0f, 0x4b, 0x70, 0x56, 0x9d, 0x35,
+    0x1e, 0x24, 0x0e, 0x5e, 0x63, 0x58, 0xd1, 0xa2, 0x25, 0x22, 0x7c, 0x3b, 0x01, 0x21, 0x78, 0x87,
+    0xd4, 0x00, 0x46, 0x57, 0x9f, 0xd3, 0x27, 0x52, 0x4c, 0x36, 0x02, 0xe7, 0xa0, 0xc4, 0xc8, 0x9e,
+    0xea, 0xbf, 0x8a, 0xd2, 0x40, 0xc7, 0x38, 0xb5, 0xa3, 0xf7, 0xf2, 0xce, 0xf9, 0x61, 0x15, 0xa1,
+    0xe0, 0xae, 0x5d, 0xa4, 0x9b, 0x34, 0x1a, 0x55, 0xad, 0x93, 0x32, 0x30, 0xf5, 0x8c, 0xb1, 0xe3,
+    0x1d, 0xf6, 0xe2, 0x2e, 0x82, 0x66, 0xca, 0x60, 0xc0, 0x29, 0x23, 0xab, 0x0d, 0x53, 0x4e, 0x6f,
+    0xd5, 0xdb, 0x37, 0x45, 0xde, 0xfd, 0x8e, 0x2f, 0x03, 0xff, 0x6a, 0x72, 0x6d, 0x6c, 0x5b, 0x51,
+    0x8d, 0x1b, 0xaf, 0x92, 0xbb, 0xdd, 0xbc, 0x7f, 0x11, 0xd9, 0x5c, 0x41, 0x1f, 0x10, 0x5a, 0xd8,
+    0x0a, 0xc1, 0x31, 0x88, 0xa5, 0xcd, 0x7b, 0xbd, 0x2d, 0x74, 0xd0, 0x12, 0xb8, 0xe5, 0xb4, 0xb0,
+    0x89, 0x69, 0x97, 0x4a, 0x0c, 0x96, 0x77, 0x7e, 0x65, 0xb9, 0xf1, 0x09, 0xc5, 0x6e, 0xc6, 0x84,
+    0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20, 0x79, 0xee, 0x5f, 0x3e, 0xd7, 0xcb, 0x39, 0x48,
+]
+_SM4_CK = [
+    0x00070e15, 0x1c232a31, 0x383f464d, 0x545b6269, 0x70777e85, 0x8c939aa1, 0xa8afb6bd, 0xc4cbd2d9,
+    0xe0e7eef5, 0xfc030a11, 0x181f262d, 0x343b4249, 0x50575e65, 0x6c737a81, 0x888f969d, 0xa4abb2b9,
+    0xc0c7ced5, 0xdce3eaf1, 0xf8ff060d, 0x141b2229, 0x30373e45, 0x4c535a61, 0x686f767d, 0x848b9299,
+    0xa0a7aeb5, 0xbcc3cad1, 0xd8dfe6ed, 0xf4fb0209, 0x10171e25, 0x2c333a41, 0x484f565d, 0x646b7279,
+]
+_SM4_FK = (0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc)
+_SM4_M = 0xFFFFFFFF
+
+
+def _rol32(x, n):
+    return ((x << n) | (x >> (32 - n))) & _SM4_M
+
+
+def _sm4_tau(a):
+    b = [_SM4_SBOX[(a >> 24) & 255], _SM4_SBOX[(a >> 16) & 255],
+         _SM4_SBOX[(a >> 8) & 255], _SM4_SBOX[a & 255]]
+    return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]
+
+
+def _sm4_round_keys(key16):
+    k = [(key16[0] << 24) | (key16[1] << 16) | (key16[2] << 8) | key16[3],
+         (key16[4] << 24) | (key16[5] << 16) | (key16[6] << 8) | key16[7],
+         (key16[8] << 24) | (key16[9] << 16) | (key16[10] << 8) | key16[11],
+         (key16[12] << 24) | (key16[13] << 16) | (key16[14] << 8) | key16[15]]
+    k = [k[0] ^ _SM4_FK[0], k[1] ^ _SM4_FK[1], k[2] ^ _SM4_FK[2], k[3] ^ _SM4_FK[3]]
+    rk = []
+    for i in range(32):
+        out = _sm4_tau(k[1] ^ k[2] ^ k[3] ^ _SM4_CK[i])
+        x = k[0] ^ out ^ _rol32(out, 13) ^ _rol32(out, 23)
+        rk.append(x)
+        k = [k[1], k[2], k[3], x]
+    return rk
+
+
+def _sm4_block(block, rk):
+    x = [(block[0] << 24) | (block[1] << 16) | (block[2] << 8) | block[3],
+         (block[4] << 24) | (block[5] << 16) | (block[6] << 8) | block[7],
+         (block[8] << 24) | (block[9] << 16) | (block[10] << 8) | block[11],
+         (block[12] << 24) | (block[13] << 16) | (block[14] << 8) | block[15]]
+    for i in range(32):
+        out = _sm4_tau(x[1] ^ x[2] ^ x[3] ^ rk[i])
+        xn = x[0] ^ out ^ _rol32(out, 2) ^ _rol32(out, 10) ^ _rol32(out, 18) ^ _rol32(out, 24)
+        x = [x[1], x[2], x[3], xn]
+    y = [x[3], x[2], x[1], x[0]]
+    res = []
+    for w in y:
+        res += [(w >> 24) & 255, (w >> 16) & 255, (w >> 8) & 255, w & 255]
+    return res
+
+
+def sm4_ecb_hex(plaintext: bytes, key_b64: str) -> str:
+    """SM4-128-ECB + PKCS#7, 返回小写 hex。key_b64 = encrypt_key(base64 串)。"""
+    key16 = base64.b64decode(key_b64)
+    rk = _sm4_round_keys(key16)
+    pad = 16 - (len(plaintext) % 16)
+    data = plaintext + bytes([pad]) * pad
+    out = bytearray()
+    for off in range(0, len(data), 16):
+        out += bytes(_sm4_block(data[off:off + 16], rk))
+    return out.hex()
 
 
 def read_token_cache():
@@ -232,6 +381,22 @@ class RedRocket:
         self.unionid = ""
         self.encrypt_key = None
         self.encrypt_ver = None
+        self.secure_paths = set()
+
+    def fetch_secure_paths(self):
+        """拉取需加密体的 API 路径清单 (secure_path)。失败不致命, 7006 时会再补拉。"""
+        try:
+            r = self.request(EP_SECURE_LIST, {"knowledgeKeyList": "secure_path"}, "GET")
+            data = r.get("data") or []
+            content = ""
+            if isinstance(data, list) and data:
+                content = data[0].get("knowledgeContent") or ""
+            self.secure_paths = {x.strip() for x in content.split(",") if x.strip()}
+        except Exception as e:
+            print(f"  拉取加密清单失败(忽略): {e}")
+
+    def _is_secure(self, path):
+        return path in self.secure_paths
 
     # -- 传输层 ----------------------------------------------------------
     def request(self, path, data=None, method="POST", _retried=False):
@@ -251,8 +416,22 @@ class RedRocket:
         url = f"{BASE_URL}{path}"
         if method.upper() == "GET":
             data["key"] = int(time.time() * 1000)
-            resp = session.get(url, params=data, headers=headers, timeout=60)
+            # 只读 GET: 瞬态故障有界重试一次; 写 POST 绝不重试
+            resp = None
+            for _get_attempt in range(2):
+                try:
+                    resp = session.get(url, params=data, headers=headers, timeout=60)
+                    break
+                except Exception as _e:
+                    if _get_attempt == 0 and _is_transient(_e):
+                        time.sleep(2)
+                        continue
+                    raise
         else:
+            # secure path: 把原始 body 用 SM4-ECB 加密成 {"msg":hex}; 签名覆盖加密后信封
+            if self._is_secure(path) and self.encrypt_key:
+                plaintext = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+                data = {"msg": sm4_ecb_hex(plaintext.encode("utf-8"), self.encrypt_key)}
             nonce = make_nonce()
             timestamp = str(int(time.time() * 1000))
             headers.update({
@@ -278,9 +457,15 @@ class RedRocket:
             # 用户加密 key 过期 -> 刷新后重试一次 (vendor.js:6358)
             self.encrypt_key, self.encrypt_ver = get_encrypt_key(self.account_id)
             return self.request(path, data, method, _retried=True)
+        if code == "7006" and not getattr(self, "_retried_secure", False):
+            # 服务端把该路径加入加密清单: 重取清单, 把路径标记为 secure 后重试一次
+            print(f"  ⚠️ 7006(加密清单变更): 重取清单并加密重试")
+            self._retried_secure = True
+            self.fetch_secure_paths()
+            self.secure_paths.add(path)
+            return self.request(path, data, method, _retried=True)
         if code == "7006":
-            # 服务端要求重取加密路径清单; 本脚本不走加密体, 仅记录
-            print(f"  ⚠️ 服务端返回 7006(加密清单变更): {result.get('msg') or result.get('message')}")
+            print(f"  ⚠️ 服务端返回 7006(加密仍不被接受): {result.get('msg') or result.get('message')}")
         if code == "407":
             self.ticket = ""
             self.user_id = ""
@@ -475,93 +660,240 @@ def ensure_ticket(client, manual_ticket):
     return True
 
 
-def run_account(account_id, index):
+def run_account(account_id, index, state):
+    """返回 (汇总文本, outcome)。outcome =
+    {"status": "SUCCESS"|"FAILURE", "retryable": bool,
+     "write_attempted": bool, "reason": str}
+    登录/写前读取的瞬态失败可 retryable=True(外层安全重跑);
+    写已尝试(成功/拒绝/未知)一律 write_attempted=True, FAILURE 时 retryable=False。
+    """
     lines = [f"【账号 {index}】"]
+    outcome = {"status": "SUCCESS", "retryable": True,
+               "write_attempted": False, "reason": ""}
     client = RedRocket(account_id, index)
 
     client.encrypt_key, client.encrypt_ver = get_encrypt_key(account_id)
     if not client.encrypt_key:
         raise RuntimeError("wx_server 未返回 encrypt_key, 无法签名")
     client.resolve_openid()
+    client.fetch_secure_paths()
 
     manual = MANUAL_TICKETS[index - 1] if index - 1 < len(MANUAL_TICKETS) else ""
     ensure_ticket(client, manual)
 
-    state = client.get_sign_days()
-    signed, days, today_point = RedRocket.parse_sign_state(state)
+    # 权威只读: 今日是否已签 (以服务端 today 为准)
+    data = client.get_sign_days()
+    signed, days, today_point = RedRocket.parse_sign_state(data)
     print(f"账号 {index} 签到状态: 今日已签={signed} 连续天数={days} 今日可得={today_point}")
 
     if signed is True:
-        # 幂等优先: 已签则不再提交, 但仍汇报积分余额
+        # 幂等收敛: 权威已签 -> 落 success, 绝不写
+        try:
+            _set_rec(state, account_id, {"status": "success",
+                                         "reason": "authoritative_signed"})
+        except Exception as e:
+            print(f"  ⚠️ 状态落盘失败(已签幂等, 不影响结果): {e}")
         msg = f"今日已签到{f', 连续 {days} 天' if days is not None else ''}"
         print(f"✅ 账号 {index} {msg}")
         lines.append(f"✅ {msg}")
-        succeeded = True
+    elif READ_ONLY:
+        # 只读模式: 不写状态文件, 不发写请求
+        outcome["reason"] = "read_only_mode"
+        print(f"🔍 账号 {index} 只读模式: 今日未签, 不发起签到写")
+        lines.append("🔍 只读模式: 未发起签到写")
     else:
-        ok, result = client.sign_in()
-        if ok:
-            msg = "签到成功"
-            data = result.get("data")
-            gained = None
-            if isinstance(data, dict):
-                gained = data.get("point") or data.get("points") or data.get("addPoint")
-            gained = gained or today_point
-            if gained:
-                msg += f", +{gained} 积分"
-            print(f"🎉 账号 {index} {msg}")
-            lines.append(f"🎉 {msg}")
-            succeeded = True
-        else:
-            detail = RedRocket.err(result)
-            if any(k in detail for k in ("已签", "重复", "已参与", "已领取")):
-                print(f"✅ 账号 {index} 今日已签到 ({detail})")
-                lines.append("✅ 今日已签到")
-                succeeded = True
+        rec = _rec(state, account_id)
+        st = rec.get("status")
+
+        if st == "success":
+            lines.append("✅ 今日已签到(状态文件确认)")
+        elif st == "failed":
+            # 当日已被服务端确定性拒绝: 不再重发, 如实报失败且不允许外层重放
+            outcome["status"] = "FAILURE"
+            outcome["retryable"] = False
+            outcome["reason"] = "write_rejected_today"
+            print(f"❌ 账号 {index} 今日签到写已被服务端拒绝, 不再重发")
+            lines.append(f"❌ 今日签到写已被服务端拒绝({rec.get('reason', '')}), 不再重发")
+        do_write = False
+        if st == "success":
+            lines.append("✅ 今日已签到(状态文件确认)")
+        elif st == "failed":
+            # 当日已被服务端确定性拒绝: 不再重发, 如实报失败且不允许外层重放
+            outcome["status"] = "FAILURE"
+            outcome["retryable"] = False
+            outcome["reason"] = "write_rejected_today"
+            print(f"❌ 账号 {index} 今日签到写已被服务端拒绝, 不再重发")
+            lines.append(f"❌ 今日签到写已被服务端拒绝({rec.get('reason', '')}), 不再重发")
+        elif st in ("attempting", "unknown"):
+            # 上次写出网后结果未知(或进程崩溃残留): 本进程不重发, 只做权威收敛
+            attempts = rec.get("attempts", 1)
+            last_ts = rec.get("last_attempt_ts", 0)
+            confirms = rec.get("not_signed_confirms", 0) + 1
+            if attempts >= MAX_WRITE_ATTEMPTS:
+                outcome["status"] = "FAILURE"
+                outcome["retryable"] = False
+                outcome["reason"] = "recovery_attempts_exhausted"
+                lines.append("⚠️ 写后结果未知: 当日恢复写次数已用尽, 不再自动写")
+            elif time.time() - last_ts < COOLDOWN_SEC:
+                _set_rec(state, account_id,
+                         {**rec, "status": "unknown", "not_signed_confirms": confirms})
+                outcome["status"] = "FAILURE"
+                outcome["reason"] = "unknown_cooldown"
+                lines.append(f"⚠️ 写后结果未知: 权威确认未签(第{confirms}次), 冷却期内不重发")
+            elif confirms < 2:
+                _set_rec(state, account_id,
+                         {**rec, "status": "unknown", "not_signed_confirms": confirms})
+                outcome["status"] = "FAILURE"
+                outcome["reason"] = "unknown_confirming"
+                lines.append(f"⚠️ 写后结果未知: 权威确认未签(第{confirms}/2次), 暂不恢复写")
             else:
-                print(f"❌ 账号 {index} 签到失败: {detail}")
-                lines.append(f"❌ 签到失败: {detail}")
-                succeeded = False
+                # 冷却期已过 + 连续两次权威确认未签: 放行唯一一次恢复写
+                do_write = True
+        else:
+            do_write = True  # 当日首次写
+
+        if do_write:
+            # --- 真正发写: 首次 或 唯一一次恢复写 ---
+            rec = _rec(state, account_id)
+            attempts = rec.get("attempts", 0) + 1
+            # 写前原子落盘 attempting 并回读校验, 失败则阻断写(绝不先出网)
+            try:
+                _set_rec(state, account_id,
+                         {"status": "attempting", "attempts": attempts,
+                          "last_attempt_ts": int(time.time()),
+                          "not_signed_confirms": rec.get("not_signed_confirms", 0)})
+            except Exception as e:
+                outcome["status"] = "FAILURE"
+                outcome["retryable"] = True  # 写未出网, 外层可安全重跑
+                outcome["reason"] = "state_persist_failed"
+                print(f"❌ 账号 {index} 写前状态落盘失败, 阻断写: {e}")
+                lines.append(f"❌ 写前状态落盘失败, 阻断写: {e}")
+                point = client.total_point()
+                if point is not None:
+                    lines.append(f"当前积分: {point}")
+                return "\n".join(lines), outcome
+
+            outcome["write_attempted"] = True
+            try:
+                ok, result = client.sign_in()
+            except Exception as e:
+                # 写后结果未知: 落 unknown, 本进程不重发, 交权威收敛
+                _set_rec(state, account_id,
+                         {**_rec(state, account_id), "status": "unknown"})
+                outcome["status"] = "FAILURE"
+                outcome["retryable"] = False
+                outcome["reason"] = "write_unknown"
+                print(f"❌ 账号 {index} 写后结果未知({e}), 不重发, 等待权威收敛")
+                lines.append(f"❌ 签到写结果未知({e}), 不重发, 等待权威收敛")
+            else:
+                if ok:
+                    data_ = result.get("data")
+                    gained = None
+                    if isinstance(data_, dict):
+                        gained = data_.get("point") or data_.get("points") or data_.get("addPoint")
+                    gained = gained or today_point
+                    msg = "签到成功" + (f", +{gained} 积分" if gained else "")
+                    _set_rec(state, account_id, {"status": "success", "attempts": attempts})
+                    print(f"🎉 账号 {index} {msg}")
+                    lines.append(f"🎉 {msg}")
+                else:
+                    detail = RedRocket.err(result)
+                    if any(k in detail for k in ("已签", "重复", "已参与", "已领取")):
+                        _set_rec(state, account_id,
+                                 {"status": "success", "attempts": attempts,
+                                  "reason": "server_idempotent"})
+                        print(f"✅ 账号 {index} 今日已签到 ({detail})")
+                        lines.append("✅ 今日已签到(服务端幂等)")
+                    else:
+                        _set_rec(state, account_id,
+                                 {"status": "failed", "attempts": attempts,
+                                  "reason": detail[:120]})
+                        outcome["status"] = "FAILURE"
+                        outcome["retryable"] = False
+                        outcome["reason"] = "write_rejected"
+                        print(f"❌ 账号 {index} 签到被服务端拒绝: {detail}")
+                        lines.append(f"❌ 签到被服务端拒绝: {detail}")
 
     point = client.total_point()
     if point is not None:
         print(f"账号 {index} 当前积分: {point}")
         lines.append(f"当前积分: {point}")
-    return "\n".join(lines), succeeded
+    return "\n".join(lines), outcome
+
+
+def _emit_result(status, payload):
+    """整脚本只输出一条结构化结果行; 末尾追加扁平 retryable=0/1 以兼容 qlall
+    NO_RETRY_FAILURE 正则(要求行内字面 retryable=0)。不打印 token/code/手机号。"""
+    retry = payload.pop("retryable", 0)
+    print(f"{RESULT_LINE_TAG} {status} {json.dumps(payload, ensure_ascii=False)} retryable={retry}")
 
 
 def main():
     raw = os.getenv("hshj", "")
     accounts = [x.strip() for x in raw.replace("&", "\n").splitlines() if x.strip()]
 
+    print("=============== 红色火箭 签到开始 ===============")
+    if READ_ONLY:
+        print("🔍 HSHJ_READ_ONLY=1 只读模式: 不发起任何签到写")
+
     if not accounts:
         print("❌ 未检测到账号信息(环境变量 hshj), 退出。")
-        return
+        _emit_result("FAILURE", {"script": "hongsehuojian.py",
+                                 "reason": "no_accounts", "retryable": 0})
+        sys.exit(1)
     if not WX_AUTH:
         print("❌ 未配置 wx_auth, 无法获取 code, 退出。")
-        return
+        _emit_result("FAILURE", {"script": "hongsehuojian.py",
+                                 "reason": "no_wx_auth", "retryable": 0})
+        sys.exit(1)
 
-    print("=============== 红色火箭 签到开始 ===============")
+    state = load_state()
     summaries = []
-    ok_count = 0
+    ok_n, fail_n = 0, 0
+    write_attempted = False
+    reasons = []
     for i, entry in enumerate(accounts, 1):
         parts = entry.split("#", 1)
         account = parts[0].strip()
         remark = parts[1].strip() if len(parts) > 1 else ""
         print(f"\n-------------- 账号 {i}{('/' + remark) if remark else ''} --------------")
         try:
-            summary, ok = run_account(account, i)
-            summaries.append(summary)
-            ok_count += 1 if ok else 0
+            summary, oc = run_account(account, i, state)
         except Exception as e:
+            # 异常发生在写之前: 未出网, 外层可安全重跑
             print(f"❌ 账号 {i} 执行异常: {e}")
-            summaries.append(f"【账号 {i}】\n❌ 执行异常: {e}")
+            summary = f"【账号 {i}】\n❌ 执行异常: {e}"
+            oc = {"status": "FAILURE", "retryable": True,
+                  "write_attempted": False, "reason": "prewrite_exception"}
+        summaries.append(summary)
+        write_attempted = write_attempted or oc["write_attempted"]
+        if oc["status"] == "SUCCESS":
+            ok_n += 1
+        else:
+            fail_n += 1
+            reasons.append(oc.get("reason") or "failure")
         time.sleep(1)
+
+    status = "SUCCESS" if fail_n == 0 else "FAILURE"
+    # 写已尝试过(无论成败/拒绝/未知) -> 失败不可由外层整段重放;
+    # 纯写前登录/读取瞬态失败才可 retryable=1。
+    retryable = 0 if (status == "FAILURE" and write_attempted) else (1 if status == "FAILURE" else 0)
 
     print("\n=============== 红色火箭 签到结束 ===============")
     try:
-        send(f"红色火箭签到 {ok_count}/{len(accounts)} 成功", "\n\n".join(summaries))
+        send(f"红色火箭签到 {ok_n}/{len(accounts)} 成功", "\n\n".join(summaries))
     except Exception as e:
         print(f"⚠️ 通知发送失败: {e}")
+
+    _emit_result(status, {
+        "script": "hongsehuojian.py",
+        "accounts": f"{ok_n}/{len(accounts)}",
+        "mode": "read_only" if READ_ONLY else "normal",
+        "writeAttempted": 1 if write_attempted else 0,
+        "reason": ";".join(reasons) if reasons else "ok",
+        "retryable": retryable,
+    })
+    sys.exit(0 if status == "SUCCESS" else 1)
 
 
 MANUAL_TICKETS = [

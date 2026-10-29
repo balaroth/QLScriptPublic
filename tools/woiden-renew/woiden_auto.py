@@ -594,6 +594,66 @@ def ask_vision(png_bytes, n=9):
         return None
 
 
+def read_target(bf):
+    """
+    从挑战 iframe 里读出「要选的物体」。
+
+    reCAPTCHA 把说明拆成两段：普通文本 "Select all images with" + <strong>目标词</strong>。
+    直接读 .rc-imageselect-desc 的 inner_text 有时只拿到前半句（实测只返回
+    "Select all images with"），所以优先读 strong，其次读整段再正则截取。
+    """
+    for sel, mode in ((".rc-imageselect-desc strong", "raw"),
+                      (".rc-imageselect-desc-wrapper", "parse"),
+                      (".rc-imageselect-desc", "parse")):
+        try:
+            t = (bf.locator(sel).first.text_content(timeout=3000) or "").strip()
+        except Exception:
+            continue
+        if not t:
+            continue
+        if mode == "raw" and len(t) < 60:
+            return t.lower().rstrip(".")
+        m = re.search(r"images? with\s+(?:a |an |the )?(.+)$", t, re.I | re.S)
+        if m:
+            return m.group(1).strip().lower().rstrip(".")
+    return ""
+
+
+def ask_cell(png_bytes, target):
+    """
+    只把「一个格子」发给视觉模型，问它里面有没有目标物体。
+
+    为什么不再整张图问「点哪几格」：
+      2026-10-28 起模型能认出整张九宫格是 CAPTCHA，直接拒答（cells 恒为 []，
+      notes 写 "I can't identify the specific cells in an image-selection CAPTCHA"）。
+      但把图片裁成单格、不提 CAPTCHA、只要一个 yes/no，它就会老实回答。
+    返回 True / False / None（None 表示调用失败，交给调用方决定是否放弃该格）。
+    """
+    key = KEY_PATH.read_text().strip()
+    img = base64.b64encode(png_bytes).decode()
+    prompt = ("This is a single photo cropped from a street-scene dataset. "
+              "Does it contain a %s? Answer with exactly one word: yes or no." % target)
+    payload = {"model": VISION_MODEL, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}},
+    ]}]}
+    import urllib.request
+    req = urllib.request.Request(VISION_API, data=json.dumps(payload).encode(),
+                                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    try:
+        r = urllib.request.urlopen(req, timeout=90)
+        body = json.loads(r.read().decode())
+    except Exception:
+        return None
+    c = (body.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    c = re.sub(r"</?escape>", "", c).strip().lower()
+    if c.startswith("yes"):
+        return True
+    if c.startswith("no"):
+        return False
+    return None
+
+
 def solve_recaptcha_v2(page, max_rounds=3):
     """
     完成 reCAPTCHA v2，成功后 token 会自动写进页面隐藏的 textarea。
@@ -688,6 +748,7 @@ def solve_recaptcha_v2(page, max_rounds=3):
             log.append("anchor_clicked")
         except Exception as e:
             log.append("anchor_click_err:" + str(e)[:80])
+    t_start = time.time()
     for rnd in range(max_rounds):
         page.wait_for_timeout(2500)
         # 每轮再清一次：广告是随机插入的，可能在验证过程中弹出
@@ -714,28 +775,44 @@ def solve_recaptcha_v2(page, max_rounds=3):
         if n_td not in (9, 16):
             page.wait_for_timeout(2000)
             continue
-        try:
-            png = frame.first.screenshot()
-        except Exception as e:
-            log.append("shot_err:" + str(e)[:80])
-            break
-        try:
-            ans = ask_vision(png, n_td)
-        except Exception as e:
-            log.append("vision_err:" + str(e)[:120])
-            break
-        log.append({"round": rnd, "answer": ans})
-        if not ans:
-            break
+        # 主路径：逐格问 yes/no。整图问「点哪几格」会被模型当成 CAPTCHA 拒答。
+        target = read_target(bf)
+        log.append({"round": rnd, "target": target})
         cells = []
-        for c in ans.get("cells", []):
+        if target:
+            for i in range(n_td):
+                if time.time() - t_start > 300:
+                    log.append("time_budget_hit")
+                    break
+                try:
+                    cell_png = bf.locator("td").nth(i).screenshot(timeout=8000)
+                except Exception as e:
+                    log.append("cell_shot_err_%d:%s" % (i + 1, str(e)[:40]))
+                    continue
+                if ask_cell(cell_png, target):
+                    cells.append(i + 1)
+            log.append({"round": rnd, "cells": cells})
+
+        if not cells:
+            # 后备：老的整图识别。目标词读不到、或逐格全否时才走这里。
             try:
-                c = int(c)
-            except Exception:
-                continue
-            if 1 <= c <= n_td:
-                cells.append(c)
+                png = frame.first.screenshot()
+                ans = ask_vision(png, n_td)
+            except Exception as e:
+                log.append("vision_err:" + str(e)[:120])
+                ans = None
+            log.append({"round": rnd, "answer": ans})
+            if ans:
+                for c in ans.get("cells", []):
+                    try:
+                        c = int(c)
+                    except Exception:
+                        continue
+                    if 1 <= c <= n_td:
+                        cells.append(c)
         log.append({"round": rnd, "click": cells})
+        if not cells:
+            break
         for c in cells:
             try:
                 bf.locator("td").nth(c - 1).click(timeout=8000)
@@ -743,7 +820,16 @@ def solve_recaptcha_v2(page, max_rounds=3):
             except Exception as e:
                 log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
         try:
-            bf.locator("#recaptcha-verify-button").click(timeout=10000)
+            btn = bf.locator("#recaptcha-verify-button")
+            btn.wait_for(state="attached", timeout=10000)
+            try:
+                btn.click(timeout=6000)
+            except Exception:
+                # 实测有韩语广告横幅（TRAVELOVER 那种）横在面板底部，正好盖住
+                # verify 按钮，Playwright 的点击会一路等到超时。JS click 不受
+                # pointer-events 遮挡影响，也不会误点广告。
+                btn.evaluate("el => el.click()")
+                log.append("verify_js_click")
         except Exception as e:
             log.append("verify_err:" + str(e)[:80])
             break

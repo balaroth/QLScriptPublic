@@ -103,6 +103,7 @@ git pull fork main   # 或 upstream 同步后确认 daily/woiden_auto_renew.py �
 | 2026-10-28 起 `td_count:9` 但 `cells:[]`，`notes` 写着 "I can't identify the specific cells in an image-selection CAPTCHA" | 视觉模型认出了整张九宫格是 CAPTCHA，主动拒答（不是接口坏了，`instruction` 照样能读对） | 改为**逐格提问**：先从 `.rc-imageselect-desc strong` 读目标词，再把每个 `td` 单独截图，只问 "Does it contain a X? yes/no"。单格图没有说明文字，模型不会联想到 CAPTCHA；实测 5–10 秒一格、判断准确。整图识别保留作后备 |
 | `verify_err: Locator.click: Timeout 10000ms`，但截图里格子都勾上了 | 页面底部有广告横幅（实测是韩语 TRAVELOVER 旅游广告）横在 reCAPTCHA 面板下方，正好盖住 `#recaptcha-verify-button`，Playwright 的点击会一直等到超时 | 先正常 `click(timeout=6000)`，失败再 `evaluate("el => el.click()")` 用 JS 触发，不受 pointer-events 遮挡影响，也不会误点广告 |
 | 勾选后仍无 token | bframe 出现但内容还在加载，`td` 数为 0 | 点完后 `td.first.wait_for(timeout=8000)` |
+| 2026-10-30 `td_count:16` 且日志里 `target:""`，随后 `cells:[]` | 16 格 4×4 挑战的 DOM 是 `.rc-imageselect-desc-wrapper > .rc-imageselect-desc-no-canonical`，**根本不存在 `.rc-imageselect-desc` 这个元素**；文案是 `Select all squares with ...` 而不是 `images with ...`。老实现首选 `.rc-imageselect-desc strong` 匹配 0 个，退回 wrapper 又被 `images? with` 正则卡住，两道关卡同时失效 → target 恒空 → 掉进整图 `ask_vision` 被模型拒答 → `needs_human_verification` | `read_target` 改为逐层尝试 strong（含 `-no-canonical` 与 `payload`），正则只锚 `with <物体>`、不再限定 images/squares；target 为空时新增 `ask_desc_ocr()`，把说明条截图交给模型做**纯 OCR**（问「这段文字要求选什么物体」，不是「帮我解验证码」，所以不拒答）；`ask_cell` 提示词去掉不定冠词（目标词常为复数）。实测 16 格与 9 格布局均能读出目标词，续期一轮通过 |
 
 标签清理：所有终态经 `emit()` 调 `tidy_tabs()`；with 块内异常也会趁连接存活先清再抛；另有 `atexit` 兜底。SIGKILL（worker 520s 超时）无法捕获，残留标签由下次运行复用 + 清理自愈。
 

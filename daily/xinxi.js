@@ -14,7 +14,8 @@ schedule: 由 qlall 统一执行；qlrun 条目仅供手工运行，不设独立
   XINXI_READ_ONLY=1           只读验证，不执行签到/评论/点赞/关注/分享
   XINXI_PROBE_ONLY=1          未配置账号时仅探测后端；默认缺账号会失败，防止误报成功
   XINXI_HTTP_TIMEOUT=15000    请求超时（毫秒）
-  XINXI_MAX_RETRIES=2         只读请求最大重试次数
+  XINXI_MAX_RETRIES=2         只读请求最大重试次数（含 HTTP 200 的业务级网络异常）
+  // 写请求一旦尝试，后续失败禁止 qlrun/qlall 重放整份脚本。
   XINXI_MAX_PAGES=10          查找可关注帖子的最大页数
   XINXI_BROWSE_GOODS_ID=22    浏览商品任务参数（保持旧脚本默认值）
 */
@@ -58,6 +59,31 @@ const boolEnv = (name, fallback = false) => {
   return /^(1|true|yes|on)$/i.test(value);
 };
 const asArray = (value) => (Array.isArray(value) ? value : []);
+
+function businessSuccess(code) {
+  return code === 0 || code === '0';
+}
+
+function transientBusiness(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)
+      || !['number', 'string'].includes(typeof result.code)
+      || result.code === '' || businessSuccess(result.code)) return false;
+  // 仅识别明确网络/服务瞬时异常；限流、鉴权和普通业务拒绝不能混入。
+  const message = String(result.msg || result.message || '');
+  if (/限流|频繁|太快|未授权|登录|令牌|token|rate.?limit/i.test(message)) return false;
+  return /^(?:网络异常|网络错误|网络请求失败|服务暂时不可用|服务器繁忙|系统繁忙|服务异常|network error|service unavailable)(?:[，,。.!！].*)?$/i.test(message.trim());
+}
+
+function isTransientError(error) {
+  if (!error || error instanceof AuthExpiredError) return false;
+  if (error.retryable !== undefined) return error.retryable === true;
+  if (error.cause) return isTransientError(error.cause);
+  const status = error.httpStatus || (error.response && error.response.status);
+  if (status) return status === 408 || (status >= 500 && status <= 599);
+  return ['ETIMEDOUT', 'ECONNABORTED', 'ECONNRESET', 'ECONNREFUSED',
+    'EAI_AGAIN', 'ENOTFOUND', 'EPIPE'].includes(error.code);
+}
+
 const errorText = (error) => {
   if (!error) return '未知错误';
   if (error instanceof AuthExpiredError) return error.message;
@@ -196,6 +222,23 @@ class Task {
     this.phoneProvider = options.phoneProvider || (() => fetchPhoneFromCollector({ http: this.http, logger: this.logger }));
     this.authRefreshAttempted = false;
     this.phoneBindAttempted = false;
+    this.writeAttempted = false;
+    this.failureErrors = [];
+  }
+
+  recordFailure(error) {
+    this.failureErrors.push(error);
+  }
+
+  runResult(extra = {}) {
+    return {
+      ok: this.failures.length === 0,
+      failures: this.failures,
+      writeAttempted: this.writeAttempted,
+      retryable: !this.writeAttempted && this.failureErrors.length > 0
+        && this.failureErrors.every(isTransientError),
+      ...extra,
+    };
   }
 
   prefix(message) {
@@ -213,7 +256,8 @@ class Task {
   }
 
   async retryAfterAuth(error, options, meta) {
-    if (this.autoLogin && !meta.authRetry && !this.authRefreshAttempted) {
+    if (this.autoLogin && meta.idempotent === true && !this.writeAttempted
+        && !meta.authRetry && !this.authRefreshAttempted) {
       await this.ensureToken(true);
       return this.request(options, { ...meta, authRetry: true });
     }
@@ -224,7 +268,12 @@ class Task {
     if (!meta.noAuth) await this.ensureToken(false);
     const method = String(options.method || 'GET').toUpperCase();
     const idempotent = meta.idempotent === true;
-    const attempts = idempotent ? this.maxRetries + 1 : 1;
+    if (this.readOnly && !idempotent) {
+      throw new ApiError('只读模式禁止业务写请求', { retryable: false });
+    }
+    const retryBudget = Number.isInteger(meta.retries)
+      ? Math.min(this.maxRetries, Math.max(0, meta.retries)) : this.maxRetries;
+    const attempts = idempotent ? retryBudget + 1 : 1;
     let lastError;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -245,6 +294,8 @@ class Task {
       };
 
       try {
+        // 用业务语义而非 GET/POST 判断写入：签到、分享等也使用 GET。
+        if (!idempotent) this.writeAttempted = true;
         const response = await this.http.request({
           ...options,
           method,
@@ -252,8 +303,8 @@ class Task {
           timeout: options.timeout || this.timeout,
         });
         const result = response && response.data;
-        if (!result || typeof result !== 'object') {
-          throw new ApiError('接口返回的不是 JSON 对象', { endpoint: options.url });
+        if (!result || typeof result !== 'object' || Array.isArray(result)) {
+          throw new ApiError('接口返回的不是 JSON 对象', { endpoint: options.url, retryable: false });
         }
         const apiCode = Number(result.code);
         if (
@@ -269,6 +320,17 @@ class Task {
             httpStatus: response.status,
             endpoint: options.url,
           });
+        }
+        if (response.status === 429 || /限流|频繁|太快|rate.?limit/i.test(String(result.msg || result.message || ''))) {
+          throw new ApiError('服务端限制请求，本轮不再重试', { retryable: false, httpStatus: response.status, apiCode: result.code });
+        }
+        if (transientBusiness(result)) {
+          throw new ApiError(`业务层暂时异常：${result.msg || result.message}`, {
+            retryable: true, apiCode: result.code, httpStatus: response.status, endpoint: options.url,
+          });
+        }
+        if (response.status === 408 || response.status >= 500) {
+          throw new ApiError(`HTTP ${response.status}`, { retryable: true, httpStatus: response.status });
         }
         return result;
       } catch (error) {
@@ -301,7 +363,7 @@ class Task {
         const retryable =
           idempotent &&
           attempt < attempts &&
-          (!status || status === 408 || status === 429 || status >= 500);
+          isTransientError(error);
         if (!retryable) break;
         const delay = Math.min(3000, 300 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 150);
         this.logger.warn(this.prefix(`只读请求失败，${delay}ms 后重试（${attempt}/${attempts - 1}）：${errorText(error)}`));
@@ -312,13 +374,15 @@ class Task {
     throw new ApiError(`请求失败：${errorText(lastError)}`, {
       cause: lastError,
       endpoint: options.url,
+      retryable: idempotent && isTransientError(lastError),
     });
   }
 
   unwrap(result, action) {
-    if (result.code !== 0) {
-      throw new ApiError(`${action}失败：${result.msg || `接口码 ${result.code}`}`, {
-        apiCode: result.code,
+    if (!result || !businessSuccess(result.code)) {
+      throw new ApiError(`${action}失败：${(result && result.msg) || `接口码 ${result && result.code}`}`, {
+        apiCode: result && result.code,
+        retryable: false,
       });
     }
     return result.data;
@@ -373,7 +437,11 @@ class Task {
       },
       { idempotent: true },
     );
-    return Boolean(this.unwrap(result, '签到状态查询'));
+    const state = this.unwrap(result, '签到状态查询');
+    if (state !== true && state !== false) {
+      throw new ApiError('签到状态不是明确布尔值，禁止猜测或发起签到', { retryable: false });
+    }
+    return state;
   }
 
   async signIn() {
@@ -386,21 +454,20 @@ class Task {
     try {
       result = await this.request(options);
     } catch (error) {
-      const status = error.httpStatus || (error.cause && error.cause.response && error.cause.response.status);
-      const transient = !status || status === 408 || status === 429 || status >= 500;
-      if (!transient) throw error;
-
-      this.logger.warn(this.prefix(`签到请求结果不确定，先核对服务端签到状态：${errorText(error)}`));
+      if (error instanceof AuthExpiredError
+          || !(isTransientError(error) || isTransientError(error.cause))) throw error;
+      this.logger.warn(this.prefix(`签到请求结果不确定，只核对服务端状态，不重放写入：${errorText(error)}`));
       if (await this.signStatus()) {
         this.logger.log(this.prefix('签到状态：已签到（服务端已落账）'));
         return { idempotent: true };
       }
-
-      this.logger.warn(this.prefix('服务端仍显示未签到，受控补偿签到 1 次'));
-      result = await this.request(options);
+      throw new ApiError('签到结果未确认，本轮不补偿重放', { retryable: false, cause: error });
     }
     const data = this.unwrap(result, '签到') || {};
-    this.logger.log(this.prefix(`签到成功，获得积分【${data.integral ?? '未知'}】`));
+    if (!(await this.signStatus())) {
+      throw new ApiError('签到响应成功但服务端状态仍未签到', { retryable: false });
+    }
+    this.logger.log(this.prefix(`签到成功（服务端状态确认），获得积分【${data.integral ?? '未知'}】`));
     return data;
   }
 
@@ -436,22 +503,37 @@ class Task {
       },
       { idempotent: true },
     );
-    const data = this.unwrap(result, '帖子列表查询') || {};
-    const list = asArray(data.list);
+    const data = this.unwrap(result, '帖子列表查询');
+    if (!data || !Array.isArray(data.list)) {
+      throw new ApiError('帖子列表格式异常，禁止将损坏响应当作空列表', { retryable: false });
+    }
+    const list = data.list;
     if (pageNum === 1) this.posts = list;
     return list;
   }
 
   async getGoods() {
-    const result = await this.request(
-      {
-        method: 'GET',
-        url: `${CDN_API_BASE}/mini/integralGoods?miniIs=1&orderField=sort&orderScheme=DESC&pageSize=50&pageNum=1`,
-      },
-      { idempotent: true },
-    );
-    const data = this.unwrap(result, '积分商品查询') || {};
-    this.goods = asArray(data.list);
+    const apiPath = '/mini/integralGoods?miniIs=1&orderField=sort&orderScheme=DESC&pageSize=50&pageNum=1';
+    let result;
+    try {
+      // CDN 只尝试一次；瞬时故障切到已验证的同业务源站，避免连等三次超时。
+      result = await this.request(
+        { method: 'GET', url: `${CDN_API_BASE}${apiPath}`, timeout: Math.min(this.timeout, 8000) },
+        { idempotent: true, retries: 0 },
+      );
+    } catch (error) {
+      if (!isTransientError(error)) throw error;
+      this.logger.warn(this.prefix('商品 CDN 暂时不可用，改用官方源站只读查询'));
+      result = await this.request(
+        { method: 'GET', url: `${API_BASE}${apiPath}` },
+        { idempotent: true, retries: Math.max(0, this.maxRetries - 1) },
+      );
+    }
+    const data = this.unwrap(result, '积分商品查询');
+    if (!data || !Array.isArray(data.list)) {
+      throw new ApiError('积分商品列表格式异常', { retryable: false });
+    }
+    this.goods = data.list;
     return this.goods;
   }
 
@@ -610,6 +692,7 @@ class Task {
     ]);
     for (const result of results) {
       if (result.status === 'rejected') {
+        this.recordFailure(result.reason);
         this.failures.push(errorText(result.reason));
         this.logger.warn(this.prefix(`只读检查项失败：${errorText(result.reason)}`));
       }
@@ -637,7 +720,7 @@ class Task {
       const tasks = await this.getDailyTasks();
       if (this.readOnly) {
         await this.readOnlySnapshot(tasks, signState);
-        return { ok: this.failures.length === 0, failures: this.failures };
+        return this.runResult();
       }
 
       for (const task of tasks) {
@@ -652,6 +735,7 @@ class Task {
           await this.wait(500);
         } catch (error) {
           const message = `${task.taskName || task.code || '未知任务'}：${errorText(error)}`;
+          this.recordFailure(error);
           this.failures.push(message);
           this.logger.error(this.prefix(message));
           if (error instanceof AuthExpiredError) throw error;
@@ -668,12 +752,13 @@ class Task {
       for (const item of this.goods) {
         this.logger.log(`积分物品【${item.name || item.id || '未命名'}】，库存【${item.stock ?? '未知'}】`);
       }
-      return { ok: this.failures.length === 0, failures: this.failures };
+      return this.runResult();
     } catch (error) {
       const message = error instanceof AuthExpiredError ? 'sso 已失效，请重新抓取' : errorText(error);
+      this.recordFailure(error);
       this.failures.push(message);
       this.logger.error(this.prefix(message));
-      return { ok: false, authExpired: error instanceof AuthExpiredError, failures: this.failures };
+      return this.runResult({ authExpired: error instanceof AuthExpiredError });
     }
   }
 }
@@ -735,6 +820,8 @@ async function main() {
   );
 
   let failed = 0;
+  let retryable = true;
+  let wrote = false;
   let skipped = false;
   if (!accounts.length) {
     if (!probeOnly) {
@@ -753,13 +840,17 @@ async function main() {
         readOnly,
       });
       const result = await task.run();
-      if (!result.ok) failed += 1;
+      wrote = wrote || result.writeAttempted;
+      if (!result.ok) {
+        failed += 1;
+        if (result.retryable !== true) retryable = false;
+      }
     }
   }
 
   logger.log(`执行汇总：账号=${accounts.length}，失败=${failed}，模式=${mode}`);
   if (failed) {
-    console.log(`[QLRUN_RESULT] FAILURE accounts=${accounts.length} failed=${failed} retryable=1`);
+    console.log(`[QLRUN_RESULT] FAILURE accounts=${accounts.length} failed=${failed} retryable=${retryable && !wrote ? 1 : 0} wrote=${wrote ? 1 : 0}`);
   } else if (skipped) {
     console.log('[QLRUN_RESULT] SKIP reason=no_accounts configured=0');
   } else if (probeOnly) {
@@ -767,7 +858,13 @@ async function main() {
   } else {
     console.log(`[QLRUN_RESULT] SUCCESS accounts=${accounts.length} failed=0 mode=${mode}`);
   }
-  await env.sendMsg();
+  // 先固定业务退出码，通知失败不能改变业务结果或触发整任务重跑。
+  if (failed) process.exitCode = 1;
+  try {
+    if (process.env.QL_SUPPRESS_NOTIFY !== '1') await env.sendMsg();
+  } catch (_) {
+    console.log('[xinxi] 通知失败；业务结果保持不变');
+  }
   const seconds = ((Date.now() - env.startTime) / 1000).toFixed(3);
   console.log(`🔔${env.name},结束!🕛 ${seconds}秒`);
   if (failed) process.exitCode = 1;
@@ -775,6 +872,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch((error) => {
+    console.error('[QLRUN_RESULT] FAILURE retryable=0 reason=unhandled_exception');
     console.error(`辛喜脚本未捕获异常：${errorText(error)}`);
     process.exitCode = 1;
   });

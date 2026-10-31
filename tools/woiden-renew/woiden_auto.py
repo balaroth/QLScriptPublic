@@ -682,6 +682,124 @@ def _vision_text(png_bytes, prompt, max_tokens=24):
         return ""
     return c
 
+def grid_cells(bf, n):
+    """
+    用 iframe 内的 canvas 把整张挑战图切成 n 个单格 JPEG 字节。
+
+    为什么不用 locator.screenshot()：
+      2026-10-31 实测，挑战挂起约 2 分钟后 Chromium 合成器进入挂起状态，
+      Playwright 所有截屏都卡在 "attempting to take screenshot" 直到 30 秒超时
+      （错误里 fonts 明明已经 loaded，问题不在字体）。16 格 × 30 秒直接烧光
+      时间预算，token 恒为 0，最终误报 needs_human_verification。
+
+    为什么不直接下载 img.src：
+      实测 9 格与 16 格布局下，所有 td 的 <img> 都指向**同一张 300×300 整图**
+      （靠 CSS 裁剪显示各格）。直接下载得到的是整图，模型会把每一格都答 yes。
+
+    canvas 方案：img 与 bframe 同源（都是 recaptcha.net），canvas 不会被 taint，
+    可以 drawImage 后按网格裁切再 toDataURL。纯 JS 计算，不经过渲染管线。
+    """
+    cols = int(round(n ** 0.5))
+    js = """() => {
+      const cols = %d;
+      const imgs = Array.from(document.querySelectorAll('td img'));
+      if (!imgs.length) return {err: 'no img'};
+      const img = imgs[0];
+      const W0 = img.naturalWidth || 300, H0 = img.naturalHeight || 300;
+      const cw = Math.floor(W0 / cols), ch = Math.floor(H0 / cols);
+      const out = [];
+      for (let r = 0; r < cols; r++) {
+        for (let c = 0; c < cols; c++) {
+          const cv = document.createElement('canvas');
+          cv.width = cw; cv.height = ch;
+          const ctx = cv.getContext('2d');
+          try {
+            ctx.drawImage(img, c * cw, r * ch, cw, ch, 0, 0, cw, ch);
+            out.push(cv.toDataURL('image/jpeg', 0.92));
+          } catch (e) { return {err: 'canvas:' + e.name}; }
+        }
+      }
+      return {imgs: out};
+    }""" % cols
+    try:
+        res = bf.locator("html").evaluate(js)
+    except Exception:
+        return []
+    if not isinstance(res, dict) or "imgs" not in res:
+        return []
+    out = []
+    for d in res["imgs"][:n]:
+        try:
+            out.append(base64.b64decode(d.split(",", 1)[1]))
+        except Exception:
+            return []
+    return out
+
+
+def ask_cells(pngs, target, workers=4, retries=2):
+    """
+    并发问每一格「有没有 target」，返回与 pngs 等长的列表（True/False/None）。
+
+    为什么要并发：单格一次视觉调用实测 8-11 秒，16 格串行就是 150 秒以上，
+    加上前面的数学验证码和 Telegram 取码，很容易撞上 worker 的 520 秒上限。
+    并发 4 路把这段压到 40-60 秒。
+
+    为什么要重试：2026-10-31 实测 9 格里 4 格返回 None（接口抖动），
+    而 None 会被上层当 false，导致漏选、整轮失败。重试 2 次后归零。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(i):
+        for attempt in range(retries + 1):
+            v = ask_cell(pngs[i], target)
+            if v is not None:
+                return i, v
+            time.sleep(1.2 * (attempt + 1))
+        return i, None
+
+    res = [None] * len(pngs)
+    if not pngs:
+        return res
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pngs)))) as ex:
+        for i, v in ex.map(one, range(len(pngs))):
+            res[i] = v
+    return res
+
+
+def cell_image(bf, idx):
+    """
+    取第 idx 格（0 基）的图片字节。
+
+    为什么不直接 locator.screenshot()：
+      2026-10-31 实测，挑战挂起约 2 分钟后 Chromium 合成器进入挂起状态，
+      Playwright 的所有截屏都卡在 "attempting to take screenshot" 直到 30 秒超时
+      （错误里 fonts 明明已经 loaded，问题不在字体）。16 格 × 30 秒直接把时间预算
+      烧光，token 恒为 0，最终误报 needs_human_verification。
+      而每个 td 里的 <img> 指向 recaptcha 的 payload URL，可以直接 HTTP 下载：
+      实测 0.2 秒一张、约 26KB JPEG，完全绕开渲染管线。
+    截图只作兜底（URL 取不到或下载失败时）。
+    """
+    src = None
+    try:
+        src = bf.locator("td").nth(idx).locator("img").evaluate(
+            "el => el.currentSrc || el.src || ''")
+    except Exception:
+        src = None
+    if src and src.startswith("http"):
+        try:
+            import urllib.request
+            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=20).read()
+            if len(data) > 500:
+                return data
+        except Exception:
+            pass
+    try:
+        return bf.locator("td").nth(idx).screenshot(timeout=6000)
+    except Exception:
+        return None
+
+
 def ask_cell(png_bytes, target):
     """
     只把「一个格子」发给视觉模型，问它里面有没有目标物体。
@@ -827,7 +945,8 @@ def solve_recaptcha_v2(page, max_rounds=3):
         bf = page.frame_locator("iframe[src*='bframe']")
         # bframe 出现不代表内容已渲染，等第一个格子出现，避免把加载中误判成 0 格
         try:
-            bf.locator("td").first.wait_for(timeout=8000)
+            # 用 attached 而不是默认的 visible：合成器挂起后 visible 检查会一直等
+            bf.locator("td").first.wait_for(timeout=10000, state="attached")
         except Exception:
             pass
         try:
@@ -846,23 +965,22 @@ def solve_recaptcha_v2(page, max_rounds=3):
         log.append({"round": rnd, "target": target})
         cells = []
         if target:
-            for i in range(n_td):
-                if time.time() - t_start > 300:
-                    log.append("time_budget_hit")
-                    break
-                try:
-                    cell_png = bf.locator("td").nth(i).screenshot(timeout=8000)
-                except Exception as e:
-                    log.append("cell_shot_err_%d:%s" % (i + 1, str(e)[:40]))
-                    continue
-                if ask_cell(cell_png, target):
-                    cells.append(i + 1)
-            log.append({"round": rnd, "cells": cells})
+            grid = grid_cells(bf, n_td)
+            if len(grid) != n_td:
+                log.append({"round": rnd, "grid_fallback": len(grid)})
+                grid = [cell_image(bf, i) for i in range(n_td)]
+            idx = [i for i, g in enumerate(grid) if g]
+            verdicts = ask_cells([grid[i] for i in idx], target) if idx else []
+            for k, v in zip(idx, verdicts):
+                if v:
+                    cells.append(k + 1)
+            log.append({"round": rnd, "cells": cells,
+                        "unknown": sum(1 for v in verdicts if v is None)})
 
         if not cells:
             # 后备：老的整图识别。目标词读不到、或逐格全否时才走这里。
             try:
-                png = frame.first.screenshot()
+                png = frame.first.screenshot(timeout=10000)
                 ans = ask_vision(png, n_td)
             except Exception as e:
                 log.append("vision_err:" + str(e)[:120])
@@ -880,22 +998,27 @@ def solve_recaptcha_v2(page, max_rounds=3):
         if not cells:
             break
         for c in cells:
+            # 渲染挂起后 Playwright 的 click 会卡到超时（要求可见+稳定+可交互），
+            # 但 JS click 只派发事件、不依赖渲染状态，所以这里反过来：JS 优先。
             try:
-                bf.locator("td").nth(c - 1).click(timeout=8000)
-                page.wait_for_timeout(350)
-            except Exception as e:
-                log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
+                bf.locator("td").nth(c - 1).evaluate("el => el.click()")
+                page.wait_for_timeout(300)
+            except Exception:
+                try:
+                    bf.locator("td").nth(c - 1).click(timeout=5000)
+                    page.wait_for_timeout(300)
+                except Exception as e:
+                    log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
         try:
             btn = bf.locator("#recaptcha-verify-button")
             btn.wait_for(state="attached", timeout=10000)
             try:
-                btn.click(timeout=6000)
-            except Exception:
-                # 实测有韩语广告横幅（TRAVELOVER 那种）横在面板底部，正好盖住
-                # verify 按钮，Playwright 的点击会一路等到超时。JS click 不受
-                # pointer-events 遮挡影响，也不会误点广告。
+                # JS click 优先：① 广告横幅会盖住按钮 ② 渲染挂起后 Playwright 的
+                # click 要等可见+稳定+可交互，必然超时。JS click 只派发事件。
                 btn.evaluate("el => el.click()")
                 log.append("verify_js_click")
+            except Exception:
+                btn.click(timeout=6000)
         except Exception as e:
             log.append("verify_err:" + str(e)[:80])
             break

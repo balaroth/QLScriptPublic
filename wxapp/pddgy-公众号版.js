@@ -45,6 +45,34 @@ const MANOR_BASE = ORCHARD_BASE + "/proxy/api/api";
 const CHECKIN_TYPE = 201811;
 const MAX_WATER_TIMES = 20; // 附带浇水上限（非核心）
 const TOKEN_CACHE_FILE = path.join(__dirname, "pddgy_token_cache.json");
+
+// --- 防重放/结果契约 (与同仓 JS 脚本同一语义, 不把失败伪装成成功) -----------------
+// PDDGY_READ_ONLY=1: 只登录+只读首页, 绝不调用写接口 apply/activity, 也不写状态文件。
+// 状态文件 pddgy_gzh_sign_state.json: 按 日期 -> openid 记录
+//   success / failed / attempting / unknown + attempts + not_signed_confirms。
+// 写前原子落盘 attempting 并回读校验; 写后未知只做只读权威收敛, 本进程不重发;
+// 冷却期 + 连续两次权威确认未签后, 当日最多再恢复写一次(硬上限)。
+const READ_ONLY = ["1", "true", "yes"].includes((process.env.PDDGY_READ_ONLY || "0").trim().toLowerCase());
+const STATE_FILE = path.join(__dirname, "pddgy_gzh_sign_state.json");
+const COOLDOWN_SEC = 1800;
+const MAX_WRITE_ATTEMPTS = 2;
+const RESULT_TAG = "[QLRUN_RESULT]";
+
+function today() { return new Date().toISOString().slice(0, 10); }
+function loadState() {
+    try { if (!fs.existsSync(STATE_FILE)) return {}; return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) || {}; }
+    catch (e) { return {}; }
+}
+function saveStateAtomic(st) {
+    const tmp = STATE_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(st, null, 2), "utf8");
+    fs.renameSync(tmp, STATE_FILE);
+    const back = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    if (JSON.stringify(back) !== JSON.stringify(st)) throw new Error("状态文件回读校验不一致");
+}
+function recOf(st, openid) { return (st[today()] && st[today()][openid]) || {}; }
+function ensureDay(st) { if (!st[today()]) st[today()] = {}; return st; }
+
 const UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 " +
     "MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF XWEB/19895 miniProgram/wx32540bd863b27570";
@@ -169,9 +197,14 @@ class Task {
 
         this.cookieStr = parts.join("; ");
         this.pdduid = uid;
-        const cache = readCache();
-        cache[this.account.openid] = { cookieStr: this.cookieStr, uid, updatedAt: new Date().toISOString() };
-        writeCache(cache);
+        // 防自伤: 仅在确实拿到 uid 时才覆盖缓存, 失败登录不得清空好 cookie
+        if (uid) {
+            const cache = readCache();
+            cache[this.account.openid] = { cookieStr: this.cookieStr, uid, updatedAt: new Date().toISOString() };
+            writeCache(cache);
+        } else {
+            this.log("  ⚠️ 登录未返回 uid, 保留旧缓存不覆盖");
+        }
         this.log(`登录成功 uid=${uid}`);
     }
     async manorPost(apiPath, body) {
@@ -284,28 +317,102 @@ class Task {
         }
     }
     async run() {
-        if (!this.account.openid) { this.log("跳过：变量值里没有 openid"); return; }
+        if (!this.account.openid) { this.log("跳过：变量值里没有 openid"); return { status: "SKIPPED", retryable: false, writeAttempted: false }; }
+        let outcome = { status: "SUCCESS", retryable: true, writeAttempted: false };
         try {
             await this.ensureSession();
-            const r = await this.checkin();
-            await $.wait(500, 1000);
-            if (!r.blocked) await this.waterTree();
         } catch (e) {
             const em = String(e.message || e);
             if (em.startsWith("BLOCKED")) {
                 this.log(`⛔ ${em.replace(/^BLOCKED:/, "")}（拼多多重风控，需在小程序内手动过验证，脚本无法绕过）`);
-                return;
+                return { status: "BLOCKED", retryable: false, writeAttempted: false, reason: "risk_control" };
             }
+            // 登录/会话为瞬态故障: 不写状态, 可安全重跑
             this.log(`执行失败: ${em}`);
+            return { status: "FAILURE", retryable: true, writeAttempted: false, reason: "session" };
         }
+
+        // 今日已签 -> 幂等收敛, 零写
+        let st = ensureDay(loadState());
+        let rec = recOf(st, this.account.openid);
+        if (rec.status === "success") {
+            this.log("今日已签(本地状态), 跳过写");
+            outcome = { status: "SUCCESS", retryable: false, writeAttempted: false, reason: "already_signed" };
+        } else if (READ_ONLY) {
+            this.log("PDDGY_READ_ONLY=1: 只读, 不写签到");
+            outcome = { status: "SUCCESS", retryable: false, writeAttempted: false, reason: "read_only" };
+        } else {
+            // 防重放: 写前判断当日写次数与冷却/权威确认
+            const attempts = rec.attempts || 0;
+            const lastTs = rec.last_attempt_ts || 0;
+            const cooled = (Date.now() / 1000) - lastTs >= COOLDOWN_SEC;
+            if (attempts >= MAX_WRITE_ATTEMPTS) {
+                this.log("当日写次数已达上限, 停止");
+                outcome = { status: "FAILURE", retryable: false, writeAttempted: false, reason: "write_cap" };
+            } else if (rec.status === "unknown" && !(cooled && (rec.not_signed_confirms || 0) >= 2)) {
+                // 写后未知: 只做只读收敛, 本进程不重发; 冷却+两次权威确认后才放行一次恢复写
+                st[today()][this.account.openid] = { ...rec, not_signed_confirms: (rec.not_signed_confirms || 0) + 1 };
+                saveStateAtomic(st);
+                this.log("写后未知: 只读收敛, 暂不重发");
+                outcome = { status: "FAILURE", retryable: true, writeAttempted: false, reason: "unknown_converge" };
+            } else {
+                // 写前原子落盘 attempting 并回读校验
+                st[today()][this.account.openid] = { status: "attempting", attempts: attempts + 1, last_attempt_ts: Math.floor(Date.now() / 1000), not_signed_confirms: 0 };
+                saveStateAtomic(st);
+                outcome.writeAttempted = true;
+                let r;
+                try {
+                    r = await this.checkin();
+                } catch (e) {
+                    // 写后未知: 只落 unknown, 本进程不重发
+                    st = ensureDay(loadState());
+                    st[today()][this.account.openid] = { ...recOf(st, this.account.openid), status: "unknown", attempts: attempts + 1, last_attempt_ts: Math.floor(Date.now() / 1000) };
+                    saveStateAtomic(st);
+                    this.log(`写后未知: ${e.message || e}`);
+                    return { status: "FAILURE", retryable: false, writeAttempted: true, reason: "write_unknown" };
+                }
+                if (r.blocked) {
+                    st = ensureDay(loadState());
+                    st[today()][this.account.openid] = { ...recOf(st, this.account.openid), status: "failed", reason: "risk_control" };
+                    saveStateAtomic(st);
+                    outcome = { status: "BLOCKED", retryable: false, writeAttempted: true, reason: "risk_control" };
+                } else if (r.ok) {
+                    st = ensureDay(loadState());
+                    st[today()][this.account.openid] = { status: "success", attempts: attempts + 1, already: !!r.already, ts: Date.now() };
+                    saveStateAtomic(st);
+                    outcome = { status: "SUCCESS", retryable: false, writeAttempted: true, reason: r.already ? "already_signed" : "ok" };
+                    await $.wait(500, 1000);
+                    await this.waterTree();
+                } else {
+                    st = ensureDay(loadState());
+                    st[today()][this.account.openid] = { ...recOf(st, this.account.openid), status: "failed", attempts: attempts + 1, reason: r.msg || "checkin_failed" };
+                    saveStateAtomic(st);
+                    outcome = { status: "FAILURE", retryable: false, writeAttempted: true, reason: "checkin_rejected" };
+                }
+            }
+        }
+        return outcome;
     }
 }
 
 !(async () => {
     $.checkEnv(ckName);
     if (!$.userCount) { $.log(`未找到变量 ${ckName}`); return; }
+    const results = [];
     for (let i = 0; i < $.userList.length; i++) {
-        await new Task($.userList[i]).run();
+        const r = await new Task($.userList[i]).run();
+        results.push(r);
         if (i < $.userList.length - 1) await $.wait(1500, 3000);
     }
+    const ok = results.every((r) => r.status === "SUCCESS" || r.status === "SKIPPED");
+    const writes = results.reduce((n, r) => n + (r.writeAttempted ? 1 : 0), 0);
+    const line = `${RESULT_TAG} ${ok ? "SUCCESS" : "FAILURE"} ${JSON.stringify({
+        script: "pddgy-公众号版.js",
+        accounts: `${results.filter((r) => r.status === "SUCCESS").length}/${results.length}`,
+        mode: READ_ONLY ? "read_only" : "normal",
+        writeAttempted: writes,
+        reason: results[0] ? results[0].reason || "" : "",
+    })} retryable=${results.some((r) => r.retryable) ? 1 : 0}`;
+    console.log(line);
+    process.exitCode = ok ? 0 : 1;
 })().catch((e) => $.log(e.message || e)).finally(() => $.done());

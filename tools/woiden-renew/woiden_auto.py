@@ -738,7 +738,7 @@ def grid_cells(bf, n):
     return out
 
 
-def ask_cells(pngs, target, workers=4, retries=2, deadline=None):
+def ask_cells(pngs, target, workers=4, retries=2, deadline=None, loose=False):
     """
     并发问每一格「有没有 target」，返回与 pngs 等长的列表（True/False/None）。
 
@@ -751,12 +751,18 @@ def ask_cells(pngs, target, workers=4, retries=2, deadline=None):
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    stop = {"hit": False}
+
     def one(i):
         for attempt in range(retries + 1):
             # deadline 是绝对时间戳：超了就不再发起新调用，避免整轮撞上 worker 520s 上限
-            if deadline and time.time() > deadline:
+            if stop["hit"] or (deadline and time.time() > deadline):
                 return i, None
-            v = ask_cell(pngs[i], target)
+            v = ask_cell(pngs[i], target, loose=loose)
+            if v == "throttled":
+                # 配额打满：剩下所有格子都别再发了，否则只是白烧
+                stop["hit"] = True
+                return i, "throttled"
             if v is not None:
                 return i, v
             time.sleep(1.2 * (attempt + 1))
@@ -767,6 +773,18 @@ def ask_cells(pngs, target, workers=4, retries=2, deadline=None):
         return res
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pngs)))) as ex:
         for i, v in ex.map(one, range(len(pngs))):
+            res[i] = v
+    # 补判：并发下总有格子拿不到结果（实测 16 格里 4 个），多半是被同一时刻的
+    # 并发压力打回来的。这些格子若其实是目标物就会漏选，所以对它们串行再走一遍，
+    # 一次只发一个请求，避开限流。仍然失败才留 None。
+    for i in [k for k, v in enumerate(res) if v is None]:
+        if stop["hit"] or (deadline and time.time() > deadline):
+            break
+        v = ask_cell(pngs[i], target, loose=loose)
+        if v == "throttled":
+            stop["hit"] = True
+            break
+        if v is not None:
             res[i] = v
     return res
 
@@ -805,38 +823,66 @@ def cell_image(bf, idx):
         return None
 
 
-def ask_cell(png_bytes, target):
+def ask_cell(png_bytes, target, loose=False):
     """
     只把「一个格子」发给视觉模型，问它里面有没有目标物体。
 
     为什么不再整张图问「点哪几格」：
       2026-10-28 起模型能认出整张九宫格是 CAPTCHA，直接拒答（cells 恒为 []，
       notes 写 "I can't identify the specific cells in an image-selection CAPTCHA"）。
-      但把图片裁成单格、不提 CAPTCHA、只要一个 yes/no，它就会老实回答。
-    返回 True / False / None（None 表示调用失败，交给调用方决定是否放弃该格）。
+      但把图片裁成单格、不提 CAPTCHA，它就会老实回答。
+
+    为什么是三态而不是 yes/no：
+      单格图只有 100x100，小目标（烟囱、消防栓）常常只露出一角，
+      二选一会被迫在「不确定」和「没有」之间选边，实测容易出现整轮全 no。
+      引入 maybe 后上层可以分档处理：有明确 yes 就只信 yes，
+      全无 yes 时才退而用 maybe，避免一开始就多选把这一轮浪费掉。
+
+    loose=True 用于「全判 no」之后的复判：措辞放宽到「部分可见、很小、在背景里也算」。
+    返回 "yes" / "maybe" / "no"；接口失败返回 None（交给调用方重试）。
     """
     key = KEY_PATH.read_text().strip()
     img = base64.b64encode(png_bytes).decode()
-    prompt = ("This is a single photo cropped from a street-scene dataset. "
-              "Does it show %s? Answer with exactly one word: yes or no." % target)
+    if loose:
+        prompt = ("Look closely at this photo. Does it contain %s, even if it is only "
+                  "partially visible, small, or in the background? "
+                  "Answer with exactly one word: yes, no, or maybe." % target)
+    else:
+        prompt = ("This is a single photo cropped from a street-scene dataset. "
+                  "Does it show %s? Answer with exactly one word: yes, no, or maybe." % target)
     payload = {"model": VISION_MODEL, "messages": [{"role": "user", "content": [
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}},
     ]}]}
     import urllib.request
+    import urllib.error
     req = urllib.request.Request(VISION_API, data=json.dumps(payload).encode(),
                                  headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     try:
         r = urllib.request.urlopen(req, timeout=90)
         body = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # 2026-10-31 实测：图片走 /backend-api/files，上游有「文件上传上限」配额，
+        # 打满后返回 502 包着 429 throttled。这不是网络抖动，重试只会继续烧配额，
+        # 必须单独识别出来让上层立刻收手。
+        txt = ""
+        try:
+            txt = e.read().decode()[:600]
+        except Exception:
+            pass
+        if e.code == 429 or "throttled" in txt or "上传上限" in txt:
+            return "throttled"
+        return None
     except Exception:
         return None
     c = (body.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
     c = re.sub(r"</?escape>", "", c).strip().lower()
     if c.startswith("yes"):
-        return True
+        return "yes"
+    if c.startswith(("maybe", "perhaps", "possibly", "partially", "partly")):
+        return "maybe"
     if c.startswith("no"):
-        return False
+        return "no"
     return None
 
 
@@ -986,14 +1032,28 @@ def solve_recaptcha_v2(page, max_rounds=3):
                     grid.append(cell_image(bf, i))
                 grid += [None] * (n_td - len(grid))
             idx = [i for i, g in enumerate(grid) if g]
-            verdicts = ask_cells([grid[i] for i in idx], target,
-                                 deadline=deadline) if idx else []
-            for k, v in zip(idx, verdicts):
-                if v:
-                    cells.append(k + 1)
-            log.append({"round": rnd, "cells": cells,
+            pngs = [grid[i] for i in idx]
+            verdicts = ask_cells(pngs, target, deadline=deadline) if pngs else []
+            yes = [idx[k] + 1 for k, v in enumerate(verdicts) if v == "yes"]
+            maybe = [idx[k] + 1 for k, v in enumerate(verdicts) if v == "maybe"]
+            throttled = sum(1 for v in verdicts if v == "throttled")
+            log.append({"round": rnd, "yes": yes, "maybe": maybe,
                         "unknown": sum(1 for v in verdicts if v is None),
+                        "throttled": throttled,
                         "elapsed": round(time.time() - t_start)})
+            if yes:
+                cells = yes
+            elif maybe:
+                # 没有明确 yes，但有模棱两可的格子：先按 maybe 提交。
+                # 即使选错，reCAPTCHA 也会换一张新图，比直接 break 多一次机会。
+                cells = maybe
+            elif pngs and not throttled and time.time() < deadline:
+                # 全判 no：多半是 100x100 小图里目标只露一角，换宽松措辞复判一次
+                verdicts2 = ask_cells(pngs, target, deadline=deadline, loose=True)
+                loose_hit = [idx[k] + 1 for k, v in enumerate(verdicts2)
+                             if v in ("yes", "maybe")]
+                log.append({"round": rnd, "loose_retry": loose_hit})
+                cells = loose_hit
 
         if not cells:
             # 后备：老的整图识别。目标词读不到、或逐格全否时才走这里。

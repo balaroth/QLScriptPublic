@@ -34,7 +34,24 @@ LABELS = {
     "error": "执行异常",
 }
 
-RETRYABLE = set()  # never let qlrun/qlall retry: each retry re-triggers a Telegram code
+# 哪些失败值得让 qlall 重跑一次。
+#
+# 2026-10-20 最初这里写的是 `set()`（一律不重试），理由是重试会重新走 stage1、
+# 重新触发一次 Telegram 发码。但那条规则是从「PHPSESSID 失效变登录墙」这一种
+# 情况推出来的 —— 登录态问题重试确实没用 —— 却被写成了全局规则。结果后面
+# 失败类型早就变了（模型拒答、DOM 改版、渲染挂起），这些全是技术性瞬时故障，
+# 重跑一次就能过，却因为 retryable=0 被 qlall 直接 break，一天只有一次机会。
+#
+# 现在按 stage 区分，只放行「重跑有意义」的两类：
+#   recaptcha_v2  视觉模型判错 / 合成器挂起 / 配额抖动 —— 重跑大概率能过
+#   telegram      没等到新码 —— 重新发码有机会
+# 需要人工介入的一律不放行：login（要人重登）、stage1/stage2（数学验证码
+# 读不出，重试只会再失败一次）。
+RETRYABLE_STAGES = {"recaptcha_v2", "telegram"}
+
+# 同一天最多执行 2 次（1 次正常 + 1 次重试）。按日期自动重置，避免某天连续
+# 发码或连续刷 reCAPTCHA。qlall 侧 ATTEMPTS 是 3，这里收紧到 2。
+MAX_ATTEMPTS_PER_DAY = 2
 
 
 def log(msg):
@@ -58,6 +75,36 @@ def notify(title, body):
         log("notify rc=%s %s" % (r.returncode, tail.strip()[:200]))
     except Exception as e:
         log("notify exception: %s" % e)
+
+
+ATTEMPT_FILE = BASE / "attempt.count"
+
+
+def bump_attempt():
+    """记录并返回「今天是第几次执行」，跨天自动重置。"""
+    today = time.strftime("%Y-%m-%d")
+    n = 0
+    try:
+        d, v = ATTEMPT_FILE.read_text().strip().split()
+        if d == today:
+            n = int(v)
+    except Exception:
+        pass
+    n += 1
+    try:
+        ATTEMPT_FILE.write_text("%s %d" % (today, n))
+        os.chmod(ATTEMPT_FILE, 0o666)
+    except Exception:
+        pass
+    return n
+
+
+def clear_attempt():
+    """成功（含 not_due / ok）后清零，避免当天后续手动执行被次数上限挡住。"""
+    try:
+        ATTEMPT_FILE.unlink()
+    except Exception:
+        pass
 
 
 def clean_stale_lock():
@@ -109,6 +156,8 @@ def main():
 
     BASE.mkdir(parents=True, exist_ok=True)
     clean_stale_lock()
+    attempt = bump_attempt()
+    log("attempt #%d today (max %d)" % (attempt, MAX_ATTEMPTS_PER_DAY))
 
     nonce = "%d-%d" % (int(time.time()), os.getpid())
     try:
@@ -156,22 +205,32 @@ def main():
         detail = "\n".join(lines)
 
         if status == "renewed":
+            clear_attempt()
             notify("【Woiden d11】续期成功", "自动续期已完成。\n" + detail)
             print("[QLRUN_RESULT] SUCCESS")
             return 0
         if status == "not_due":
+            clear_attempt()
             notify("【Woiden d11】未到续期窗口", "本次仅检查，未提交续期。\n" + detail)
             print("[QLRUN_RESULT] SUCCESS")
             return 0
         if status == "ok":
+            clear_attempt()
             notify("【Woiden d11】检查通过", "VPS 状态正常，本次未提交续期。\n" + detail)
             print("[QLRUN_RESULT] SUCCESS")
             return 0
 
-        retry = 1 if status in RETRYABLE else 0
+        stage = result.get("stage") or ""
+        can_retry = (status in ("needs_human_verification", "needs_manual_renewal")
+                     and stage in RETRYABLE_STAGES
+                     and attempt < MAX_ATTEMPTS_PER_DAY)
+        retry = 1 if can_retry else 0
+        log("stage=%s attempt=%d/%d retryable=%d" % (
+            stage, attempt, MAX_ATTEMPTS_PER_DAY, retry))
         notify("【Woiden d11】%s" % label,
                "自动续期未完成，需要处理。\n状态：%s\n%s" % (status, detail))
-        print("[QLRUN_RESULT] FAILURE retryable=%d reason=%s" % (retry, status))
+        print("[QLRUN_RESULT] FAILURE retryable=%d reason=%s stage=%s attempt=%d/%d"
+              % (retry, status, stage, attempt, MAX_ATTEMPTS_PER_DAY))
         return 1
     finally:
         try:

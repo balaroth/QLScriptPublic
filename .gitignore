@@ -14,3 +14,13 @@ daily/*_token_cache.json
 **/.backup-*/
 wxapp/*_cache.json
 jd/fruit_helpcode_new
+
+# 运行时状态文件（含 openid / 写次数 / 冷却记录），不入库
+wxapp/*_state.json
+backup/**/*_state.json
+
+# 凭据缓存（含 token / uid），任何目录都不入库
+*_token_cache.json
+
+# backup 下的时间戳快照目录，只留本地
+backup/*-20*/

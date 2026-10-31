@@ -700,6 +700,8 @@ def grid_cells(bf, n):
     可以 drawImage 后按网格裁切再 toDataURL。纯 JS 计算，不经过渲染管线。
     """
     cols = int(round(n ** 0.5))
+    if cols * cols != n:
+        return []
     js = """() => {
       const cols = %d;
       const imgs = Array.from(document.querySelectorAll('td img'));
@@ -736,7 +738,7 @@ def grid_cells(bf, n):
     return out
 
 
-def ask_cells(pngs, target, workers=4, retries=2):
+def ask_cells(pngs, target, workers=4, retries=2, deadline=None):
     """
     并发问每一格「有没有 target」，返回与 pngs 等长的列表（True/False/None）。
 
@@ -751,6 +753,9 @@ def ask_cells(pngs, target, workers=4, retries=2):
 
     def one(i):
         for attempt in range(retries + 1):
+            # deadline 是绝对时间戳：超了就不再发起新调用，避免整轮撞上 worker 520s 上限
+            if deadline and time.time() > deadline:
+                return i, None
             v = ask_cell(pngs[i], target)
             if v is not None:
                 return i, v
@@ -954,7 +959,9 @@ def solve_recaptcha_v2(page, max_rounds=3):
         except Exception:
             n_td = 0
         log.append({"round": rnd, "td_count": n_td})
-        if n_td not in (9, 16):
+        # reCAPTCHA 实际会出 2x2 / 3x3 / 4x4 三种网格。只认 9 和 16 会在
+        # 出现 4 格时连续 3 轮直接 continue，最终 token 恒 0。
+        if n_td not in (4, 9, 16):
             page.wait_for_timeout(2000)
             continue
         # 主路径：逐格问 yes/no。整图问「点哪几格」会被模型当成 CAPTCHA 拒答。
@@ -965,17 +972,28 @@ def solve_recaptcha_v2(page, max_rounds=3):
         log.append({"round": rnd, "target": target})
         cells = []
         if target:
+            # 时间预算：整个 v2 阶段最多 200 秒。worker 是 520 秒硬超时，
+            # 前面还有数学验证码、Telegram 取码、stage1 表单，必须留足余量。
+            deadline = t_start + 200
             grid = grid_cells(bf, n_td)
             if len(grid) != n_td:
                 log.append({"round": rnd, "grid_fallback": len(grid)})
-                grid = [cell_image(bf, i) for i in range(n_td)]
+                grid = []
+                for i in range(n_td):
+                    if time.time() > deadline:
+                        log.append("time_budget_hit")
+                        break
+                    grid.append(cell_image(bf, i))
+                grid += [None] * (n_td - len(grid))
             idx = [i for i, g in enumerate(grid) if g]
-            verdicts = ask_cells([grid[i] for i in idx], target) if idx else []
+            verdicts = ask_cells([grid[i] for i in idx], target,
+                                 deadline=deadline) if idx else []
             for k, v in zip(idx, verdicts):
                 if v:
                     cells.append(k + 1)
             log.append({"round": rnd, "cells": cells,
-                        "unknown": sum(1 for v in verdicts if v is None)})
+                        "unknown": sum(1 for v in verdicts if v is None),
+                        "elapsed": round(time.time() - t_start)})
 
         if not cells:
             # 后备：老的整图识别。目标词读不到、或逐格全否时才走这里。

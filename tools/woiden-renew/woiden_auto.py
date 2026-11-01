@@ -789,6 +789,179 @@ def ask_cells(pngs, target, workers=4, retries=2, deadline=None, loose=False):
     return res
 
 
+def grid_stitched(bf, n, scale=2):
+    """
+    把整张挑战图放大 scale 倍并叠加编号网格，输出**单张** PNG。
+
+    为什么需要：ask_cells 每格一次视觉调用，9 格 9 次、16 格 16 次上传，
+    上游「文件上传上限」配额在半轮之内就被打满，表现为 throttled=1 加一大片
+    unknown，判定必然残缺，点出去的集合不可能是对的。拼成一张后整轮只消耗
+    1 次配额。
+
+    为什么带编号：模型必须能说出「第几格」，否则拿不到可点击的索引。编号框
+    画在每格左上角，占位很小，不遮挡主体内容。
+
+    为什么放大 2 倍：单格只有 100x100（原图 300x300 切 9 份），模型对这么小的
+    目标经常答不出来；双三次放大不增加信息量，但实测更稳。
+
+    返回 PNG bytes；失败返回 None。
+    """
+    cols = int(round(n ** 0.5))
+    if cols * cols != n:
+        return None
+    js = """() => {
+      const cols = %d, s = %d;
+      const imgs = Array.from(document.querySelectorAll('td img'));
+      if (!imgs.length) return {err: 'no img'};
+      const img = imgs[0];
+      const W0 = img.naturalWidth || 300, H0 = img.naturalHeight || 300;
+      const W = W0 * s, H = H0 * s;
+      const cv = document.createElement('canvas');
+      cv.width = W; cv.height = H;
+      const ctx = cv.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      try { ctx.drawImage(img, 0, 0, W, H); } catch (e) { return {err: 'draw:' + e.name}; }
+      const cw = W / cols, ch = H / cols;
+      const fs = Math.max(14, Math.round(ch * 0.20));
+      ctx.font = 'bold ' + fs + 'px sans-serif';
+      ctx.textBaseline = 'top';
+      for (let i = 0; i < cols * cols; i++) {
+        const r = Math.floor(i / cols), c = i %% cols;
+        const x = c * cw, y = r * ch;
+        ctx.strokeStyle = 'rgba(0,255,0,0.95)';
+        ctx.lineWidth = Math.max(2, Math.round(s));
+        ctx.strokeRect(x + 1, y + 1, cw - 2, ch - 2);
+        ctx.fillStyle = 'rgba(0,0,0,0.72)';
+        ctx.fillRect(x + 3, y + 3, Math.round(fs * 1.4), Math.round(fs * 1.3));
+        ctx.fillStyle = '#00ff00';
+        ctx.fillText(String(i + 1), x + 5, y + 4);
+      }
+      try { return {img: cv.toDataURL('image/png')}; } catch (e) { return {err: 'png:' + e.name}; }
+    }""" % (cols, scale)
+    try:
+        res = bf.locator("html").evaluate(js)
+    except Exception:
+        return None
+    if not isinstance(res, dict) or "img" not in res:
+        return None
+    try:
+        return base64.b64decode(res["img"].split(",", 1)[1])
+    except Exception:
+        return None
+
+
+def ask_stitched(png_bytes, n, target):
+    """
+    一次问完整张带编号的拼图，返回 1-based 格子编号列表。
+
+    返回值语义（调用方必须区分）：
+      list  —— 模型的判定；[] 表示模型明确说没有格子命中
+      None  —— 拒答或接口失败，必须回退到单格模式
+      "throttled" —— 配额打满，不要再发任何图片请求
+    """
+    key = KEY_PATH.read_text().strip()
+    img = base64.b64encode(png_bytes).decode()
+    side = int(round(n ** 0.5))
+    prompt = (
+        "This is one photograph divided into a %dx%d grid. Every cell has a small green "
+        "number in its top-left corner.\n"
+        "List every cell number whose part of the photo contains a %s. "
+        "Answer with the numbers only, separated by commas, for example: 2, 5, 9. "
+        "If none of them contain a %s, answer exactly: none"
+        % (side, side, target, target)
+    )
+    payload = {"model": VISION_MODEL, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}},
+    ]}]}
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(VISION_API, data=json.dumps(payload).encode(),
+                                 headers={"Authorization": "Bearer " + key,
+                                          "Content-Type": "application/json"})
+    try:
+        r = urllib.request.urlopen(req, timeout=120)
+        body = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        txt = ""
+        try:
+            txt = e.read().decode()[:600]
+        except Exception:
+            pass
+        if e.code == 429 or "throttled" in txt or "上传上限" in txt:
+            return "throttled"
+        return None
+    except Exception:
+        return None
+    c = (body.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    c = re.sub(r"</?escape>", "", c).strip()
+    low = c.lower()
+    # 拒答检测：模型面对九宫格常回 "I can't solve CAPTCHA..."，命中就回退
+    if "can't" in low or "cannot" in low or "unable" in low or "sorry" in low:
+        return None
+    if "none" in low:
+        return []
+    nums = [int(x) for x in re.findall(r"\d+", c)]
+    return sorted({x for x in nums if 1 <= x <= n})
+
+
+def judge_cells_stitched(bf, n_td, target, log, rnd):
+    """拼图主路径：消耗 1 次配额。失败/拒答返回 None，让调用方回退单格。"""
+    png = grid_stitched(bf, n_td)
+    if not png:
+        log.append({"round": rnd, "stitched": "no_png"})
+        return None
+    ans = ask_stitched(png, n_td, target)
+    if ans == "throttled":
+        log.append({"round": rnd, "stitched": "throttled"})
+        return None
+    if ans is None:
+        log.append({"round": rnd, "stitched": "refused"})
+        return None
+    log.append({"round": rnd, "stitched": ans})
+    return ans
+
+
+def judge_cells_single(bf, n_td, target, deadline, t_start, log, rnd):
+    """单格逐判（旧主路径，现作回退）：9/16 次配额，慢但能拿到逐格三态。"""
+    cells = []
+    grid = grid_cells(bf, n_td)
+    if len(grid) != n_td:
+        log.append({"round": rnd, "grid_fallback": len(grid)})
+        grid = []
+        for i in range(n_td):
+            if time.time() > deadline:
+                log.append("time_budget_hit")
+                break
+            grid.append(cell_image(bf, i))
+        grid += [None] * (n_td - len(grid))
+    idx = [i for i, g in enumerate(grid) if g]
+    pngs = [grid[i] for i in idx]
+    verdicts = ask_cells(pngs, target, deadline=deadline) if pngs else []
+    yes = [idx[k] + 1 for k, v in enumerate(verdicts) if v == "yes"]
+    maybe = [idx[k] + 1 for k, v in enumerate(verdicts) if v == "maybe"]
+    throttled = sum(1 for v in verdicts if v == "throttled")
+    log.append({"round": rnd, "yes": yes, "maybe": maybe,
+                "unknown": sum(1 for v in verdicts if v is None),
+                "throttled": throttled,
+                "elapsed": round(time.time() - t_start)})
+    if yes:
+        cells = yes
+    elif maybe:
+        # 没有明确 yes，但有模棱两可的格子：先按 maybe 提交。
+        # 即使选错，reCAPTCHA 也会换一张新图，比直接 break 多一次机会。
+        cells = maybe
+    elif pngs and not throttled and time.time() < deadline:
+        # 全判 no：多半是 100x100 小图里目标只露一角，换宽松措辞复判一次
+        verdicts2 = ask_cells(pngs, target, deadline=deadline, loose=True)
+        loose_hit = [idx[k] + 1 for k, v in enumerate(verdicts2)
+                     if v in ("yes", "maybe")]
+        log.append({"round": rnd, "loose_retry": loose_hit})
+        cells = loose_hit
+    return cells
+
+
 def cell_image(bf, idx):
     """
     取第 idx 格（0 基）的图片字节。
@@ -1021,39 +1194,11 @@ def solve_recaptcha_v2(page, max_rounds=3):
             # 时间预算：整个 v2 阶段最多 200 秒。worker 是 520 秒硬超时，
             # 前面还有数学验证码、Telegram 取码、stage1 表单，必须留足余量。
             deadline = t_start + 200
-            grid = grid_cells(bf, n_td)
-            if len(grid) != n_td:
-                log.append({"round": rnd, "grid_fallback": len(grid)})
-                grid = []
-                for i in range(n_td):
-                    if time.time() > deadline:
-                        log.append("time_budget_hit")
-                        break
-                    grid.append(cell_image(bf, i))
-                grid += [None] * (n_td - len(grid))
-            idx = [i for i, g in enumerate(grid) if g]
-            pngs = [grid[i] for i in idx]
-            verdicts = ask_cells(pngs, target, deadline=deadline) if pngs else []
-            yes = [idx[k] + 1 for k, v in enumerate(verdicts) if v == "yes"]
-            maybe = [idx[k] + 1 for k, v in enumerate(verdicts) if v == "maybe"]
-            throttled = sum(1 for v in verdicts if v == "throttled")
-            log.append({"round": rnd, "yes": yes, "maybe": maybe,
-                        "unknown": sum(1 for v in verdicts if v is None),
-                        "throttled": throttled,
-                        "elapsed": round(time.time() - t_start)})
-            if yes:
-                cells = yes
-            elif maybe:
-                # 没有明确 yes，但有模棱两可的格子：先按 maybe 提交。
-                # 即使选错，reCAPTCHA 也会换一张新图，比直接 break 多一次机会。
-                cells = maybe
-            elif pngs and not throttled and time.time() < deadline:
-                # 全判 no：多半是 100x100 小图里目标只露一角，换宽松措辞复判一次
-                verdicts2 = ask_cells(pngs, target, deadline=deadline, loose=True)
-                loose_hit = [idx[k] + 1 for k, v in enumerate(verdicts2)
-                             if v in ("yes", "maybe")]
-                log.append({"round": rnd, "loose_retry": loose_hit})
-                cells = loose_hit
+            # 主路径：整图拼合一次问，整轮只烧 1 次上传配额。
+            # 回退：拼图被拒答或接口失败时才走单格逐判（9/16 次配额）。
+            cells = judge_cells_stitched(bf, n_td, target, log, rnd)
+            if cells is None:
+                cells = judge_cells_single(bf, n_td, target, deadline, t_start, log, rnd)
 
         if not cells:
             # 后备：老的整图识别。目标词读不到、或逐格全否时才走这里。

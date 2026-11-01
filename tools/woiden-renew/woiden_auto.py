@@ -56,6 +56,12 @@ URL_RENEW = "https://woiden.id/vps-renew"     # 续期第一步
 URL_CODE = "https://woiden.id/vps-renew-code"  # 续期第二步，填 Telegram 收到的码
 VISION_API = "http://127.0.0.1:40337/v1/chat/completions"  # d3 本机的视觉模型服务
 VISION_MODEL = "gpt-5.6"
+# 人工判定通道：拼图被拒答或配额打满时，把带编号的挑战图导出到 artifacts/，
+# 轮询 manual-answer.json 等外部写入格子编号，彻底绕开视觉上传配额。
+MANUAL = os.environ.get("WOIDEN_MANUAL") == "1"
+MANUAL_TIMEOUT = int(os.environ.get("WOIDEN_MANUAL_TIMEOUT", "120"))
+# 仅用于验证人工通道本身：跳过拼图自动判定，直接导出图片等人给答案
+FORCE_MANUAL = os.environ.get("WOIDEN_FORCE_MANUAL") == "1"
 
 # 剩余天数低于此值才真正提交续期。
 # 关键业务事实：Woiden 续期后到期日不是「原到期日 + 2 天」，而是重置为
@@ -923,6 +929,84 @@ def judge_cells_stitched(bf, n_td, target, log, rnd):
     return ans
 
 
+def judge_cells_manual(bf, n_td, target, log, rnd, timeout=None):
+    """
+    人工判定通道：导出带编号的挑战图，等外部写入 manual-answer.json。
+
+    为什么需要：视觉接口走 /backend-api/files，上游「文件上传上限」按 8 小时
+    滚动窗口计数，实测整个窗口只有约 30 次额度。逐格投票、甚至一轮 16 格
+    都能把它吃光，之后 8 小时什么都做不了。这条通道一张图都不上传，只把
+    图片落到本地磁盘，由外部（人或其他视觉通道）给出格子编号。
+
+    协议：
+      写 artifacts/manual-<ts>.png         带编号的整图
+      写 artifacts/manual-request.json     {"round","n","target","image","at"}
+      读 artifacts/manual-answer.json      {"cells": [1,4,7]}
+      读到后删除 answer 文件，返回 1-based 编号列表；超时返回 None。
+
+    timeout 默认取 MANUAL_TIMEOUT。reCAPTCHA 挑战本身约 2 分钟失效，
+    所以不要设得太长。
+    """
+    timeout = MANUAL_TIMEOUT if timeout is None else timeout
+    png = grid_stitched(bf, n_td, scale=2)
+    if not png:
+        log.append({"round": rnd, "manual": "no_png"})
+        return None
+    try:
+        ART.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    cap = ART / ("manual-%s.png" % time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        cap.write_bytes(png)
+    except Exception as e:
+        log.append({"round": rnd, "manual": "write_fail:" + str(e)[:60]})
+        return None
+    ans = ART / "manual-answer.json"
+    req = ART / "manual-request.json"
+    try:
+        ans.unlink()
+    except Exception:
+        pass
+    try:
+        req.write_text(json.dumps({"round": rnd, "n": n_td, "target": target,
+                                   "image": str(cap), "at": now_iso()}, ensure_ascii=False))
+    except Exception:
+        pass
+    log.append({"round": rnd, "manual_wait": str(cap)})
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if ans.exists():
+            try:
+                d = json.loads(ans.read_text())
+                raw = d.get("cells", [])
+                cells = []
+                for x in raw:
+                    try:
+                        v = int(x)
+                    except Exception:
+                        continue
+                    if 1 <= v <= n_td:
+                        cells.append(v)
+                cells = sorted(set(cells))
+                log.append({"round": rnd, "manual_cells": cells})
+                try:
+                    ans.unlink()
+                except Exception:
+                    pass
+                return cells
+            except Exception as e:
+                log.append({"round": rnd, "manual_bad": str(e)[:80]})
+                try:
+                    ans.unlink()
+                except Exception:
+                    pass
+                return None
+        time.sleep(2)
+    log.append({"round": rnd, "manual": "timeout"})
+    return None
+
+
 def judge_cells_single(bf, n_td, target, deadline, t_start, log, rnd):
     """单格逐判（旧主路径，现作回退）：9/16 次配额，慢但能拿到逐格三态。"""
     cells = []
@@ -1196,7 +1280,11 @@ def solve_recaptcha_v2(page, max_rounds=3):
             deadline = t_start + 200
             # 主路径：整图拼合一次问，整轮只烧 1 次上传配额。
             # 回退：拼图被拒答或接口失败时才走单格逐判（9/16 次配额）。
-            cells = judge_cells_stitched(bf, n_td, target, log, rnd)
+            cells = None
+            if not FORCE_MANUAL:
+                cells = judge_cells_stitched(bf, n_td, target, log, rnd)
+            if cells is None and MANUAL:
+                cells = judge_cells_manual(bf, n_td, target, log, rnd)
             if cells is None:
                 cells = judge_cells_single(bf, n_td, target, deadline, t_start, log, rnd)
 
@@ -1220,18 +1308,38 @@ def solve_recaptcha_v2(page, max_rounds=3):
         log.append({"round": rnd, "click": cells})
         if not cells:
             break
+        clicked = []
         for c in cells:
             # 渲染挂起后 Playwright 的 click 会卡到超时（要求可见+稳定+可交互），
             # 但 JS click 只派发事件、不依赖渲染状态，所以这里反过来：JS 优先。
-            try:
-                bf.locator("td").nth(c - 1).evaluate("el => el.click()")
-                page.wait_for_timeout(300)
-            except Exception:
+            # 2026-11-01 实测：日志记了 click=[1,4,5,8]，截图里只有 2 格真的变成
+            # 选中态，另外两次点击静默失败。所以每次点击后都要回读选中状态，
+            # 没生效就重试，最终把实际生效的格子单独记下来。
+            ok_click = False
+            for _try in range(3):
                 try:
-                    bf.locator("td").nth(c - 1).click(timeout=5000)
-                    page.wait_for_timeout(300)
-                except Exception as e:
-                    log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
+                    bf.locator("td").nth(c - 1).evaluate("el => el.click()")
+                except Exception:
+                    try:
+                        bf.locator("td").nth(c - 1).click(timeout=4000)
+                    except Exception as e:
+                        log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
+                page.wait_for_timeout(280)
+                try:
+                    ok_click = bool(bf.locator("td").nth(c - 1).evaluate(
+                        "el => el.getAttribute('aria-checked') === 'true'"
+                        " || el.classList.contains('selected')"
+                        " || !!el.querySelector('.rc-imageselect-checkbox--checked')"
+                        " || !!el.querySelector('.rc-imageselect-tile-selected')"))
+                except Exception:
+                    ok_click = None
+                if ok_click:
+                    break
+            if ok_click:
+                clicked.append(c)
+            else:
+                log.append("cell_click_unconfirmed_%d" % c)
+        log.append({"round": rnd, "clicked_confirmed": clicked})
         try:
             btn = bf.locator("#recaptcha-verify-button")
             btn.wait_for(state="attached", timeout=10000)

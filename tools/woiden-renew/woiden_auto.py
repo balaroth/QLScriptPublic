@@ -49,13 +49,19 @@ BASE = Path("/opt/woiden-renew")          # 宿主工作目录，与本文件同
 ART = BASE / "artifacts"                  # 失败时的证据截图，供人工排查
 STATE = BASE / "state"                    # 预留状态目录
 TPL_PATH = BASE / "digit_templates.json"  # 数学验证码数字模板
-KEY_PATH = BASE / "secrets" / "chatgpt2api.key"  # 视觉模型密钥（不入 git）
+# 视觉模型密钥。默认用 d3 上 deepseek-v4.1-flash 的 key，
+# 该通道实测无文件上传配额；要切回 chatgpt2api 时用环境变量覆盖三个常量。
+KEY_PATH = Path(os.environ.get("WOIDEN_VISION_KEY") or (BASE / "secrets" / "eta_vision.key"))
 CDP = "http://127.0.0.1:9222"             # 常驻 Chromium 的调试端口，只监听本机
 URL_INFO = "https://woiden.id/vps-info"       # 状态页，读到期日
 URL_RENEW = "https://woiden.id/vps-renew"     # 续期第一步
 URL_CODE = "https://woiden.id/vps-renew-code"  # 续期第二步，填 Telegram 收到的码
-VISION_API = "http://127.0.0.1:40337/v1/chat/completions"  # d3 本机的视觉模型服务
-VISION_MODEL = "gpt-5.6"
+# 视觉后端。默认 d3 上的 deepseek-v4.1-flash（端口 30011）：
+# 实测支持图片输入，连发 10 次无配额限制，判定与人工一致。
+# 旧通道 40337（gpt-5.6）走 /backend-api/files，上游「文件上传上限」
+# 8 小时约 30 次，已降为备选，可用环境变量切回。
+VISION_API = os.environ.get("WOIDEN_VISION_API", "http://127.0.0.1:30011/v1/chat/completions")
+VISION_MODEL = os.environ.get("WOIDEN_VISION_MODEL", "deepseek-v4.1-flash")
 # 人工判定通道：拼图被拒答或配额打满时，把带编号的挑战图导出到 artifacts/，
 # 轮询 manual-answer.json 等外部写入格子编号，彻底绕开视觉上传配额。
 MANUAL = os.environ.get("WOIDEN_MANUAL") == "1"
@@ -695,11 +701,9 @@ def grid_cells(bf, n):
     为什么不用 locator.screenshot()：
       2026-10-31 实测，挑战挂起约 2 分钟后 Chromium 合成器进入挂起状态，
       Playwright 所有截屏都卡在 "attempting to take screenshot" 直到 30 秒超时
-      （错误里 fonts 明明已经 loaded，问题不在字体）。16 格 × 30 秒直接烧光
       时间预算，token 恒为 0，最终误报 needs_human_verification。
 
     为什么不直接下载 img.src：
-      实测 9 格与 16 格布局下，所有 td 的 <img> 都指向**同一张 300×300 整图**
       （靠 CSS 裁剪显示各格）。直接下载得到的是整图，模型会把每一格都答 yes。
 
     canvas 方案：img 与 bframe 同源（都是 recaptcha.net），canvas 不会被 taint，
@@ -1053,7 +1057,6 @@ def cell_image(bf, idx):
     为什么不直接 locator.screenshot()：
       2026-10-31 实测，挑战挂起约 2 分钟后 Chromium 合成器进入挂起状态，
       Playwright 的所有截屏都卡在 "attempting to take screenshot" 直到 30 秒超时
-      （错误里 fonts 明明已经 loaded，问题不在字体）。16 格 × 30 秒直接把时间预算
       烧光，token 恒为 0，最终误报 needs_human_verification。
       而每个 td 里的 <img> 指向 recaptcha 的 payload URL，可以直接 HTTP 下载：
       实测 0.2 秒一张、约 26KB JPEG，完全绕开渲染管线。

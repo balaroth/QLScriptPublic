@@ -24,3 +24,7 @@ backup/**/*_state.json
 
 # backup 下的时间戳快照目录，只留本地
 backup/*-20*/
+
+# 凭据目录（视觉模型 key 等），绝不入库
+secrets/
+**/secrets/

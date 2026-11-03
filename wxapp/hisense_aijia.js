@@ -781,7 +781,7 @@ class Task {
     }
 
     async run(isRetry = false) {
-        summary.accounts++;
+        if (!isRetry) summary.accounts++;
         try {
             await this.ensureLogin();
             this.log(`登录态 OK`);

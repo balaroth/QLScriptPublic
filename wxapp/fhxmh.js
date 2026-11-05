@@ -111,29 +111,36 @@ function readState() {
 function writeStateAtomic(state) {
     if (READ_ONLY) return false;
     const tmp = STATE_FILE + ".tmp." + process.pid + "." + Date.now() + "." + Math.random().toString(36).slice(2);
-    const payload = JSON.stringify(state);
-    const fd = fs.openSync(tmp, "w", 0o600);
+    const payload = Buffer.from(JSON.stringify(state), "utf8");
+    let fd = -1;
     try {
-        fs.writeSync(fd, payload);
+        fd = fs.openSync(tmp, "w", 0o600);
+        /* writeAll loop: Node short-write is possible without throw */
+        let off = 0;
+        while (off < payload.length) {
+            const n = fs.writeSync(fd, payload, off, payload.length - off);
+            if (typeof n !== "number" || n <= 0 || n > payload.length - off) { const e = new Error("state short write"); e.stateCorrupt = true; throw e; }
+            off += n;
+        }
         fs.fsyncSync(fd);
-    } finally { fs.closeSync(fd); }
-    try { fs.renameSync(tmp, STATE_FILE); }
-    catch (e) { try { fs.unlinkSync(tmp); } catch {} throw e; }
-    /* dir fsync where supported */
-    try {
+        fs.closeSync(fd); fd = -1;
+        fs.renameSync(tmp, STATE_FILE);
+        /* dir fsync must not be swallowed: fail-closed after rename */
         const dfd = fs.openSync(path.dirname(STATE_FILE), "r");
         try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
-    } catch {}
-    /* strict readback */
-    const back = fs.readFileSync(STATE_FILE, "utf8");
-    const parsed = JSON.parse(back);
-    if (!parsed || parsed._schema !== SCHEMA_VERSION || typeof parsed.entries !== "object") {
-        const err = new Error("state readback mismatch"); err.stateCorrupt = true; throw err;
+        /* strict readback: raw bytes exact */
+        const back = fs.readFileSync(STATE_FILE);
+        if (!back.equals(payload)) { const e = new Error("state readback byte mismatch"); e.stateCorrupt = true; throw e; }
+        const parsed = JSON.parse(back.toString("utf8"));
+        if (!parsed || parsed._schema !== SCHEMA_VERSION || typeof parsed.entries !== "object") {
+            const e = new Error("state readback schema mismatch"); e.stateCorrupt = true; throw e;
+        }
+        return true;
+    } catch (e) {
+        if (fd >= 0) { try { fs.closeSync(fd); } catch {} }
+        try { fs.unlinkSync(tmp); } catch {}
+        throw e;
     }
-    if (JSON.stringify(parsed) !== payload) {
-        const err = new Error("state readback content mismatch"); err.stateCorrupt = true; throw err;
-    }
-    return true;
 }
 function acquireLock() {
     if (READ_ONLY) return { locked: true, release: () => {} };
@@ -246,6 +253,7 @@ class FeiheMom {
         const data = member.data;
         if (!Object.prototype.hasOwnProperty.call(data, "points")) throw new Error("memberInfo.data.points 缺失");
         const score = data.points;
+        if (typeof score !== "number" || !Number.isFinite(score) || score < 0) throw new Error(`memberInfo.points 非法: ${typeof score}`);
         return `积分=${score}`;
     }
 
@@ -281,14 +289,20 @@ class FeiheMom {
     }
 
     async doSign(activityId) {
-        const sign = await this.api({ method: "POST", path: "/c/activity/todo/checkIn", data: { activityId, mockTime: Date.now() }, allowFail: true });
-        if (SIGN_OK_CODES.includes(String(sign?.code)) && (sign?.success === undefined || sign?.success === true)) return { ok: true, credits: sign?.data?.credits };
-        if (String(sign?.code) === "A00001") {
-            return { ok: true, already: true };
+        /* returns classification; never throws definite — runAccount always re-checks authority */
+        let sign;
+        try {
+            sign = await this.api({ method: "POST", path: "/c/activity/todo/checkIn", data: { activityId, mockTime: Date.now() }, allowFail: true });
+        } catch (e) {
+            return { classification: "transport_error", error: e };
         }
-        const e = new Error(`签到业务拒绝: ${short(sign)}`);
-        e.definite = true;
-        throw e;
+        if (SIGN_OK_CODES.includes(String(sign?.code)) && (sign?.success === undefined || sign?.success === true)) {
+            return { classification: "ok", credits: sign?.data?.credits };
+        }
+        if (String(sign?.code) === "A00001") {
+            return { classification: "already" };
+        }
+        return { classification: "rejected", code: sign?.code };
     }
 }
 
@@ -320,7 +334,10 @@ async function runAccount(openid, index, state) {
         if (chk1.todaySigned) {
             runner.outcome = "already";
             summary.done++; summary.already++;
-            if (!READ_ONLY) persistStateLocked(entryKey, { alias, action, day, activityId: chk1.activityId, status: "success", attempts: 0, ts: Date.now(), authorityConfirmed: true });
+            if (!READ_ONLY) {
+                const prev0 = state.entries[entryKey] || {};
+                persistStateLocked(entryKey, { alias, action, day, activityId: chk1.activityId, status: "success", attempts: prev0.attempts || 0, recoverCount: prev0.recoverCount || 0, ts: Date.now(), authorityConfirmed: true });
+            }
             $.log(`[${alias}] 今日已签 activity=${chk1.activityId}`);
             return;
         }
@@ -380,41 +397,37 @@ async function runAccount(openid, index, state) {
             });
             summary.writeAttempted++;
 
-            try {
-                const r = await runner.doSign(chk1.activityId);
-                // post-write authority
-                let chk3;
-                try { chk3 = await runner.fetchCheckIn(); }
-                catch (e) { chk3 = null; }
-                if (chk3 && chk3.todaySigned) {
-                    runner.outcome = "success"; summary.done++;
-                    mergeStateEntry(entryKey, {
-                        alias, action, day, activityId: chk1.activityId, status: "success",
-                        attempts: (prev.attempts || 0) + 1, recoverCount: prev.recoverCount || 0,
-                        ts: Date.now(), authorityConfirmed: true,
-                    });
-                } else {
-                    runner.outcome = "write_unknown"; runner.retryable = 0; summary.fail++; summary.ambiguous++;
-                    mergeStateEntry(entryKey, {
-                        alias, action, day, activityId: chk1.activityId, status: "unknown",
-                        attempts: (prev.attempts || 0) + 1, recoverCount: (prev.recoverCount || 0) + 1,
-                        ts: Date.now(), authorityConfirmed: false,
-                    });
-                }
-            } catch (e) {
-                if (e.definite) {
-                    runner.outcome = "failed"; runner.retryable = 0; summary.fail++;
-                    mergeStateEntry(entryKey, {
-                        alias, action, day, activityId: chk1.activityId, status: "failed",
-                        attempts: (prev.attempts || 0) + 1, recoverCount: prev.recoverCount || 0, ts: Date.now(),
-                    });
-                } else {
-                    runner.outcome = "write_unknown"; runner.retryable = 0; summary.fail++; summary.ambiguous++;
-                    mergeStateEntry(entryKey, {
-                        alias, action, day, activityId: chk1.activityId, status: "unknown",
-                        attempts: (prev.attempts || 0) + 1, recoverCount: prev.recoverCount || 0, ts: Date.now(),
-                    });
-                }
+            const post = await runner.doSign(chk1.activityId);
+            /* always post-write authority, never second POST */
+            let chk3 = null;
+            let authErr = null;
+            try { chk3 = await runner.fetchCheckIn(); } catch (e) { authErr = e; chk3 = null; }
+            if (chk3 && chk3.todaySigned) {
+                runner.outcome = "success"; summary.done++;
+                mergeStateEntry(entryKey, {
+                    alias, action, day, activityId: chk1.activityId, status: "success",
+                    attempts: (prev.attempts || 0) + 1, recoverCount: prev.recoverCount || 0,
+                    ts: Date.now(), authorityConfirmed: true,
+                });
+            } else if (post.classification === "rejected" && !authErr) {
+                /* server said rejected AND authority confirms unsigned → definite failed */
+                runner.outcome = "failed"; runner.retryable = 0; summary.fail++;
+                const safeCode = String(post.code || "unknown").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 20);
+                summary.reason = `checkin_rejected_${safeCode}`;
+                mergeStateEntry(entryKey, {
+                    alias, action, day, activityId: chk1.activityId, status: "failed",
+                    attempts: (prev.attempts || 0) + 1, recoverCount: prev.recoverCount || 0,
+                    ts: Date.now(),
+                });
+            } else {
+                /* transport error / authority read failed / post response ambiguous → unknown */
+                runner.outcome = "write_unknown"; runner.retryable = 0; summary.fail++; summary.ambiguous++;
+                summary.reason = authErr ? "authority_unavailable" : (post.classification === "transport_error" ? "checkin_transport_error" : "write_unknown");
+                mergeStateEntry(entryKey, {
+                    alias, action, day, activityId: chk1.activityId, status: "unknown",
+                    attempts: (prev.attempts || 0) + 1, recoverCount: (prev.recoverCount || 0) + 1,
+                    ts: Date.now(), authorityConfirmed: false,
+                });
             }
         } finally { lock.release(); }
     } catch (e) {

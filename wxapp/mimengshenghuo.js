@@ -22,6 +22,39 @@ const $ = new Env("米萌生活");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const READ_ONLY = process.env.MIMENG_READ_ONLY === "1";
+$.done = async () => { if ($.sendMsg) await $.sendMsg(); };
+function dayKey() { return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10); }
+function atomicState(file, value) {
+    const bytes = Buffer.from(JSON.stringify(value));
+    const tmp = file + '.tmp.' + process.pid + '.' + crypto.randomBytes(6).toString('hex');
+    const fd = fs.openSync(tmp, 'wx', 0o600);
+    try {
+        let offset = 0;
+        while (offset < bytes.length) {
+            const n = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+            if (!Number.isInteger(n) || n <= 0 || n > bytes.length - offset) throw new Error('state short write');
+            offset += n;
+        }
+        fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, file);
+    const d = fs.openSync(path.dirname(file), 'r');
+    try { fs.fsyncSync(d); } finally { fs.closeSync(d); }
+    if (!fs.readFileSync(file).equals(bytes)) throw new Error('state readback mismatch');
+}
+function loadState(file) {
+    if (!fs.existsSync(file)) return { entries: {} };
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!d || typeof d !== 'object' || Array.isArray(d) || !d.entries || typeof d.entries !== 'object' || Array.isArray(d.entries)) throw new Error('invalid state');
+    for (const e of Object.values(d.entries)) {
+        if (!e || !Number.isInteger(e.attempts) || e.attempts < 1 || e.attempts > 2 || !['attempting','success','unknown'].includes(e.outcome) || typeof e.day !== 'string') throw new Error('invalid state entry');
+    }
+    return d;
+}
+function safeError(e) { return String(e?.message || e).replace(/eyJ[\w.-]+/g, '<jwt>').slice(0, 160); }
+
 
 const CK_NAME = "mimengshenghuo";
 const APP = { name: "米萌生活", appid: "wx9939a74ee8a8522a" };
@@ -169,26 +202,23 @@ class Mimeng {
         const cached = this.getCachedToken();
         if (cached) {
             this.token = cached;
-            $.log(`账号[${this.index}] 使用缓存token: ${maskToken(this.token)}`);
-            const ok = await this.checkToken();
-            if (ok) return;
-            $.log(`账号[${this.index}] 缓存token失效，重新登录`);
-            this.removeCachedToken();
+            if (await this.checkToken()) return;
+            this.token = '';
+            if (!READ_ONLY) this.removeCachedToken();
         }
-
-        const code = await getWxCode(this.openid);
-        const res = await this.gql(
-            `mutation codeLogin($client_id: String! $code: String!) {
-                login(client_id: $client_id, code: $code)
-            }`,
-            { client_id: APP.appid, code },
-            "",
-            true
-        );
-        const token = res?.data?.login || "";
-        if (!token) throw new Error(`登录未返回token: ${short(res)}`);
+        // Verified route: fresh runtime code, exchanged by the native request bridge.
+        const fresh = await request({method:'POST', url:WX_SERVER_URL+'/wx/runtime-code', headers:{auth:WX_AUTH}, data:{appid:APP.appid,openid:this.openid}, timeout:70000});
+        const code = fresh.data?.code || fresh.data?.data?.code;
+        if (fresh.status !== 200 || fresh.data?.status !== true || typeof code !== 'string' || !code) throw new Error('runtime code unavailable');
+        const query = 'mutation codeLogin($client_id: String! $code: String!) {login(client_id:$client_id,code:$code)}';
+        const exchange = await request({method:'POST',url:WX_SERVER_URL+'/wx/proxy',headers:{auth:WX_AUTH}, timeout:70000, data:{appid:APP.appid,openid:this.openid,url:GQL_URL,method:'POST',needCookie:false,headers:{'content-type':'application/json','x-provider-id':APP.appid},body:JSON.stringify({query,variables:{client_id:APP.appid,code},operationName:'codeLogin'})}});
+        const data = typeof exchange.data?.data === 'string' ? JSON.parse(exchange.data.data) : exchange.data?.data;
+        const token = data?.data?.login;
+        if (exchange.status !== 200 || exchange.data?.status !== true || exchange.data.statusCode !== 200 || data?.errors?.length || typeof token !== 'string' || !token) throw new Error('native login token unconfirmed');
         this.token = token;
-        $.log(`账号[${this.index}] 登录成功: ${maskToken(this.token)}`);
+        if (!(await this.checkToken())) throw new Error('native token unauthorized');
+        if (!READ_ONLY) this.saveCachedToken();
+        $.log(`账号[${this.index}] 原生会话登录成功`);
     }
 
     async checkToken() {
@@ -205,7 +235,9 @@ class Mimeng {
             this.token,
             true
         );
-        return Boolean(res?.data?.viewer?.uid);
+        if (res?.errors?.some(e => e?.message === 'Unauthenticated.')) return false;
+        if (!res || res.errors?.length || !res.data?.viewer || !res.data.viewer.uid) throw new Error('viewer authority unavailable');
+        return true;
     }
 
     async queryHome() {
@@ -252,14 +284,17 @@ class Mimeng {
             { client_id: APP.appid }
         );
 
-        this.viewer = res.data.viewer || {};
+        if (!res?.data?.viewer?.uid || !Array.isArray(res.data.viewer.todoActivityRecords)) throw new Error('home authority malformed');
+        this.viewer = res.data.viewer;
         this.socialApp = res.data.socialApp || {};
-        const records = this.viewer.todoActivityRecords || [];
-        this.checkIn = records.find((item) => item.activity?.name === "每日签到") || null;
+        const records = this.viewer.todoActivityRecords;
+        const signs = records.filter((item) => item.activity?.name === "每日签到");
+        if (signs.length !== 1 || typeof signs[0].completed_at_today !== 'boolean' || !Number.isInteger(signs[0].activity?.id)) throw new Error('unique daily checkin authority unavailable');
+        this.checkIn = signs[0];
         this.videoTask =
             records.find((item) => /视频/.test(item.activity?.name || "") || item.activity?.button_action === "seeVideo") || null;
 
-        $.log(`查询：uid=${this.viewer.uid || "未知"} 米豆=${this.viewer.wallet?.points ?? "未知"} 小程序=${this.socialApp.name || APP.name}`);
+        $.log(`查询：米豆=${this.viewer.wallet?.points ?? "未知"} 小程序=${this.socialApp.name || APP.name}`);
         if (this.checkIn) {
             $.log(
                 `签到任务：id=${this.checkIn.activity.id} 今日${this.checkIn.completed_at_today ? "已完成" : "未完成"} progress=${this.checkIn.progress}/${this.checkIn.activity.cycle_quota}`
@@ -307,6 +342,7 @@ class Mimeng {
     }
 
     async activityPush(activityId, label) {
+        if (READ_ONLY || !this.writePermit) throw new Error('activity mutation requires durable guard');
         const res = await this.gql(
             `mutation activity($activity_id: Int!) {
                 activityPush(id: $activity_id) {
@@ -333,10 +369,47 @@ class Mimeng {
         return `${label}失败：${result.message || short(result)}`;
     }
 
+    async guardedActivity(action, authority, write) {
+        if (READ_ONLY) throw new Error('readonly mutation blocked');
+        const hash = crypto.createHash('sha256').update(String(this.openid)).digest('hex');
+        const file = path.join(__dirname, `mimeng_actions_${hash}.json`), lock = file + '.lock';
+        const fd = fs.openSync(lock, 'wx', 0o600);
+        try {
+            const state = loadState(file), key = dayKey() + ':' + action;
+            const check = async () => { const v = await authority(); if (typeof v !== 'boolean') throw new Error('non-boolean authority'); return v; };
+            if (await check()) return;
+            const old = state.entries[key];
+            if (old) {
+                if (old.attempts >= 2) throw new Error('daily action attempts exhausted');
+                const at = Date.parse(old.attemptedAt);
+                if (!Number.isFinite(at) || Date.now() - at < 300000) throw new Error('unconfirmed action cooling');
+                await $.wait(500);
+                if (await check()) return;
+            }
+            state.entries[key] = { ...(old || {}), day: dayKey(), attempts: (old?.attempts || 0) + 1, outcome:'attempting', attemptedAt:new Date().toISOString() };
+            atomicState(file, state);
+            this.writeAttempted = true;
+            this.writePermit = true;
+            try { await write(); } catch (_) { /* Every attempted mutation is finalized by authority. */ } finally { this.writePermit = false; }
+            for (let i = 0; i < 3; i++) {
+                try { if (await check()) { state.entries[key].outcome = 'success'; atomicState(file, state); return; } } catch (_) {}
+                if (i < 2) await $.wait(500 * (i + 1));
+            }
+            state.entries[key].outcome = 'unknown'; atomicState(file, state);
+            throw new Error('mutation unconfirmed; no replay');
+        } finally { fs.closeSync(fd); fs.unlinkSync(lock); }
+    }
+
     async doSign() {
-        if (!this.checkIn) return "未找到签到任务";
-        if (this.checkIn.completed_at_today) return "今日已签到";
-        return this.activityPush(this.checkIn.activity.id, "签到");
+        if (!this.checkIn || typeof this.checkIn.completed_at_today !== 'boolean') throw new Error('checkin state unavailable');
+        if (this.checkIn.completed_at_today === true) return '今日已签到（权威确认）';
+        const id = this.checkIn.activity.id;
+        await this.guardedActivity('sign:' + id, async () => {
+            await this.queryHome();
+            if (this.checkIn.activity.id !== id) throw new Error('activity changed during sign');
+            return this.checkIn.completed_at_today;
+        }, () => this.activityPush(id, '签到'));
+        return '签到成功（权威回查确认）';
     }
 
     async doVideo() {
@@ -350,7 +423,16 @@ class Mimeng {
         const times = Math.max(0, Math.min(remaining, Number.isFinite(limit) ? limit : remaining));
         const results = [];
         for (let i = 0; i < times; i++) {
-            results.push(await this.activityPush(this.videoTask.activity.id, `视频任务[${i + 1}/${times}]`));
+            await this.queryHome();
+            const id = this.videoTask?.activity?.id, before = this.videoTask?.progress;
+            if (!Number.isInteger(id) || !Number.isInteger(before)) throw new Error('video progress authority invalid');
+            if (before >= total) break;
+            await this.guardedActivity('video:' + id + ':' + before, async () => {
+                await this.queryHome();
+                if (this.videoTask?.activity?.id !== id || !Number.isInteger(this.videoTask?.progress)) throw new Error('video authority changed');
+                return this.videoTask.progress > before;
+            }, () => this.activityPush(id, `视频任务[${i + 1}/${times}]`));
+            results.push('视频进度已权威确认');
             await $.wait(1200);
         }
         return results;
@@ -359,9 +441,12 @@ class Mimeng {
     async run() {
         await this.login();
         await this.queryHome();
+        if (READ_ONLY) { $.log(`只读权威验证：${this.checkIn.completed_at_today ? '已签' : '未签'}，零业务写`); return; }
         $.log(`签到：${await this.doSign()}`);
-        const videos = await this.doVideo();
-        for (const result of videos) $.log(`观看视频：${result}`);
+        try {
+            const videos = await this.doVideo();
+            for (const result of videos) $.log(`视频任务：${result}`);
+        } catch (e) { this.optionalFailed = 1; $.log(`可选视频未完成：${safeError(e)}`); }
         await this.queryHome();
         await this.pointsRecords();
         this.saveCachedToken();
@@ -369,29 +454,19 @@ class Mimeng {
 }
 
 async function runAccount(openid, index) {
-    $.log(`\n========== ${APP.name} 账号[${index}] ${openid} ==========`);
     const runner = new Mimeng(openid, index);
-    try {
-        await runner.run();
-    } catch (e) {
-        $.log(`账号[${index}] 执行失败：${e.message || e}`);
-    }
+    try { await runner.run(); return { failed:0, optional:runner.optionalFailed || 0, wrote:!!runner.writeAttempted }; }
+    catch (e) { $.log(`账号[${index}] 未完成：${safeError(e)}`); return { failed:1, optional:runner.optionalFailed || 0, wrote:!!runner.writeAttempted }; }
 }
 
 (async () => {
     const accounts = splitAccounts(process.env[CK_NAME] || DEFAULT_OPENID || "");
-    if (!accounts.length) {
-        $.log(`未配置 ${CK_NAME}`);
-        await $.done();
-        return;
-    }
-    $.log(`共找到${accounts.length}个账号`);
+    if (!accounts.length) throw new Error('no configured accounts');
+    let failed = 0, optional = 0, wrote = false;
     for (let i = 0; i < accounts.length; i++) {
-        await runAccount(accounts[i], i + 1);
-        await $.wait(800);
+        const r = await runAccount(accounts[i], i + 1);
+        failed += r.failed; optional += r.optional; wrote = wrote || r.wrote;
     }
-    await $.done();
-})().catch(async (e) => {
-    $.log(`脚本异常：${e.stack || e.message || e}`);
-    await $.done();
-});
+    $.log(`[QLRUN_RESULT] ${failed ? 'FAILURE' : 'SUCCESS'} accounts=${accounts.length} failed=${failed} optional_failed=${optional} retryable=${failed && !wrote ? 1 : 0} mode=${READ_ONLY ? 'readonly' : 'normal'}`);
+    if (failed) process.exitCode = 1;
+})().catch(e => { $.log(safeError(e)); $.log('[QLRUN_RESULT] FAILURE reason=script_error retryable=0'); process.exitCode = 1; }).finally(() => $.done());

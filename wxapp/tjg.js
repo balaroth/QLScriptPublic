@@ -22,6 +22,12 @@ cron: 9 9,14 * * *
 
 const { Env } = require("../tools/env.js");
 const $ = new Env("天机观签到");
+// Shared Env.done() calls process.exit(0); preserve this script's actual result
+// without replacing process.exit globally or modifying the shared Env library.
+$.done = async function () {
+    await this.sendMsg();
+    this.log(`天机观签到,结束! ${(Date.now() - this.startTime) / 1000} 秒`);
+};
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -117,6 +123,8 @@ async function apiRequest(method, endpoint, token, params = {}) {
     if (response.status < 200 || response.status >= 300) {
         const error = new Error(`HTTP ${response.status}: ${short(response.data)}`);
         error.retryable = response.status >= 500;
+        error.status = response.status;
+        error.authFailure = isAuthFailure(body, response.status);
         throw error;
     }
     return body;
@@ -214,17 +222,32 @@ class Task {
     }
 
     async login() {
-        const code = await collectorRuntimeCode(`login-${this.index}`);
-        const body = await apiRequest("POST", EP.login, "", { code });
-        const token = Number(body.code) === 1 ? String(body?.data?.token || "") : "";
-        if (!token) {
-            const error = new Error(`登录未返回 token: ${short(body)}`);
-            error.retryable = false;
-            throw error;
+        let lastError;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const code = await collectorRuntimeCode(`login-${this.index}-${attempt}`);
+                const body = await apiRequest("POST", EP.login, "", { code });
+                const token = Number(body.code) === 1 ? String(body?.data?.token || "") : "";
+                if (!token) {
+                    const error = new Error(`登录未返回 token: ${short(body)}`);
+                    error.retryable = false;
+                    throw error;
+                }
+                this.token = token;
+                const info = await this.getUserInfo();
+                if (Number(info.code) !== 1) throw new Error(`新登录身份校验失败: ${short(info)}`);
+                cacheToken(this.account.id, token);
+                this.log("登录成功，用户身份验真通过");
+                return;
+            } catch (error) {
+                lastError = error;
+                this.token = "";
+                if (!isRetryableError(error) || attempt === 3) throw error;
+                this.log(`登录瞬态故障，下一轮重新获取全新 code（${attempt}/3）`);
+                await sleep(1000 * attempt);
+            }
         }
-        this.token = token;
-        cacheToken(this.account.id, token);
-        this.log("登录成功");
+        throw lastError;
     }
 
     async getUserInfo() {
@@ -235,10 +258,22 @@ class Task {
         const cached = readCache()[this.account.id] || {};
         if (cached.token) {
             this.token = String(cached.token);
-            const info = await this.getUserInfo();
+            let info;
+            try {
+                info = await this.getUserInfo();
+            } catch (error) {
+                // An expired cached session commonly returns HTTP401, not HTTP200.
+                // Recover only explicit authentication rejection; transient failures
+                // retain the cache and fail without silently changing identity.
+                if (error.authFailure !== true) throw error;
+                info = { code: 401, msg: "cached session expired" };
+            }
             if (Number(info.code) === 1) {
                 this.log("缓存会话真实校验通过");
                 return info;
+            }
+            if (!isAuthFailure(info) && Number(info.code) !== 401) {
+                throw new Error(`缓存身份校验响应异常: ${short(info)}`);
             }
             this.log("缓存会话失效，重新登录");
             this.token = "";
@@ -287,6 +322,10 @@ class Task {
         if (process.env.TJG_GATE_FORCE_SECURE_INIT === "1") {
             await collectorSecureNetworkInit(`gate-${this.index}`);
             this.log("门禁模式：官方安全网络初始化验证通过");
+        }
+        if (process.env.TJG_READ_ONLY === "1") {
+            this.log(`只读验证：每日签到进度 ${before.now}/${before.daily_limit}，未发起签到写`);
+            return "readonly";
         }
         if (isSignTaskDone(before)) {
             this.log(`今日已签到（官方任务进度 ${before.now}/${before.daily_limit}）`);
@@ -379,7 +418,7 @@ class Task {
     }
 
     if (failed === 0 && success === $.userCount) {
-        $.log(`[QLRUN_RESULT] SUCCESS core=${success}/${$.userCount} reason=tjg_sign_verified`);
+        $.log(`[QLRUN_RESULT] SUCCESS core=${success}/${$.userCount} reason=${process.env.TJG_READ_ONLY === "1" ? "tjg_readonly_verified" : "tjg_sign_verified"} mode=${process.env.TJG_READ_ONLY === "1" ? "readonly" : "normal"}`);
     } else {
         $.log(`[QLRUN_RESULT] FAILURE retryable=${retryable ? 1 : 0} core=${success}/${$.userCount} failed=${failed}`);
         process.exitCode = 1;

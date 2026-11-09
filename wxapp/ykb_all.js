@@ -22,6 +22,53 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const WeChatServer = require("./wcs.js");
+const READ_ONLY = process.env.YKB_READ_ONLY === "1";
+// Preserve this Env instance's notifications without allowing done() to mask RC1.
+$.done = async () => { if ($.sendMsg) await $.sendMsg(); };
+const crypto = require("crypto");
+function dayKey() { return new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10); }
+function atomicJSON(file, value) {
+    const bytes = Buffer.from(JSON.stringify(value));
+    const tmp = file + '.tmp.' + process.pid + '.' + crypto.randomBytes(6).toString('hex');
+    const fd = fs.openSync(tmp, 'wx', 0o600);
+    try {
+        let offset = 0;
+        while (offset < bytes.length) {
+            const n = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+            if (!Number.isInteger(n) || n <= 0 || n > bytes.length - offset) throw new Error('state short write');
+            offset += n;
+        }
+        fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, file);
+    const d = fs.openSync(path.dirname(file), 'r');
+    try { fs.fsyncSync(d); } finally { fs.closeSync(d); }
+    if (!fs.readFileSync(file).equals(bytes)) throw new Error('state readback mismatch');
+}
+function readState(file) {
+    if (!fs.existsSync(file)) return { entries: {} };
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !value.entries || typeof value.entries !== 'object' || Array.isArray(value.entries)) throw new Error('invalid ykb state');
+    for (const e of Object.values(value.entries)) {
+        if (!e || typeof e !== 'object' || !/^\d{4}-\d{2}-\d{2}$/.test(e.day) || !Number.isInteger(e.attempts) || e.attempts < 0 || !['attempting','unknown','success'].includes(e.outcome)) throw new Error('invalid ykb state entry');
+    }
+    return value;
+}
+function rewardConfigUnavailable(result) {
+    return result?.ResponseStatus?.ErrorCode === '0' && result?.Data?.Message === '获取不到收益卡信息';
+}
+function businessUnavailable(e) {
+    const code = String(e?.raw?.ResponseStatus?.ErrorCode || '');
+    const message = String(e?.raw?.ResponseStatus?.Message || '');
+    if (code === '2102008001' && message === '门店未开启签到功能或者未设置签到活动') return 'activity_unavailable';
+    if (code === '2106000010' && message === '您的会员级别不能签到，请关注其他活动吧！') return 'member_ineligible';
+    if (code === '400' && message === '线上商城服务已到期') return 'service_expired';
+    return '';
+}
+function safeError(e) {
+    return String(e?.raw?.ResponseStatus?.Message || e?.message || e).replace(/eyJ[\w.-]+/g, '<jwt>').replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, '<phone>').slice(0, 150);
+}
+
 
 const CK_NAME = "ykb_all";
 const API_BASE = "https://pw.gzych.vip";
@@ -167,9 +214,10 @@ function maskPhone(phone = "") {
 }
 
 function monthRange() {
-    const now = new Date();
-    const firstDay = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime();
+        const key = dayKey();
+        const y = Number(key.slice(0, 4)), m = Number(key.slice(5, 7)) - 1;
+    const firstDay = Date.UTC(y, m, 1) - 8 * 3600000;
+    const nextMonth = Date.UTC(y, m + 1, 1) - 8 * 3600000;
     return {
         BeginDate: firstDay - 15 * 24 * 60 * 60 * 1000,
         EndDate: nextMonth - 1000 + 15 * 24 * 60 * 60 * 1000,
@@ -296,6 +344,9 @@ class Task {
     }
 
     async request({ method = "GET", apiPath, params = {}, data = {}, skipToken = false }) {
+        const mutation = /\/(Submit|ReceiveTask|ReceiveTaskRewards)$/.test(apiPath);
+        if (READ_ONLY && mutation) throw new Error("read-only mutation blocked");
+        if (mutation && !this.writePermit) throw new Error("mutation requires durable state guard");
         const options = {
             method,
             url: `${this.app.apiBase}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`,
@@ -306,56 +357,59 @@ class Task {
         if (skipToken) delete options.headers.Authorization;
         if (method === "GET") options.params = params;
         else options.data = data;
-
-        const { data: result, status } = await axios.request(options);
-        if (status !== 200) throw new Error(`HTTP ${status}: ${JSON.stringify(result)}`);
-
-        const responseStatus = result && result.ResponseStatus;
-        if (responseStatus) {
-            const code = Number(responseStatus.ErrorCode);
-            if (code !== 0) {
-                const err = new Error(`${responseStatus.Message || JSON.stringify(result)}(${responseStatus.ErrorCode})`);
-                err.raw = result;
-                throw err;
+        const tries = mutation || method !== "GET" ? 1 : 3;
+        for (let i = 0; i < tries; i++) {
+            let response;
+            try { response = await axios.request(options); }
+            catch (e) {
+                if (i + 1 < tries && /ECONN|ETIMEDOUT|ECONNABORTED|timeout|socket/i.test(e.code || e.message)) { await sleep(500 * (i + 1)); continue; }
+                throw e;
+            }
+            const { data: result, status } = response;
+            const responseStatus = result && result.ResponseStatus;
+            if (status !== 200 || !responseStatus || !/^-?\d+$/.test(String(responseStatus.ErrorCode))) {
+                const e = new Error(`HTTP ${status}: invalid response envelope`); e.raw = result; e.http = status;
+                if (i + 1 < tries && (status >= 500 || status === 429)) { await sleep(500 * (i + 1)); continue; }
+                throw e;
+            }
+            if (String(responseStatus.ErrorCode) !== "0") {
+                const e = new Error(`${responseStatus.Message || 'business error'}(${responseStatus.ErrorCode})`); e.raw = result; e.http = status; throw e;
+            }
+            if (apiPath.endsWith('/MemberCheckIn/Submit') && rewardConfigUnavailable(result)) {
+                const e = new Error('reward_config_unavailable'); e.rewardConfigEvidence = result; throw e;
             }
             return result.Data;
         }
-
-        if (typeof result?.code !== "undefined" && Number(result.code) !== 0 && Number(result.code) !== 200) {
-            throw new Error(result.msg || result.message || JSON.stringify(result));
-        }
-        return result?.Data ?? result?.data ?? result;
     }
 
     async run() {
-        const cached = this.getCachedToken();
-        if (cached) {
-            this.applyToken(cached);
-            this.log(`使用缓存token ${shortToken(this.token)}`);
-            if (!(await this.checkToken())) {
-                this.removeCachedToken();
-                this.log("缓存token失效，重新登录");
+        try {
+            const cached = this.getCachedToken();
+            if (cached) {
+                this.applyToken(cached);
+                if (!(await this.checkToken())) { this.token = ""; if (!READ_ONLY) this.removeCachedToken(); }
             }
+            if (!this.token) await this.login();
+            if (!this.token) throw new Error("login exhausted");
+            await this.getMemberInfo();
+            const done = await this.tryMemberCheckIn();
+            if (!done && !this.writeAttempted) await this.tryTaskSign();
+        } catch (e) {
+            const unavailable = businessUnavailable(e);
+            const configSkip = !!e?.rewardConfigEvidence && rewardConfigUnavailable(e.rewardConfigEvidence);
+            this.summary.status = configSkip ? 'accepted_skip' : (unavailable ? "neutral" : "failed");
+            this.summary.sign = configSkip ? 'reward_config_unavailable（未签到，按用户口径跳过）' : (unavailable || safeError(e));
         }
-
-        if (!this.token) await this.login();
-        if (!this.token) {
-            this.summary.sign = "登录失败";
-            return this.summary;
-        }
-
-        await this.getMemberInfo();
-        const done = await this.tryMemberCheckIn();
-        if (!done) await this.tryTaskSign();
+        if (!this.summary.status) this.summary.status = "failed";
+        this.summary.writeAttempted = !!this.writeAttempted;
         return this.summary;
     }
 
     async checkToken() {
-        try {
-            await this.request({ apiPath: "/ykb_huiyuan/api/v1/MemberMine/Info" });
-            return true;
-        } catch {
-            return false;
+        try { await this.request({ apiPath: "/ykb_huiyuan/api/v1/MemberMine/Info" }); return true; }
+        catch (e) {
+            if (e.http === 401 || String(e.raw?.ResponseStatus?.ErrorCode) === '1500000004') return false;
+            throw e;
         }
     }
 
@@ -403,13 +457,15 @@ class Task {
                 });
                 this.applyToken(data);
                 if (!this.token) throw new Error(`登录响应无Token: ${JSON.stringify(data)}`);
-                this.saveCachedToken();
-                this.log(`登录成功(${apiPath}): ${this.customerName || ""} openId=${this.openId || ""}`);
+                if (!READ_ONLY) this.saveCachedToken();
+                this.log(`登录成功(${apiPath})`);
                 return;
             } catch (e) {
-                this.log(`登录接口 ${apiPath} 失败: ${e.message || e}`);
+                if (businessUnavailable(e)) throw e;
+                this.log(`登录接口 ${apiPath} 未完成: ${safeError(e)}`);
             }
         }
+        throw new Error('login exhausted');
     }
 
     async getMemberInfo() {
@@ -422,9 +478,8 @@ class Task {
             this.summary.assets = `代币=${assets.coin} 金币=${assets.goldCoin} 积分=${assets.integral} 彩票=${assets.ticket} 优惠券=${assets.coupon}`;
             this.log(`会员: ${this.summary.member} ${this.summary.assets}`);
         } catch (e) {
-            this.summary.member = `查询失败: ${e.message || e}`;
-            this.log(`查询会员信息失败: ${e.message || e}`);
-            if (isAuthError(e)) this.removeCachedToken();
+            this.summary.member = `查询未完成: ${safeError(e)}`;
+            throw e;
         }
     }
 
@@ -469,40 +524,85 @@ class Task {
         return assets;
     }
 
-    async tryMemberCheckIn() {
+    async guardedAction(action, authority, write) {
+        if (READ_ONLY) return authority();
+        const hash = crypto.createHash('sha256').update(this.cacheKey()).digest('hex');
+        const file = path.join(__dirname, `ykb_actions_${hash}.json`), lock = file + '.lock';
+        const fd = fs.openSync(lock, 'wx', 0o600);
         try {
-            const detail = await this.request({
-                apiPath: "/ykb_huiyuan/api/v1/MemberCheckIn/GetDetail",
-                params: monthRange(),
-            });
-            const dailyReward = Array.isArray(detail?.RewardRules)
-                ? detail.RewardRules.find((item) => item.CycleType === "Daily")
-                : null;
-            const dailyText = dailyReward ? `${dailyReward.Amount}${dailyReward.RewardAlias || ""}` : "未知";
-            this.log(`会员签到状态: 已连续${detail?.Days ?? 0}天 今日奖励=${dailyText}`);
-
-            if (detail?.IsCheckIn) {
-                this.summary.sign = "今日已签到";
-                this.log("今日已签到");
-                return true;
+            const state = readState(file), key = dayKey() + ':' + action;
+            const check = async () => { const v = await authority(); if (typeof v !== 'boolean') throw new Error('non-boolean authority'); return v; };
+            if (await check()) return true;
+            const old = state.entries[key];
+            if (old) {
+                if (old.rewardConfigUnavailable && rewardConfigUnavailable(old.rewardConfigUnavailable)) {
+                    const e = new Error('reward_config_unavailable'); e.rewardConfigEvidence = old.rewardConfigUnavailable; throw e;
+                }
+                if (old.unavailable) {
+                    const e = new Error('explicit daily eligibility refusal');
+                    e.raw = old.unavailable;
+                    if (businessUnavailable(e)) throw e;
+                    throw new Error('invalid legacy eligibility evidence');
+                }
+                if (old.attempts >= 2) throw new Error('daily attempts exhausted; no replay');
+                const at = Date.parse(old.attemptedAt);
+                if (!Number.isFinite(at) || Date.now() - at < 300000) throw new Error('unconfirmed action cooling; no replay');
+                // Both independent reads under the same lock must say not completed.
+                await sleep(500);
+                if (await check()) return true;
             }
+            state.entries[key] = { ...(old || {}), day: dayKey(), action, attempts: (old?.attempts || 0) + 1, outcome: 'attempting', attemptedAt: new Date().toISOString() };
+            atomicJSON(file, state);
+            this.writeAttempted = true;
+            let error;
+            this.writePermit = true;
+            try { await write(); } catch (e) { error = e; } finally { this.writePermit = false; }
+            for (let i = 0; i < 3; i++) {
+                try {
+                    if (await check()) { state.entries[key].outcome = 'success'; atomicJSON(file, state); return true; }
+                } catch (_) { /* Unknown authority cannot authorize another write. */ }
+                if (i < 2) await sleep(500 * (i + 1));
+            }
+            state.entries[key].outcome = 'unknown';
+            if (error?.rewardConfigEvidence && rewardConfigUnavailable(error.rewardConfigEvidence)) {
+                state.entries[key].rewardConfigUnavailable = error.rewardConfigEvidence;
+                atomicJSON(file, state);
+                throw error;
+            }
+            if (businessUnavailable(error)) state.entries[key].unavailable = {ResponseStatus:{ErrorCode:String(error.raw.ResponseStatus.ErrorCode),Message:error.raw.ResponseStatus.Message}};
+            atomicJSON(file, state);
+            if (businessUnavailable(error)) throw error;
+            throw new Error('write result unconfirmed; no replay or task fallback');
+        } finally { fs.closeSync(fd); fs.unlinkSync(lock); }
+    }
 
-            const result = await this.request({
-                apiPath: "/ykb_huiyuan/api/v1/MemberCheckIn/Submit",
-            });
-            const after = await this.request({
-                apiPath: "/ykb_huiyuan/api/v1/MemberCheckIn/GetDetail",
-                params: monthRange(),
-            });
-            this.summary.sign = `签到成功 signed=${!!after?.IsCheckIn}`;
-            this.log(`签到成功${result?.Message ? `: ${result.Message}` : ""} signed=${!!after?.IsCheckIn}`);
-            return true;
-        } catch (e) {
-            this.summary.sign = `会员签到失败: ${e.message || e}`;
-            this.log(`会员签到接口不可用，改用任务签到: ${e.message || e}`);
-            if (isAuthError(e)) this.removeCachedToken();
-            return false;
+    async memberAuthority() {
+        const detail = await this.request({ apiPath: "/ykb_huiyuan/api/v1/MemberCheckIn/GetDetail", params: monthRange() });
+        if (!detail || typeof detail.IsCheckIn !== 'boolean' || !Array.isArray(detail.DateList) || !Array.isArray(detail.RewardRules)) throw new Error('invalid member checkin authority');
+        return detail.IsCheckIn;
+    }
+
+    async tryMemberCheckIn() {
+        let signed;
+        try { signed = await this.memberAuthority(); }
+        catch (e) {
+            if (businessUnavailable(e) === 'activity_unavailable') {
+                this.memberUnavailable = true;
+                return false;
+            }
+            throw e;
         }
+        if (signed) { this.summary.status = 'success'; this.summary.sign = '今日已签到'; return true; }
+        // Evidence-based, date-scoped policy skip; never claims the shop closed or signed.
+        const stateFile = path.join(__dirname, `ykb_actions_${crypto.createHash('sha256').update(this.cacheKey()).digest('hex')}.json`);
+        const old = readState(stateFile).entries[dayKey() + ':member-checkin'];
+        if (old?.rewardConfigUnavailable && rewardConfigUnavailable(old.rewardConfigUnavailable)) {
+            this.summary.status = 'accepted_skip'; this.summary.sign = 'reward_config_unavailable（未签到，按用户口径跳过）'; return true;
+        }
+        if (READ_ONLY) { this.summary.status = 'readonly'; this.summary.sign = '权威未签；只读零写'; return true; }
+        const ok = await this.guardedAction('member-checkin', () => this.memberAuthority(), () => this.request({apiPath:'/ykb_huiyuan/api/v1/MemberCheckIn/Submit'}));
+        if (ok) { this.summary.status = 'success'; this.summary.sign = '签到成功（权威确认）'; }
+        return true;
     }
 
     async getTaskList(taskType = "AllTask") {
@@ -510,13 +610,13 @@ class Task {
             apiPath: "/hdb/api/v1/ClientTask/GetTaskListFromYDG",
             params: { TaskType: taskType },
         });
-        return data?.List || data?.Data?.List || data?.list || [];
+        const list = data?.List || data?.Data?.List || data?.list;
+        if (!Array.isArray(list)) throw new Error('invalid task list authority');
+        return list;
     }
 
     isSignTask(task = {}) {
-        return /签到|每日|天天|登录|打卡|check.?in|sign/i.test(
-            [task.TaskName, task.Name, task.Remark, task.Title, task.TaskType, task.TypeName].filter(Boolean).join(" ")
-        );
+            return ['签到', '每日签到', '签到打卡'].includes(String(task.TaskName || task.Name || '').trim());
     }
 
     async getTaskDetail(task) {
@@ -535,68 +635,61 @@ class Task {
     async receiveTask(taskDetail, sourceTask) {
         const userTaskId = taskDetail?.UserTaskId || taskDetail?.UserTaskID || sourceTask?.UserTaskID || "";
         if (!userTaskId) throw new Error("缺少 UserTaskId");
-        const data = await this.request({
-            method: "POST",
-            apiPath: "/hdb/api/v1/ClientTask/ReceiveTaskRewards",
-            data: { UserTaskId: userTaskId },
-        });
-        const text = rewardText(data?.Rewards || data?.RewardList || []);
-        this.summary.sign = `任务奖励已领取${text ? `: ${text}` : ""}`;
-        this.log(`领取任务奖励成功${text ? `: ${text}` : ""}`);
+        const confirmed = async () => {
+            const d = await this.getTaskDetail({ UserTaskID: userTaskId });
+            if (normalizeStatus(d?.Status) !== 'Complete' || typeof d?.RewardReceiveStatus !== 'string') throw new Error('invalid reward authority');
+            if (d.RewardReceiveStatus === 'UnReceive') return false;
+            // Only a subsequent authoritative detail may acknowledge this reward.
+            if (!['Receive', 'Received'].includes(d.RewardReceiveStatus)) throw new Error('unrecognized reward receipt status');
+            return true;
+        };
+        const ok = await this.guardedAction('reward:' + userTaskId, confirmed, () => this.request({
+            method: "POST", apiPath: "/hdb/api/v1/ClientTask/ReceiveTaskRewards", data: { UserTaskId: userTaskId },
+        }));
+        if (ok) { this.summary.sign = '任务奖励已领取（权威确认）'; this.summary.status = 'success'; }
     }
 
     async handleTask(task) {
         const name = task.TaskName || task.Name || task.TaskID || "未知任务";
         let detail = await this.getTaskDetail(task);
+        if (!detail || typeof detail.Status !== 'string') throw new Error('invalid task authority');
         detail.Status = normalizeStatus(detail.Status);
-        this.log(`任务「${name}」状态=${detail.Status || "未知"}`);
-
-        if (detail.Status === "Complete") {
-            if (detail.RewardReceiveStatus === "UnReceive") await this.receiveTask(detail, task);
-            else this.summary.sign = `任务已完成: ${name}`;
+        if (READ_ONLY) { this.summary.status = 'readonly'; this.summary.sign = '任务只读零写'; return; }
+        if (detail.Status === 'Complete') {
+            if (detail.RewardReceiveStatus === 'UnReceive') await this.receiveTask(detail, task);
+            else throw new Error('reward receipt value requires protocol evidence');
             return;
         }
-
-        if (!task.TaskID) return;
-        const challenge = await this.request({
-            method: "POST",
-            apiPath: "/hdb/api/v1/ClientTask/ReceiveTask",
-            data: { ID: task.TaskID },
-        });
-        const userTaskId = challenge?.UserTaskId || challenge?.UserTaskID;
-        if (userTaskId) {
-            detail = await this.getTaskDetail({ UserTaskID: userTaskId });
-            detail.Status = normalizeStatus(detail.Status);
-            if (detail.Status === "Complete" && detail.RewardReceiveStatus === "UnReceive") {
-                await this.receiveTask(detail, { ...task, UserTaskID: userTaskId });
-            } else {
-                this.summary.sign = `任务状态=${detail.Status || "未知"}`;
-            }
-        }
+        if (!task.TaskID) throw new Error('missing task identity');
+        const acquired = async () => {
+            const list = await this.getTaskList();
+            const matches = list.filter(x => x.TaskID === task.TaskID && x.UserTaskID);
+            if (matches.length > 1) throw new Error('ambiguous task authority');
+            if (!matches.length) return false;
+            task.UserTaskID = matches[0].UserTaskID;
+            return true;
+        };
+        await this.guardedAction('task:' + task.TaskID, acquired, () => this.request({
+            method: 'POST', apiPath: '/hdb/api/v1/ClientTask/ReceiveTask', data: { ID: task.TaskID },
+        }));
+        detail = await this.getTaskDetail(task);
+        if (normalizeStatus(detail?.Status) === 'Complete' && detail.RewardReceiveStatus === 'UnReceive') await this.receiveTask(detail, task);
+        else throw new Error('task not completed; do not claim success');
     }
 
     async tryTaskSign() {
-        try {
-            const tasks = await this.getTaskList();
-            const signTasks = tasks.filter((task) => this.isSignTask(task));
-            if (!signTasks.length) {
-                this.summary.sign = "未找到签到/每日任务";
-                this.log("未找到签到/每日任务");
-                return;
-            }
-            for (const task of signTasks) await this.handleTask(task);
-        } catch (e) {
-            this.summary.sign = `任务签到失败: ${e.message || e}`;
-            this.log(`任务签到失败: ${e.message || e}`);
+        const tasks = await this.getTaskList();
+        const signTasks = tasks.filter((task) => this.isSignTask(task));
+        if (!signTasks.length) {
+            if (!this.memberUnavailable) throw new Error('no authoritative activity-unavailable state');
+            this.summary.status = 'neutral'; this.summary.sign = 'activity_unavailable'; return;
         }
+        for (const task of signTasks) await this.handleTask(task);
     }
 }
 
 function classifyAggregateSign(sign = "") {
-    const value = String(sign || "").trim();
-    if (/signed=false/.test(value)) return "failed";
-    if (value === "今日已签到" || /signed=true|^签到成功(?:\s|:|$)|任务奖励已领取|任务已完成/.test(value)) return "success";
-    if (/未找到签到\/每日任务|未开启签到|非会员跳过/.test(value)) return "neutral";
+    // Legacy callers cannot promote a log sentence into an authoritative result.
     return "failed";
 }
 
@@ -607,6 +700,7 @@ function classifyAggregateSign(sign = "") {
     if (!plan.length) {
         $.log(`未配置 ${CK_NAME} 或原单脚本变量`);
         $.log(`[QLRUN_RESULT] FAILURE retryable=0 total=0 success=0 neutral=0 failed=0 reason=no_configured_accounts`);
+        process.exitCode = 1;
         return;
     }
 
@@ -620,25 +714,23 @@ function classifyAggregateSign(sign = "") {
     }
 
     $.log("\n========== 执行汇总 ==========");
-    let success = 0, neutral = 0, failed = 0;
+    let success = 0, neutral = 0, failed = 0, skipped = 0;
     for (const item of summaries) {
-        item.status = classifyAggregateSign(item.sign);
+        item.status = item.status || "failed";
         if (item.status === "success") success++;
-        else if (item.status === "neutral") neutral++;
+        else if (item.status === 'accepted_skip') skipped++;
+        else if (item.status === "neutral" || (READ_ONLY && item.status === "readonly")) neutral++;
         else failed++;
         $.log(`${item.appName}: [${item.status}] ${item.member} ${item.assets} 签到=${item.sign}`);
     }
     const total = summaries.length;
-    // 聚合型任务：只要至少一个已执行子项没有失败（真实成功或明确无可执行动作），总任务即成功。
-    // 只有所有已执行子项全部失败时，才输出结构化 FAILURE；逐项失败明细仍完整保留。
-    if (success + neutral > 0) {
-        $.log(`[QLRUN_RESULT] SUCCESS total=${total} success=${success} neutral=${neutral} failed=${failed}`);
-    } else {
-        $.log(`[QLRUN_RESULT] FAILURE retryable=0 total=${total} success=0 neutral=0 failed=${failed} reason=all_subtasks_failed`);
-    }
+    const wrote = summaries.some(x => x.writeAttempted);
+    $.log(`[QLRUN_RESULT] ${failed ? 'FAILURE' : 'SUCCESS'} total=${total} success=${success} neutral=${neutral} accepted_skip=${skipped} failed=${failed} retryable=${failed && !wrote ? 1 : 0} mode=${READ_ONLY ? 'readonly' : 'normal'}`);
+    if (failed) process.exitCode = 1;
 })()
     .catch((e) => {
         $.log(e.message || e);
-        $.log(`[QLRUN_RESULT] FAILURE retryable=1 reason=aggregate_fatal_error`);
+        $.log(`[QLRUN_RESULT] FAILURE retryable=0 reason=aggregate_fatal_error`);
+        process.exitCode = 1;
     })
     .finally(() => $.done());

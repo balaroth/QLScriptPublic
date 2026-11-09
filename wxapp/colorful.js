@@ -37,6 +37,8 @@ cron: 30 10 * * *
 
 const { Env } = require("../tools/env.js");
 const $ = new Env("colorful七彩虹");
+const READ_ONLY = process.env.COLORFUL_READ_ONLY === '1';
+$.done = async () => { if ($.sendMsg) await $.sendMsg(); };
 const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -46,7 +48,7 @@ const WeChatServer = require("../wxapp/wcs.js");
 const ckName = "colorful";
 const strSplitor = "#";
 const MINI_APP_ID = "wx49018277e65fc3e1";
-const PAGE_VERSION = "91";
+const PAGE_VERSION = "99";
 const API_BASE = "https://interface.skycolorful.com";
 const TOKEN_CACHE_FILE = path.join(__dirname, "colorful_token_cache.json");
 // 手机号授权首登开关：默认开启(1)。七彩虹只有这一条首登路，等同小程序里点“手机号快捷登录”；
@@ -60,8 +62,9 @@ const defaultUserAgent =
 const EP_ON_LOGIN = "/api/User/OnLogin"; // POST {Code}          auth 无
 const EP_PHONE_LOGIN = "/api/User/DecryptPhoneNumber"; // POST {OpenId, Code}
 const EP_USER_INFO = "/api/User/GetUserInfo"; // GET
-const EP_IS_SIGN = "/api/User/IsSignV2"; // GET  -> Data.IsSign
-const EP_SIGN = "/api/User/SignV2"; // POST 无 body
+const EP_IS_SIGN = "/api/User/IsUserSign"; // formal v99 GET -> Data.IsSign
+const EP_SIGN = "/api/User/UserSign"; // formal v99 POST, no body
+const EP_SIGN_LOG = "/api/User/SignLog"; // formal v99 GET -> Data.DataList
 
 // 响应放行码：vendor.js:14036 a = [0,52001,52002,50001,51001,51002,40100,40101]
 // 客户端把这些 Code + Success 视为成功，其余一律 reject
@@ -137,14 +140,11 @@ class Task {
     }
 
     async run() {
-        if (!(await this.prepareToken())) return;
-
+        if (!(await this.prepareToken())) throw new Error('colorful authentication not confirmed');
         await this.getSignInfo();
-        if (this.signStatus) {
-            $.log(`🌸账号[${this.index}] 今日已签到`);
-        } else {
-            await this.signInV2();
-        }
+        if (READ_ONLY) { $.log(`账号[${this.index}] 只读权威状态：${this.signStatus ? '已签' : '未签'}，零签到写`); return; }
+        if (this.signStatus === true) $.log(`账号[${this.index}] 今日已签到（权威确认）`);
+        else await this.signInV2();
         await this.getUserInfo();
     }
 
@@ -193,7 +193,7 @@ class Task {
     }
 
     saveCachedToken() {
-        if (!this.token) return;
+        if (READ_ONLY || !this.token) return;
         const cache = readTokenCache();
         cache[this.cacheKey()] = {
             token: this.token,
@@ -206,6 +206,7 @@ class Task {
     }
 
     removeCachedToken() {
+        if (READ_ONLY) { this.token=''; this.refreshToken=''; return; }
         const cache = readTokenCache();
         if (cache[this.cacheKey()]) {
             delete cache[this.cacheKey()];
@@ -351,34 +352,64 @@ class Task {
             this.saveCachedToken();
             return true;
         } catch (e) {
-            return false;
+            if (/^HTTP (401|403):/.test(e.message)) return false;
+            throw e;
         }
     }
 
     async signInV2() {
+        if (READ_ONLY) throw new Error('readonly sign blocked');
+        const file = path.join(__dirname, 'colorful_actions_' + crypto.createHash('sha256').update(this.cacheKey()).digest('hex') + '.json');
+        const fd = fs.openSync(file + '.lock', 'wx', 0o600);
         try {
-            const result = await this.request(EP_SIGN, { method: "POST" });
-            $.log(`🌸账号[${this.index}]🕊签到${result.Message || "成功"}🎉`);
-        } catch (e) {
-            const message = String(e.message || e);
-            if (isAlreadySigned(message)) {
-                $.log(`🌸账号[${this.index}] 今日已签到`);
-                return;
+            await this.getSignInfo();
+            if (this.signStatus === true) return;
+            const state = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {entries:{}};
+            if (!state || typeof state !== 'object' || Array.isArray(state) || !state.entries || typeof state.entries !== 'object') throw new Error('invalid colorful state');
+            const day = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+            if (state.entries[day]) throw new Error('today sign attempted; authority unconfirmed, no replay');
+            state.entries[day] = { attempts:1, outcome:'attempting' };
+            const save = () => {
+                const bytes = Buffer.from(JSON.stringify(state)), tmp = file + '.tmp.' + process.pid;
+                const f = fs.openSync(tmp, 'wx', 0o600);
+                try {
+                    let offset = 0;
+                    while (offset < bytes.length) {
+                        const n = fs.writeSync(f, bytes, offset, bytes.length - offset);
+                        if (!Number.isInteger(n) || n <= 0 || n > bytes.length-offset) throw new Error('short state write');
+                        offset += n;
+                    }
+                    fs.fsyncSync(f);
+                } finally { fs.closeSync(f); }
+                fs.renameSync(tmp, file);
+                const d = fs.openSync(path.dirname(file), 'r');
+                try { fs.fsyncSync(d); } finally { fs.closeSync(d); }
+                if (!fs.readFileSync(file).equals(bytes)) throw new Error('state readback mismatch');
+            };
+            save(); this.writeAttempted = true;
+            try { await this.request(EP_SIGN, {method:'POST'}); } catch (_) {}
+            for (let i = 0; i < 3; i++) {
+                try {
+                    await this.getSignInfo();
+                    if (this.signStatus === true) { state.entries[day].outcome='success'; save(); $.log('签到成功（权威确认）'); return; }
+                } catch (_) {}
+                if (i < 2) await new Promise(r => setTimeout(r, 500));
             }
-            $.log(`🌸账号[${this.index}] 签到失败:${message}❌`);
-            if (isTokenError(message)) this.removeCachedToken();
-        }
+            state.entries[day].outcome='unknown'; save();
+            throw new Error('colorful write unconfirmed, no replay');
+        } finally { fs.closeSync(fd); fs.unlinkSync(file + '.lock'); }
     }
 
     async getSignInfo() {
-        try {
-            const result = await this.request(EP_IS_SIGN);
-            this.signStatus = Boolean(result?.Data?.IsSign);
-        } catch (e) {
-            const message = String(e.message || e);
-            $.log(`账号[${this.index}] 查询签到状态失败: ${message}`);
-            if (isTokenError(message)) this.removeCachedToken();
-        }
+        const result = await this.request(EP_IS_SIGN);
+        if (result?.Code !== 0 || result?.Success !== true || typeof result?.Data?.IsSign !== 'boolean') throw new Error('colorful authority invalid');
+        this.signStatus = result.Data.IsSign;
+        const log = await this.request(EP_SIGN_LOG);
+        if (log?.Code !== 0 || log?.Success !== true || !Array.isArray(log?.Data?.DataList)) throw new Error('colorful sign log invalid');
+        const day = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+        const today = log.Data.DataList.filter(x => x?.DateStr === day);
+        if (today.length !== 1 || typeof today[0].Status !== 'boolean' || today[0].Status !== this.signStatus) throw new Error('colorful authority and calendar conflict');
+        return this.signStatus;
     }
 
     async getUserInfo() {
@@ -396,15 +427,17 @@ class Task {
 }
 
 !(async () => {
-    await getNotice();
     $.checkEnv(ckName);
-
+    if (!($.userList || []).length) throw new Error('no configured accounts');
+    let failed=0, wrote=false;
     for (const user of $.userList) {
-        await new Task(user).run();
+        const task = new Task(user);
+        try { await task.run(); } catch(e) { failed++; $.log(`账号[${task.index}] 未完成：${String(e.message).replace(/eyJ[\w.-]+/g,'<jwt>').slice(0,160)}`); }
+        wrote = wrote || task.writeAttempted;
     }
-})()
-    .catch((e) => console.log(e))
-    .finally(() => $.done());
+    $.log(`[QLRUN_RESULT] ${failed ? 'FAILURE' : 'SUCCESS'} accounts=${$.userList.length} failed=${failed} retryable=0 mode=${READ_ONLY ? 'readonly' : 'normal'}`);
+    if (failed) process.exitCode=1;
+})().catch(e => { $.log(String(e.message).slice(0,160)); $.log('[QLRUN_RESULT] FAILURE reason=script_error retryable=0'); process.exitCode=1; }).finally(() => $.done());
 
 async function getNotice() {
     try {

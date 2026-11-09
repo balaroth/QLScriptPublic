@@ -1530,19 +1530,44 @@ def main():
             if not cap1:
                 return emit("needs_manual_renewal", stage="stage1", error="math captcha unreadable",
                             screenshot=shot(wd, "stage1-captcha"))
-            # 直接写 value 再派发 input 事件，让页面自己的校验逻辑认为用户输入过
-            wd.evaluate("""(ans) => {
-              document.querySelector('#web_address').value = 'woiden.id';
-              const cb = document.querySelector('input[name="agreement"]');
-              if (cb && !cb.checked) cb.checked = true;
-              const c = document.querySelector('#captcha');
-              if (c) { c.value = String(ans); c.dispatchEvent(new Event('input', {bubbles: true})); }
-            }""", cap1["answer"])
-            js_click_submit(wd)
-            r1 = wait_alert(wd, 75)
+            # reCAPTCHA v3 的评分是随机的：同一台机器、同一个出口 IP，
+            # 也可能一次通过、一次被判 "Robot verification failed"。
+            # 2026-11-09 实测 4 次提交只有 1 次通过（同一分钟内成功、失败交替出现），
+            # 单次提交成功率太低，所以在 stage1 内部就地重试 —— 不消耗当日额度，
+            # 也不会多占一次 qlall 的重试机会。
+            # 只对 v3 判定失败重试；其它提示（web_address 无效等）立刻判人工。
+            # 次数限制为 2 次：整条链路 worker 是 520s 硬超时，
+            # 每多一轮 stage1 约多 40-60s，再多会挤掉后面 v2 的 200s 预算。
+            def _stage1_submit(ans):
+                # 直接写 value 再派发 input 事件，让页面自己的校验逻辑认为用户输入过
+                wd.evaluate("""(ans) => {
+                  document.querySelector('#web_address').value = 'woiden.id';
+                  const cb = document.querySelector('input[name="agreement"]');
+                  if (cb && !cb.checked) cb.checked = true;
+                  const c = document.querySelector('#captcha');
+                  if (c) { c.value = String(ans); c.dispatchEvent(new Event('input', {bubbles: true})); }
+                }""", ans)
+                js_click_submit(wd)
+                return wait_alert(wd, 75)
+
+            r1 = ""
+            for _try in range(2):
+                if _try:
+                    # 重新加载页面：v3 token 会重新生成，评分也随之变化
+                    if not goto(wd, URL_RENEW):
+                        break
+                    clear_overlays(wd)
+                    cap1 = solve_math(wd, tpl)
+                    if not cap1:
+                        break
+                r1 = _stage1_submit(cap1["answer"])
+                if "verification code has been sent" in (r1 or "").lower():
+                    break
+                if "robot verification" not in (r1 or "").lower():
+                    break
             # 只有出现这句才说明服务端已把码发到 Telegram；其它提示一律判人工
-            if "verification code has been sent" not in r1.lower():
-                return emit("needs_manual_renewal", stage="stage1", response=r1[:300], captcha=cap1,
+            if "verification code has been sent" not in (r1 or "").lower():
+                return emit("needs_manual_renewal", stage="stage1", response=(r1 or "")[:300], captcha=cap1,
                             screenshot=shot(wd, "stage1-response"))
 
             # ---- 等 Telegram 里的新码 ----

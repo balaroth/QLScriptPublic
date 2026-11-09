@@ -88,10 +88,25 @@ function readJsonSafe(file) {
     catch (e) { return {}; }
 }
 function atomicWriteJson(file, obj) {
-    // 同目录临时文件 + 原子重命名；调用方再回读校验
-    const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), "utf8");
-    fs.renameSync(tmp, file);
+    const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+    const bytes = Buffer.from(JSON.stringify(obj));
+    let fd;
+    try {
+        fd = fs.openSync(tmp, "wx", 0o600);
+        for (let offset = 0; offset < bytes.length;) {
+            const n = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+            if (!Number.isInteger(n) || n <= 0) throw new Error("状态短写停滞");
+            offset += n;
+        }
+        fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
+        fs.renameSync(tmp, file);
+        const dir = fs.openSync(path.dirname(file), "r");
+        try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+        if (!fs.readFileSync(file).equals(bytes)) throw new Error("状态回读不一致");
+    } finally {
+        if (fd !== undefined) fs.closeSync(fd);
+        if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    }
 }
 
 function readTokenCache() { return readJsonSafe(TOKEN_CACHE_FILE); }
@@ -99,7 +114,15 @@ function writeTokenCache(c) {
     try { fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(c, null, 2), "utf8"); }
     catch (e) { /* 缓存非关键，失败不阻断主流程 */ }
 }
-function readWriteState() { return readJsonSafe(WRITE_STATE_FILE); }
+function readWriteState() {
+    if (!fs.existsSync(WRITE_STATE_FILE)) return {};
+    const state = JSON.parse(fs.readFileSync(WRITE_STATE_FILE, "utf8"));
+    if (!state || typeof state !== "object" || Array.isArray(state)) throw new ApiError("坏状态文件，已阻止写入");
+    for (const entry of Object.values(state)) {
+        if (!entry || typeof entry !== "object" || !Number.isInteger(entry.attempts) || entry.attempts < 0 || !["attempting", "success", "failed", "unknown"].includes(entry.outcome)) throw new ApiError("坏状态条目，已阻止写入");
+    }
+    return state;
+}
 function saveWriteState(all) { atomicWriteJson(WRITE_STATE_FILE, all); }
 
 function parseAccount(raw = "") {
@@ -119,7 +142,8 @@ function hmacSha1Base64(secret, message) {
     return crypto.createHmac("sha1", secret).update(message, "utf8").digest("base64");
 }
 function buildRequestData(extra) {
-    const nonce = randomIntString(6);
+    // Sign exactly the numeric nonce serialized into the request body.
+    const nonce = String(Number(randomIntString(6)));
     const timestamp = Math.floor(Date.now() / 1000);
     const signature = hmacSha1Base64(SIGN_SECRET, `nonce=${nonce}&openId=${OPEN_ID}&timestamp=${timestamp}`);
     const common = {
@@ -240,15 +264,25 @@ class Task {
         const today = chinaToday();
         const data = await this.callSigned(`${WEB_BASE}/user/sign/records`, { signDate, startDate: today }, { idempotent: true, attempts: 3 });
         const d = data.data || {};
-        return { signed: !!d.status, signCount: d.signCount };
+        if (typeof d.status !== "boolean" || !Array.isArray(d.records)) {
+            throw new ApiError("签到权威状态结构未知", { retryable: true });
+        }
+        const records = d.records.filter(item => item && item.date === today);
+        if (records.length !== 1 || typeof records[0].status !== "boolean" || records[0].status !== d.status) {
+            throw new ApiError("签到权威记录不唯一或状态冲突", { retryable: true });
+        }
+        return { signed: records[0].status, signCount: d.signCount };
     }
     readAccountState() {
         const all = readWriteState();
-        return all[this.account.openid] || {};
+        const entry = all[this.account.openid] || {};
+        // Attempts are a daily budget, never a lifetime counter.
+        return entry.date === chinaToday() ? entry : {};
     }
     persistAttempt(attemptNo, outcome) {
         const all = readWriteState();
         all[this.account.openid] = {
+            ...(all[this.account.openid] || {}),
             date: chinaToday(), outcome, attempts: attemptNo,
             lastAttemptAt: new Date().toISOString(),
         };
@@ -262,6 +296,7 @@ class Task {
     persistOutcome(outcome, attemptNo) {
         const all = readWriteState();
         all[this.account.openid] = {
+            ...(all[this.account.openid] || {}),
             date: chinaToday(), outcome, attempts: attemptNo,
             lastAttemptAt: new Date().toISOString(),
         };
@@ -269,30 +304,40 @@ class Task {
     }
     // 一次签到写（不自动重试）
     async doSignWrite() {
-        this.writeAttempted = true;
-        const today = chinaToday();
-        const attemptNo = (this.readAccountState().attempts || 0) + 1;
+        const attemptNo = Number(this.readAccountState().attempts || 0) + 1;
+        if (attemptNo > MAX_WRITE_ATTEMPTS) throw new WriteUnknownError("当日签到写硬上限已达");
         this.persistAttempt(attemptNo, "attempting");
+        this.writeAttempted = true;
+        let response = null, writeError = null;
         try {
-            const data = await this.callSigned(`${WEB_BASE}/user/sign/save`, { signDate: today }, { idempotent: false, attempts: 1 });
-            const inner = (data && data.data) || data || {};
-            if (inner.flag) { this.persistOutcome("success", attemptNo); return { ok: true, signCount: inner.signCount }; }
-            const msg = data.message || data.msg || short(data);
-            // 明确业务失败（非瞬态），记 failed，后续调度可重试
-            this.persistOutcome("failed", attemptNo);
-            throw new ApiError(`签到失败: ${msg}`, { transient: false });
-        } catch (e) {
-            if (e instanceof ApiError && e.statePersistFailed) throw e;
-            if (e.authFail) { this.persistOutcome("failed", attemptNo); throw e; }
-            if (!e.transient) { this.persistOutcome("failed", attemptNo); throw e; }
-            // 写请求已出网但结果未知：落盘 unknown，只做权威收敛，不重发
-            this.persistOutcome("unknown", attemptNo);
-            throw new WriteUnknownError(`签到写结果未知(${e.message || e})，已冷却等待，本进程不重发`);
+            response = await this.callSigned(`${WEB_BASE}/user/sign/save`, { signDate: chinaToday() }, { idempotent: false, attempts: 1 });
+        } catch (error) { writeError = error; }
+        // A successful or rejected write response never replaces authoritative state.
+        for (let poll = 0; poll < 3; poll++) {
+            try {
+                const authority = await this.querySignStatus();
+                if (authority.signed) {
+                    this.persistOutcome("success", attemptNo);
+                    return { ok: true, signCount: authority.signCount };
+                }
+            } catch (_) { /* Unknown authority must not enable another write. */ }
+            if (poll < 2) await this.wait(1000);
         }
+        this.persistOutcome("unknown", attemptNo);
+        throw new WriteUnknownError(`签到写未获权威确认${writeError ? `(${short(writeError.message)})` : ""}，本进程不重发`);
     }
     async wait(ms) { await new Promise((r) => setTimeout(r, ms)); }
 
     async run() {
+        if (this.readOnly) return this.runLocked();
+        const lockPath = WRITE_STATE_FILE + ".lock";
+        let fd;
+        try { fd = fs.openSync(lockPath, "wx", 0o600); }
+        catch (error) { return { ok: false, core: "locked", writeAttempted: false, retryable: 0 }; }
+        try { return await this.runLocked(); }
+        finally { fs.closeSync(fd); fs.unlinkSync(lockPath); }
+    }
+    async runLocked() {
         if (!this.account.openid) { this.log("跳过：变量值里没有 openid"); return { ok: true, core: "skipped", writeAttempted: false }; }
         try {
             await this.ensureLogin();
@@ -308,7 +353,7 @@ class Task {
                 } else throw e;
             }
             if (status.signed) {
-                this.persistOutcome("success", this.readAccountState().attempts || 1);
+                if (!this.readOnly) this.persistOutcome("success", this.readAccountState().attempts || 0);
                 this.log(`✅ 今日已签到，累计 ${status.signCount ?? "?"} 天`);
                 return { ok: true, core: "already", writeAttempted: this.writeAttempted };
             }
@@ -319,13 +364,17 @@ class Task {
                 return { ok: true, core: "readonly", writeAttempted: this.writeAttempted };
             }
 
-            // 已存在 attempting/unknown：冷却 + 连续两次权威确认后才允许一次恢复写
-            if (st.date === chinaToday() && (st.outcome === "attempting" || st.outcome === "unknown")) {
+            if (Number(st.attempts || 0) >= MAX_WRITE_ATTEMPTS) {
+                throw new WriteUnknownError(`今日写已达上限(${st.attempts}次)，未重复发起`);
+            }
+            // All prior attempted outcomes share one daily budget and cooldown.
+            if (st.date === chinaToday() && ["attempting", "unknown", "failed"].includes(st.outcome)) {
                 const attempts = st.attempts || 1;
                 if (attempts >= MAX_WRITE_ATTEMPTS) {
                     throw new WriteUnknownError(`今日写已达上限(${attempts}次)，等待明日或人工核查，未重复发起`);
                 }
-                const age = Date.now() - new Date(st.lastAttemptAt || Date.now()).getTime();
+                const parsedTime = Date.parse(st.lastAttemptAt || "");
+                const age = Number.isFinite(parsedTime) ? Date.now() - parsedTime : 0;
                 if (age < this.cooldownMs) {
                     throw new WriteUnknownError(`签到写${st.outcome === "attempting" ? "可能仍在途" : "结果未知"}，冷却期内(剩余约${Math.ceil((this.cooldownMs - age) / 60000)}分钟)，未重发`);
                 }

@@ -12,6 +12,7 @@ cron: 28 8 * * *
 
 const { Env } = require("../tools/env.js");
 const $ = new Env("日清食品签到");
+$.done = async function () { await this.sendMsg(); this.log(`日清食品签到结束，耗时 ${(Date.now() - this.startTime) / 1000} 秒`); };
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -80,11 +81,15 @@ class Task {
 
         if (!this.token) {
             await this.loginByWxCode();
-            if (!this.token) return;
+            if (!this.token) throw new Error("日清登录未取得token");
         }
 
         await this.getUser();
         await this.getSignInInfo();
+        if (process.env.NISSIN_READ_ONLY === "1") {
+            $.log(`账号[${this.index}] 只读权威验证，今日${this.signInfo.hasSignedToday ? "已签" : "未签"}，零签到写`);
+            return;
+        }
         await this.doSign();
         await this.enterGame();
     }
@@ -200,6 +205,7 @@ class Task {
             $.log(`账号[${this.index}] 登录成功: userId=${this.userId || "未知"}`);
         } catch (e) {
             $.log(`账号[${this.index}] 登录失败: ${e.message || e}`);
+            throw e;
         }
     }
 
@@ -208,6 +214,7 @@ class Task {
             await this.getSignInInfo(true);
             return true;
         } catch (e) {
+            if (!isTokenError(e)) throw e;
             return false;
         }
     }
@@ -226,7 +233,8 @@ class Task {
 
     async getSignInInfo(silent = false) {
         const data = await this.request({ apiPath: "/sign-in/statistics" });
-        this.signInfo = data || {};
+        if (!data || typeof data.hasSignedToday !== "boolean") throw new Error("日清签到权威状态缺失或非布尔");
+        this.signInfo = data;
         if (!silent) {
             $.log(`账号[${this.index}] 签到状态: ${data?.hasSignedToday ? "已签" : "未签"} 连续${data?.continuousDays || 0}天 总${data?.totalDays || 0}天 今日${data?.todayPoints ?? "未知"}积分`);
         }
@@ -234,38 +242,58 @@ class Task {
     }
 
     async doSign() {
-        if (this.signInfo?.hasSignedToday) {
-            $.log(`账号[${this.index}] 今日已签到`);
+        if (this.signInfo.hasSignedToday === true) {
+            $.log(`账号[${this.index}] 今日已签到（权威确认）`);
             return;
         }
+        const crypto = require("crypto");
+        const key = crypto.createHash("sha256").update(this.openid).digest("hex");
+        const file = path.join(__dirname, `nissin_sign_${key}.json`);
+        const lock = file + ".lock";
+        const day = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+        const fd = fs.openSync(lock, "wx", 0o600);
         try {
-            const data = await this.request({
-                method: "POST",
-                apiPath: "/sign-in",
-                data: {},
-            });
-            $.log(`账号[${this.index}] 签到成功: +${data ?? "未知"}积分`);
-            await this.getSignInInfo();
-        } catch (e) {
-            const message = String(e.message || e);
-            if (/已签到|重复|今日.*签/i.test(message)) {
-                $.log(`账号[${this.index}] 今日已签到`);
-                return;
+            // Repeat the authority read inside the process lock.
+            await this.getSignInInfo(true);
+            if (this.signInfo.hasSignedToday === true) return;
+            const previous = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+            if (!previous || typeof previous !== "object" || Array.isArray(previous)) throw new Error("日清写状态损坏");
+            if (previous.day === day && previous.attempted === true) throw new Error("日清今日已有未收敛写，禁止重放");
+            const state = { day, attempted: true, outcome: "attempting" };
+            const save = () => {
+                const tmp = file + ".tmp." + process.pid;
+                const bytes = Buffer.from(JSON.stringify(state));
+                const f = fs.openSync(tmp, "wx", 0o600);
+                try { fs.writeFileSync(f, bytes); fs.fsyncSync(f); } finally { fs.closeSync(f); }
+                fs.renameSync(tmp, file);
+                const d = fs.openSync(path.dirname(file), "r");
+                try { fs.fsyncSync(d); } finally { fs.closeSync(d); }
+                if (!fs.readFileSync(file).equals(bytes)) throw new Error("日清状态回读不一致");
+            };
+            save();
+            this.writeAttempted = true;
+            try { await this.request({ method: "POST", apiPath: "/sign-in", data: {} }); }
+            catch (_) { /* Any write response is finalized only by the authoritative read. */ }
+            for (let i = 0; i < 3; i++) {
+                try {
+                    await this.getSignInInfo(true);
+                    if (this.signInfo.hasSignedToday === true) {
+                        state.outcome = "success"; save();
+                        $.log(`账号[${this.index}] 签到成功（权威回查已签）`);
+                        return;
+                    }
+                } catch (_) {}
+                if (i < 2) await new Promise(r => setTimeout(r, 1000));
             }
-            $.log(`账号[${this.index}] 签到失败: ${message}`);
-            if (isTokenError(e)) this.removeCachedToken();
-        }
+            state.outcome = "unknown"; save();
+            throw new Error("日清签到写结果未知，不重放");
+        } finally { fs.closeSync(fd); fs.unlinkSync(lock); }
     }
 
     async getTaskList() {
-        try {
-            const data = await this.request({ apiPath: "/taskCenter/getEffectiveTask" });
-            return Array.isArray(data) ? data : [];
-        } catch (e) {
-            $.log(`账号[${this.index}] 查询任务列表失败: ${e.message || e}`);
-            if (isTokenError(e)) this.removeCachedToken();
-            return [];
-        }
+        const data = await this.request({ apiPath: "/taskCenter/getEffectiveTask" });
+        if (!Array.isArray(data)) throw new Error("日清任务列表结构未知");
+        return data;
     }
 
     async enterGame() {
@@ -274,17 +302,14 @@ class Task {
             const gameTask = beforeTasks.find((item) => item?.ruleType === "PLAY_GAME");
             if (gameTask) {
                 $.log(`账号[${this.index}] 玩游戏任务: ${gameTask.complete ? "已完成" : "未完成"}`);
+                if (gameTask.complete === true) return;
+            } else {
+                $.log(`账号[${this.index}] 服务端当前未配置PLAY_GAME任务，不调用旧游戏登录接口`);
+                return;
             }
 
+            // Official page only gets config and opens the H5; /game/login is obsolete.
             const gameConfig = await this.request({ apiPath: "/game/config" });
-            await this.request({
-                method: "POST",
-                apiPath: "/game/login",
-                data: {
-                    loginIp: "",
-                    loginLocation: "",
-                },
-            });
             const playCount = await this.request({ apiPath: "/game/count" });
             const gameUrl = `https://foodhall-prod.nissinfoodium.com.cn/game/index.html?version=${Date.now()}&token=${encodeURIComponent(this.token)}&user_id=${encodeURIComponent(this.userId || this.user.id || "")}&webViewHeight=800`;
             const page = await axios.get(gameUrl, {
@@ -307,7 +332,8 @@ class Task {
                 $.log(`账号[${this.index}] 玩游戏任务更新: ${updatedGameTask.complete ? "已完成" : "未完成"}`);
             }
         } catch (e) {
-            $.log(`账号[${this.index}] 进入游戏失败: ${e.message || e}`);
+            this.optionalFailures = (this.optionalFailures || 0) + 1;
+            $.log(`账号[${this.index}] 可选游戏入口未完成: ${e.message || e}；每日签到单独以权威状态判定`);
             if (isTokenError(e)) this.removeCachedToken();
         }
     }
@@ -315,9 +341,16 @@ class Task {
 
 !(async () => {
     $.checkEnv(ckName);
+    let failed = 0, optional = 0, wrote = false;
+    if (!($.userList || []).length) throw new Error("未配置日清账号");
     for (const openid of $.userList) {
-        await new Task(openid).run();
+        const task = new Task(openid);
+        try { await task.run(); } catch (e) { failed++; $.log(`账号执行失败: ${e.message || e}`); }
+        optional += task.optionalFailures || 0;
+        wrote = wrote || task.writeAttempted;
     }
+    $.log(`[QLRUN_RESULT] ${failed ? "FAILURE" : "SUCCESS"} accounts=${$.userList.length} failed=${failed} optional_failed=${optional} retryable=${failed && !wrote ? 1 : 0} mode=${process.env.NISSIN_READ_ONLY === "1" ? "readonly" : "normal"}`);
+    if (failed) process.exitCode = 1;
 })()
-    .catch((e) => $.log(e.message || e))
+    .catch((e) => { $.log(e.message || e); $.log("[QLRUN_RESULT] FAILURE reason=script_error retryable=0"); process.exitCode = 1; })
     .finally(() => $.done());

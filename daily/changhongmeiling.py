@@ -84,7 +84,7 @@ def mask_phone(value: str) -> str:
 
 
 def today() -> str:
-    return time.strftime("%Y-%m-%d", time.localtime())
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
 
 
 # ---------------- 文件锁 + 原子合并 ----------------
@@ -150,7 +150,14 @@ def atomic_write_json(path: str, payload: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
         with open(path, "r", encoding="utf-8") as fh:
             back = json.load(fh)
         if back != payload:
@@ -171,7 +178,7 @@ def update_state(account_key: str, **fields) -> dict:
             entry = state.get(key) or {"date": "", "outcome": "unknown", "attempts": 0}
             if entry.get("date") != today():
                 entry = {"date": today(), "outcome": "unknown", "attempts": 0,
-                         "lastAttemptAt": entry.get("lastAttemptAt") if entry.get("date") else None}
+                         "history": list(entry.get("history", [])) + ([dict(entry, history=[])] if entry.get("date") else [])}
             entry.update({k: v for k, v in fields.items() if v is not None})
             state[key] = entry
             atomic_write_json(STATE_FILE, state)
@@ -227,21 +234,30 @@ def fetch_collector_session(http=requests, auth: Optional[str] = None, url: Opti
     collector_auth = WX_AUTH if auth is None else str(auth or "")
     if not collector_auth:
         raise ChanghongError("未配置 wx_auth")
+    # The current upstream accepts fresh normal /wx/code, whereas legacy
+    # runtime-bound codes are rejected; do not use shared WxRequest callbacks.
     response = http.post(
-        (url or WX_SERVER_URL).rstrip("/") + "/wx/changhong-session",
-        json={"appid": appid or APPID},
+        (url or WX_SERVER_URL).rstrip("/") + "/wx/code",
+        json={"appid": appid or APPID, "openid": "ql"},
         headers={"auth": collector_auth, "Content-Type": "application/json"},
         timeout=timeout,
     )
-    try:
-        body = response.json()
-    except Exception as exc:
-        raise ChanghongError(f"collector 返回无法解析：HTTP {response.status_code}") from exc
+    body = response.json()
+    code = body.get("code") or (body.get("data") or {}).get("code")
+    if response.status_code != 200 or body.get("status") is not True or not isinstance(code, str) or not code:
+        raise ChanghongError("长虹新鲜登录code获取失败")
+    exchange = http.post(
+        BASE_URL + "/appletUser/getTokenByJsCode",
+        json={"jsCode": code, "invitation": "", "userName": "", "system": "Android", "sex": "未知", "avatarUrl": ""},
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        timeout=TIMEOUT,
+    )
+    body = exchange.json()
     data = body.get("data") or {}
-    if response.status_code != 200 or body.get("status") is not True or not data.get("token"):
-        raise ChanghongError(f"collector 自动登录失败：{body.get('message') or f'HTTP {response.status_code}'}")
-    phone = mask_phone(data.get("phone") or "")
-    return Account(str(data["token"]), f"collector:{phone}" if phone else "collector", str(body.get("via") or "collector"))
+    if exchange.status_code != 200 or str(body.get("code")) != "200" or not isinstance(data, dict) or not data.get("token"):
+        raise ChanghongError(f"长虹登录兑换失败 HTTP {exchange.status_code} code={body.get('code')}")
+    phone = mask_phone(data.get("userPhone") or "")
+    return Account(str(data["token"]), f"collector:{phone}" if phone else "collector", "fresh-code-direct-exchange")
 
 
 class Task:
@@ -376,8 +392,8 @@ class Task:
             try:
                 already = self.activity_signed_state(aggr_id)
             except ActivityUnavailable as exc:
-                self.logger(f"⛔ {label}：{exc}（非瞬态）")
-                return {"ok": False, "error": str(exc), "retryable": False}
+                self.logger(f"{label}：{exc}，服务端当前无合法可执行活动")
+                return {"ok": True, "unavailable": True, "reason": "activity_unavailable", "error": str(exc), "retryable": False}
             except StructureError as exc:
                 self.logger(f"⛔ {label}：权威结构未知，阻写：{exc}")
                 return {"ok": False, "error": f"structure-unknown: {exc}", "retryable": False}
@@ -385,6 +401,9 @@ class Task:
                 self.logger(f"❌ {label}：权威读取瞬态失败 - {exc}")
                 return {"ok": False, "error": f"权威读取失败: {exc}", "retryable": True}
 
+            if READ_ONLY:
+                self.logger(f"只读权威验证：{'已签到' if already else '未签到'}，零签到写")
+                return {"ok": True, "readonly": True, "already": already, "aggrId": aggr_id}
             if already:
                 try:
                     update_state(self.key, outcome="success",
@@ -439,7 +458,7 @@ class Task:
 
             # 写前落盘 attempting（原子回读）
             try:
-                entry = update_state(self.key, outcome="attempting",
+                entry = update_state(self.key, outcome="attempting", attempts=attempts + 1,
                                      lastAttemptAt=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
             except ChanghongError as exc:
                 self.logger(f"⛔ {label}：状态落盘失败，阻写：{exc}")

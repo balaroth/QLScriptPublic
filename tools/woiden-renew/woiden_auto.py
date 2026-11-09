@@ -1318,8 +1318,29 @@ def solve_recaptcha_v2(page, max_rounds=3):
             # 2026-11-01 实测：日志记了 click=[1,4,5,8]，截图里只有 2 格真的变成
             # 选中态，另外两次点击静默失败。所以每次点击后都要回读选中状态，
             # 没生效就重试，最终把实际生效的格子单独记下来。
+            # 2026-11-09 实测：reCAPTCHA 选中态类名变成
+            # rc-imageselect-dynamic-selected —— 既没有 aria-checked="true"，
+            # 也不是独立的 selected token，所以老判定 contains('selected')
+            # 恒为 False。点击其实生效了，却每格被判成「未确认」，于是再重复
+            # 点 2 次把它 toggle 掉，verify 必然失败（日志里 12 格全部
+            # cell_click_unconfirmed、clicked_confirmed=[] 就是这个原因）。
+            # 现在改用 className 子串匹配，同时覆盖 selected /
+            # rc-imageselect-dynamic-selected / rc-imageselect-tile-selected。
+            def _cell_selected(idx):
+                try:
+                    return bool(bf.locator("td").nth(idx - 1).evaluate(
+                        "el => el.getAttribute('aria-checked') === 'true'"
+                        " || (el.className || '').indexOf('selected') >= 0"
+                        " || !!el.querySelector('.rc-imageselect-checkbox--checked')"))
+                except Exception:
+                    return None
+
+            # 已选中的格子绝对不能再点：dynamic 挑战下再点一次就是取消选中
+            if _cell_selected(c):
+                clicked.append(c)
+                continue
             ok_click = False
-            for _try in range(3):
+            for _try in range(2):
                 try:
                     bf.locator("td").nth(c - 1).evaluate("el => el.click()")
                 except Exception:
@@ -1327,15 +1348,8 @@ def solve_recaptcha_v2(page, max_rounds=3):
                         bf.locator("td").nth(c - 1).click(timeout=4000)
                     except Exception as e:
                         log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
-                page.wait_for_timeout(280)
-                try:
-                    ok_click = bool(bf.locator("td").nth(c - 1).evaluate(
-                        "el => el.getAttribute('aria-checked') === 'true'"
-                        " || el.classList.contains('selected')"
-                        " || !!el.querySelector('.rc-imageselect-checkbox--checked')"
-                        " || !!el.querySelector('.rc-imageselect-tile-selected')"))
-                except Exception:
-                    ok_click = None
+                page.wait_for_timeout(320)
+                ok_click = _cell_selected(c)
                 if ok_click:
                     break
             if ok_click:

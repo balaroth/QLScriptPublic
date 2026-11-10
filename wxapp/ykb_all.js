@@ -373,7 +373,13 @@ class Task {
                 throw e;
             }
             if (String(responseStatus.ErrorCode) !== "0") {
-                const e = new Error(`${responseStatus.Message || 'business error'}(${responseStatus.ErrorCode})`); e.raw = result; e.http = status; throw e;
+                const e = new Error(`${responseStatus.Message || 'business error'}(${responseStatus.ErrorCode})`); e.raw = result; e.http = status;
+                // Read-only nested gateway failures use HTTP 200 but are still transient.
+                // Never replay Submit/ReceiveTask/ReceiveTaskRewards or authentication POST.
+                const nestedGateway = String(responseStatus.ErrorCode) === '1000000' &&
+                    /请求业务API系统服务无法访问\[(?:502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout)\]/.test(String(responseStatus.Message || ''));
+                if (i + 1 < tries && nestedGateway) { await sleep(500 * (i + 1)); continue; }
+                throw e;
             }
             if (apiPath.endsWith('/MemberCheckIn/Submit') && rewardConfigUnavailable(result)) {
                 const e = new Error('reward_config_unavailable'); e.rewardConfigEvidence = result; throw e;

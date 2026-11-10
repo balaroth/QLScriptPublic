@@ -47,7 +47,10 @@ LABELS = {
 #   telegram      没等到新码 —— 重新发码有机会
 # 需要人工介入的一律不放行：login（要人重登）、stage1/stage2（数学验证码
 # 读不出，重试只会再失败一次）。
-RETRYABLE_STAGES = {"recaptcha_v2", "telegram"}
+RETRYABLE_STAGES = {"recaptcha_v2", "telegram", "stage1"}
+# stage1 于 2026-11-10 加入：reCAPTCHA v3 评分是随机的，同一台机器同一 IP
+# 也可能整天被拒。woiden_auto.py 内部已对 "robot verification" 就地重试
+# 一次，这里再给 qlall 一次跨进程重试机会（重新加载页面、重新生成 token）。
 
 # 同一天最多执行 2 次（1 次正常 + 1 次重试）。按日期自动重置，避免某天连续
 # 发码或连续刷 reCAPTCHA。qlall 侧 ATTEMPTS 是 3，这里收紧到 2。

@@ -45,8 +45,7 @@ LABELS = {
 # 现在按 stage 区分，只放行「重跑有意义」的两类：
 #   recaptcha_v2  视觉模型判错 / 合成器挂起 / 配额抖动 —— 重跑大概率能过
 #   telegram      没等到新码 —— 重新发码有机会
-# 需要人工介入的一律不放行：login（要人重登）、stage1/stage2（数学验证码
-# 读不出，重试只会再失败一次）。
+# 需要人工介入的一律不放行：login（要人重登）、stage2（数学验证码读不出）。
 RETRYABLE_STAGES = {"recaptcha_v2", "telegram", "stage1"}
 # stage1 于 2026-11-10 加入：reCAPTCHA v3 评分是随机的，同一台机器同一 IP
 # 也可能整天被拒。woiden_auto.py 内部已对 "robot verification" 就地重试

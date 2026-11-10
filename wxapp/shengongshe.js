@@ -1,243 +1,73 @@
 /*
-------------------------------------------
-@Description: 申工社 - 微信小程序静默登录 + 每日签到
+申工社：官方公众号 OAuth 会话恢复及每日签到。不是微信小程序。
 cron: 34 8 * * *
-------------------------------------------
-变量名：shengongshe
-变量值：wx_server 里的 openid/账号标识，多账号用 & 或换行分隔（可加 #备注）
-
-依赖变量：
-wx_server_url  默认 http://192.168.31.196:8787
-wx_auth        必填，wx_server 鉴权值
-------------------------------------------
-契约（appid wx63d70210fcc108fd，host fwdt.shszgh.cn）：
-  登录  POST /fwdt-wechat-xc/api/wechat/oauth  {code}
-          -> code==0 && success===true，data 本身就是 token 字符串
-          之后所有请求带请求头 token: <token>
-  资料  GET  /fwdt-wechat-xc/api/member/info/get   -> data.nickname / data.integral
-  签到  GET  /fwdt-wechat-xc/api/integral/sign?_t=<毫秒>
-  token 失效的表现是 code==100 且 message==用户未登录
-------------------------------------------
+变量 shengongshe：wx_server 设备别名（当前专用恢复支持 ql），可用 #备注。
+依赖 wx_server_url、wx_auth、Node >=18；SHENGONGSHE_READ_ONLY=1 零签到及本地缓存/state/lock写。
+积分及签到目前仍开放；停运与活动状态只依据官方业务权威响应，不按时间猜测。
 */
-
-const { Env } = require("../tools/env.js");
-const $ = new Env("申工社");
-const axios = require("axios");
-const fs = require("fs");
-const path = require("path");
-const WeChatServer = require("./wcs.js");
-
-const ckName = "shengongshe";
-const MINI_APP_ID = "wx63d70210fcc108fd";
-const BASE = "https://fwdt.shszgh.cn";
-
-const TOKEN_CACHE_FILE = path.join(__dirname, "shengongshe_token_cache.json");
-const USER_AGENT =
-    "Mozilla/5.0 (Linux; Android 12; M2012K11AC Build/SKQ1.220303.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) " +
-    "Version/4.0 Chrome/134.0.6998.136 Mobile Safari/537.36 MicroMessenger/8.0.48.2580(0x28003036) MiniProgramEnv/android";
-
-const EP_LOGIN = "/fwdt-wechat-xc/api/wechat/oauth";
-const EP_SIGN = "/fwdt-wechat-xc/api/integral/sign";
-const EP_USER = "/fwdt-wechat-xc/api/member/info/get";
-
-const wechat = new WeChatServer({
-    url: process.env.wx_server_url || "http://192.168.31.196:8787",
-    appid: MINI_APP_ID,
-    auth: process.env.wx_auth || "",
-});
-
-function readCache() {
-    try {
-        if (!fs.existsSync(TOKEN_CACHE_FILE)) return {};
-        return JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf8")) || {};
-    } catch (e) {
-        return {};
-    }
+'use strict';
+const {Env}=require('../tools/env.js'),$=new Env('申工社');
+const fs=require('fs'),path=require('path'),crypto=require('crypto'),axios=require('axios');
+require('dns').setDefaultResultOrder('ipv4first');
+const READ_ONLY=process.env.SHENGONGSHE_READ_ONLY==='1',APPID='wx63d70210fcc108fd';
+const BASE='https://fwdt.shszgh.cn/fwdt-wechat-xc/api',CACHE=path.join(__dirname,'shengongshe_token_cache.json');
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)),day=()=>new Date(Date.now()+28800000).toISOString().slice(0,10);
+$.done=async()=>{if($.sendMsg)await $.sendMsg()};
+function atomic(file,value){
+ const bytes=Buffer.from(JSON.stringify(value)),tmp=file+'.tmp.'+process.pid+'.'+crypto.randomBytes(6).toString('hex');
+ const fd=fs.openSync(tmp,'wx',0o600);
+ try{let offset=0;while(offset<bytes.length){const n=fs.writeSync(fd,bytes,offset,bytes.length-offset);if(!Number.isInteger(n)||n<=0||n>bytes.length-offset)throw Error('short state write');offset+=n}fs.fsyncSync(fd)}finally{fs.closeSync(fd)}
+ fs.renameSync(tmp,file);const d=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(d)}finally{fs.closeSync(d)}
+ if(!fs.readFileSync(file).equals(bytes))throw Error('state readback mismatch');
 }
-
-function writeCache(cache) {
-    try {
-        fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
-    } catch (e) {
-        $.log(`写入token缓存失败: ${e.message || e}`);
-    }
+function objectFile(file,fallback){if(!fs.existsSync(file))return fallback;const d=JSON.parse(fs.readFileSync(file,'utf8'));if(!d||typeof d!=='object'||Array.isArray(d))throw Error('invalid persisted object');return d}
+function readState(file){const d=objectFile(file,{entries:{}});if(!d.entries||typeof d.entries!=='object'||Array.isArray(d.entries))throw Error('invalid state');for(const e of Object.values(d.entries)){if(!e||!Number.isInteger(e.attempts)||e.attempts<0||e.attempts>2||!['attempting','unknown','success'].includes(e.outcome))throw Error('invalid state entry')}return d}
+function safe(e){return String(e?.message||'script failure').replace(/eyJ[\w.-]+/g,'<redacted>').replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g,'<redacted>').slice(0,120)}
+class Task{
+ constructor(raw){this.index=$.userIdx++;this.account=String(raw).split('#')[0].trim();this.token='';this.identity='';this.wrote=false}
+ log(s){$.log(`账号[${this.index}] ${s}`)}
+ stateFile(){return path.join(__dirname,'shengongshe_actions_'+crypto.createHash('sha256').update(this.account).digest('hex')+'.json')}
+ async request(api,read=true){
+  if(!['/member/info/get','/integral/checkSign','/integral/my','/integral/sign'].includes(api))throw Error('endpoint not allowed');
+  for(let i=0;i<(read?3:1);i++){
+   try{const r=await fetch(BASE+api+'?_t='+Date.now(),{headers:{token:this.token,Referer:'https://fwdt.shszgh.cn/fwdt-h5/'},signal:AbortSignal.timeout(18000),redirect:'error'});const text=await r.text();let d;try{d=JSON.parse(text)}catch(_){const e=Error('HTTP '+r.status+' invalid JSON');e.transient=r.status>=500;throw e}
+    if(r.status!==200||d?.code!==0||d.success!==true){const e=Error('HTTP '+r.status+' business '+String(d?.code));e.auth=d?.code===100&&d?.message==='用户未登录';e.transient=[408,429,500,502,503,504].includes(r.status);throw e}return d;
+   }catch(e){if(['TimeoutError','AbortError'].includes(e.name)||e.cause?.code||e.message==='fetch failed')e.transient=true;if(read&&i<2&&e.transient){await sleep(500*(i+1));continue}throw e}
+  }
+ }
+ async profile(){const d=(await this.request('/member/info/get')).data;if(!d||typeof d.openid!=='string'||!d.openid||!Number.isFinite(d.integral))throw Error('invalid member authority');if(this.identity&&this.identity!==d.openid)throw Error('account identity mismatch');this.identity=d.openid;this.points=d.integral;return d}
+ saveCache(){if(READ_ONLY)return;const d=objectFile(CACHE,{});d[this.account]={token:this.token,identity:this.identity,updatedAt:new Date().toISOString()};atomic(CACHE,d)}
+ async login(){
+  if(this.account!=='ql')throw Error('official OAuth device alias unsupported');
+  const cached=objectFile(CACHE,{})[this.account];if(cached?.identity)this.identity=cached.identity;
+  if(cached?.token){this.token=cached.token;try{await this.profile();return}catch(e){if(!e.auth)throw e;this.token=''}}
+  if(!process.env.wx_auth||!process.env.wx_server_url)throw Error('wx_server configuration missing');
+  const r=await axios.post(process.env.wx_server_url.replace(/\/$/,'')+'/wx/shengongshe-session',{appid:APPID,openid:this.account,refresh:!!cached?.token},{headers:{auth:process.env.wx_auth},timeout:150000});
+  const d=r.data?.data;if(r.data?.status!==true||typeof d?.token!=='string'||!d.token||typeof d.identity!=='string'||!d.identity)throw Error('official OAuth session unavailable');
+  if(this.identity&&this.identity!==d.identity)throw Error('OAuth account identity mismatch');this.token=d.token;this.identity=d.identity;await this.profile();this.saveCache();this.log('公众号会话已确认');
+ }
+ async authority(){
+  const flag=(await this.request('/integral/checkSign')).data,my=(await this.request('/integral/my')).data;
+  if(typeof flag!=='boolean'||!my||!Array.isArray(my.thisWeekSignLog)||!Number.isFinite(my.total))throw Error('invalid sign authority');
+  const rows=my.thisWeekSignLog.filter(r=>r?.date===day()+' 00:00:00');if(rows.length!==1||typeof rows[0].isSign!=='boolean'||rows[0].isSign!==flag)throw Error('ambiguous daily sign authority');
+  this.points=my.total;return flag;
+ }
+ async run(){
+  if(!this.account)throw Error('empty account');await this.login();
+  if(READ_ONLY){this.log('只读权威状态：'+(await this.authority()?'已签':'未签')+'，零签到写');return}
+  const file=this.stateFile(),lock=file+'.lock',fd=fs.openSync(lock,'wx',0o600);
+  try{const state=readState(file),key=day();if(await this.authority()){if(state.entries[key]){state.entries[key].outcome='success';atomic(file,state)}this.log('今日已签（权威确认）');return}
+   const old=state.entries[key];if(old){if(old.attempts>=2)throw Error('daily write attempts exhausted');if(!Number.isFinite(Date.parse(old.attemptedAt))||Date.now()-Date.parse(old.attemptedAt)<300000)throw Error('unknown write cooling; no replay');await sleep(500);if(await this.authority()){old.outcome='success';atomic(file,state);return}}
+   // Persist and read back before the GET with business side effects. No HTTP-level retry.
+   state.entries[key]={...(old||{}),attempts:(old?.attempts||0)+1,outcome:'attempting',attemptedAt:new Date().toISOString(),identity:this.identity};atomic(file,state);this.wrote=true;
+   try{await this.request('/integral/sign',false)}catch(_){}
+   for(let i=0;i<3;i++){let signed;try{signed=await this.authority()}catch(_){}if(signed===true){state.entries[key].outcome='success';atomic(file,state);this.saveCache();this.log('签到成功（权威记录确认）积分='+this.points);return}if(i<2)await sleep(700*(i+1))}
+   state.entries[key].outcome='unknown';atomic(file,state);throw Error('sign write unconfirmed; no replay');
+  }finally{fs.closeSync(fd);fs.unlinkSync(lock)}
+ }
 }
-
-function parseAccount(raw = "") {
-    const [id, remark] = String(raw).split("#").map((s) => (s || "").trim());
-    return { openid: id, remark: remark || "" };
-}
-
-function short(v, n = 200) {
-    const t = typeof v === "string" ? v : JSON.stringify(v);
-    return !t ? "" : t.length > n ? `${t.slice(0, n)}...` : t;
-}
-
-function form(obj) {
-    return Object.entries(obj)
-        .map(([k, v]) => `${k}=${encodeURIComponent(v === undefined || v === null ? "" : v)}`)
-        .join("&");
-}
-
-/** 该后端的成功判定 */
-const isOk = (res) => Number(res?.code) === 0 && (res?.success === undefined || res?.success === true);
-const msgOf = (res) => res?.message || res?.message || res?.msg || short(res);
-/** 每天跑一次，「已签到」必须当成成功而不是失败 */
-const isAlreadyDone = (t) => /已签|已经签|签到过|重复|已完成|already/i.test(String(t || ""));
-const isAuthError = (t) => /登录|token|未授权|未登录|失效|过期|重新|401/i.test(String(t || ""));
-/** 账号态：这个微信号还没在该平台注册/绑定 —— 不是脚本缺陷，别打 ❌ */
-const isNotRegistered = (t) => /未注册|未绑定|请先注册|请先绑定|not regist/i.test(String(t || ""));
-
-class Task {
-    constructor(raw) {
-        this.index = $.userIdx++;
-        this.account = parseAccount(raw);
-        this.token = "";
-        this.signedToday = false;
-        // 设备号按 openid 稳定派生：同一账号每次跑都一样，避免被当成新设备
-        this.deviceId = "d_" + require("crypto").createHash("md5")
-            .update(String(this.account.openid || raw)).digest("hex").slice(0, 16);
-    }
-
-    log(text) {
-        $.log(`账号[${this.index}]${this.account.remark ? `[${this.account.remark}]` : ""} ${text}`);
-    }
-
-    async request(apiPath, body = null, withAuth = true, method = "POST", query = null, epHeaders = null) {
-        const isForm = false;
-        const headers = {
-            "Content-Type": isForm ? "application/x-www-form-urlencoded" : "application/json",
-            "User-Agent": USER_AGENT,
-            Referer: `https://servicewechat.com/${MINI_APP_ID}/0/page-frame.html`,
-            Accept: "application/json, text/plain, */*",
-            xweb_xhr: "1",
-            ...(epHeaders || {}),
-        };
-        if (withAuth && this.token) headers["token"] = this.token;
-        const payload = body || {};
-
-        const isGet = String(method).toUpperCase() === "GET";
-        // query 独立于 body：有些接口是 POST 但参数只在查询串上
-        const qs = query ? form(query) : (isGet && Object.keys(payload).length ? form(payload) : "");
-        const res = await axios.request({
-            method: isGet ? "GET" : "POST",
-            url: `${BASE}${apiPath}${qs ? `?${qs}` : ""}`,
-            data: isGet ? undefined : (isForm ? form(payload) : payload),
-            headers,
-            timeout: 20000,
-            validateStatus: () => true,
-        });
-        if (res.status < 200 || res.status >= 300) {
-            // 业务结论常常躺在 4xx/5xx 的 JSON 体里（"今日已签到" 见过 400 也见过 500），
-            // 有 JSON 体就交给下游按业务码判，别在这一层抛掉
-            if (res.data && typeof res.data === "object") return res.data;
-            throw new Error(`${apiPath} HTTP ${res.status}: ${short(res.data)}`);
-        }
-        return res.data;
-    }
-
-    /**
-     * wcs.getCode 在 status:false 时也会 resolve，必须自己判失败，
-     * 否则 wx_server 的取码限流会被误报成目标站登录失败。
-     */
-    async getCode() {
-        const { data } = await wechat.getCode(this.account.openid);
-        if (data && data.status === false) {
-            throw new Error(`wx_server 取code失败: ${data.message || short(data)}`);
-        }
-        const code = data?.data?.code || data?.code;
-        if (!code || typeof code !== "string") throw new Error(`wx_server 未返回 code: ${short(data)}`);
-        return code;
-    }
-
-    async login() {
-        const code = await this.getCode();
-        const res = await this.request(EP_LOGIN, { code }, false, "POST", null, null);
-        if (!isOk(res)) throw new Error(`登录失败: ${msgOf(res)}`);
-        this.token = (typeof res.data === "string" ? res.data : (res.data || {}).token) || "";
-
-        if (!this.token) throw new Error(`登录未返回 token: ${short(res)}`);
-        const cache = readCache();
-        cache[this.account.openid] = { token: this.token, updatedAt: new Date().toISOString() };
-        writeCache(cache);
-        this.log("登录成功");
-    }
-
-    async ensureLogin() {
-        const cached = readCache()[this.account.openid] || {};
-        if (!this.token && cached.token) {
-            this.token = cached.token;
-            if (await this.queryUser(false)) {
-                this.log("使用缓存token");
-                return;
-            }
-            this.log("缓存token失效，重新登录");
-            this.token = "";
-        }
-        if (!this.token) await this.login();
-    }
-
-    async queryUser(needLog = true) {
-        if (!EP_USER) return true;
-        const res = await this.request(EP_USER, {}, true, "GET", null, null);
-        if (!isOk(res)) {
-            if (needLog) this.log(`读取资料失败: ${msgOf(res)}`);
-            return false;
-        }
-        // 有的家没有 data/body 包装，响应体本身就是数据（zippo 的 profile 就是）
-        const d = res.data || res.datas || res.body || res || {};
-        if (needLog) {
-            const bits = [];
-            for (const k of ["nickname", "nickName", "name", "memberId", "integral", "points",
-                             "point", "score", "credits", "balance", "coin", "amount"]) {
-                if (d && d[k] !== undefined && d[k] !== null && d[k] !== "") bits.push(`${k}=${d[k]}`);
-            }
-            this.log(`会员: ${bits.join(" ") || short(d, 120)}`);
-        }
-        return true;
-    }
-
-    async sign(retry = true) {
-        const res = await this.request(EP_SIGN, { _t: Date.now() }, true, "GET", null, null);
-        if (isOk(res)) return this.log("✅ 签到成功");
-        if (isAlreadyDone(msgOf(res))) return this.log(`✅ 今日已签到（${msgOf(res)}）`);
-        if (isNotRegistered(msgOf(res))) {
-            return this.log(`⚠️ ${msgOf(res)} —— 该微信号还没在该平台注册会员，先在小程序里注册一次再跑`);
-        }
-        if (retry && isAuthError(msgOf(res))) {
-            this.log("会话失效，重新登录后重试");
-            this.token = "";
-            await this.login();
-            return this.sign(false);
-        }
-        this.log(`❌ 签到失败: ${msgOf(res)}`);
-    }
-
-    async run() {
-        if (!this.account.openid) {
-            this.log("跳过：变量值里没有 openid");
-            return;
-        }
-        try {
-            await this.ensureLogin();
-            await this.queryUser();
-            await this.sign();
-        } catch (e) {
-            this.log(`执行失败: ${e.message || e}`);
-        }
-    }
-}
-
-!(async () => {
-    $.checkEnv(ckName);
-    if (!$.userCount) {
-        $.log(`未找到变量 ${ckName}`);
-        return;
-    }
-    for (let i = 0; i < $.userList.length; i++) {
-        await new Task($.userList[i]).run();
-        if (i < $.userList.length - 1) await $.wait(1500, 3000);
-    }
-})()
-    .catch((e) => $.log(e.message || e))
-    .finally(() => $.done());
+!(async()=>{
+ $.checkEnv('shengongshe');if(!$.userList?.length)throw Error('no configured accounts');let failed=0;
+ for(const raw of $.userList){const t=new Task(raw);try{await t.run()}catch(e){failed++;t.log('未完成：'+safe(e))}}
+ $.log(`[QLRUN_RESULT] ${failed?'FAILURE':'SUCCESS'} accounts=${$.userList.length} failed=${failed} retryable=0 mode=${READ_ONLY?'readonly':'normal'}`);if(failed)process.exitCode=1;
+})().catch(e=>{$.log(safe(e));$.log('[QLRUN_RESULT] FAILURE reason=script_error retryable=0');process.exitCode=1}).finally(()=>$.done());

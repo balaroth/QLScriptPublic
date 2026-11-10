@@ -1311,51 +1311,68 @@ def solve_recaptcha_v2(page, max_rounds=3):
         log.append({"round": rnd, "click": cells})
         if not cells:
             break
-        clicked = []
-        for c in cells:
-            # 渲染挂起后 Playwright 的 click 会卡到超时（要求可见+稳定+可交互），
-            # 但 JS click 只派发事件、不依赖渲染状态，所以这里反过来：JS 优先。
-            # 2026-11-01 实测：日志记了 click=[1,4,5,8]，截图里只有 2 格真的变成
-            # 选中态，另外两次点击静默失败。所以每次点击后都要回读选中状态，
-            # 没生效就重试，最终把实际生效的格子单独记下来。
-            # 2026-11-09 实测：reCAPTCHA 选中态类名变成
-            # rc-imageselect-dynamic-selected —— 既没有 aria-checked="true"，
-            # 也不是独立的 selected token，所以老判定 contains('selected')
-            # 恒为 False。点击其实生效了，却每格被判成「未确认」，于是再重复
-            # 点 2 次把它 toggle 掉，verify 必然失败（日志里 12 格全部
-            # cell_click_unconfirmed、clicked_confirmed=[] 就是这个原因）。
-            # 现在改用 className 子串匹配，同时覆盖 selected /
-            # rc-imageselect-dynamic-selected / rc-imageselect-tile-selected。
-            def _cell_selected(idx):
-                try:
-                    return bool(bf.locator("td").nth(idx - 1).evaluate(
-                        "el => el.getAttribute('aria-checked') === 'true'"
-                        " || (el.className || '').indexOf('selected') >= 0"
-                        " || !!el.querySelector('.rc-imageselect-checkbox--checked')"))
-                except Exception:
-                    return None
+        def _cell_selected(idx):
+            try:
+                return bool(bf.locator("td").nth(idx - 1).evaluate(
+                    "el => el.getAttribute(\x27aria-checked\x27) === \x27true\x27"
+                    " || (el.className || \x27\x27).indexOf(\x27selected\x27) >= 0"
+                    " || !!el.querySelector(\x27.rc-imageselect-checkbox--checked\x27)"))
+            except Exception:
+                return None
 
-            # 已选中的格子绝对不能再点：dynamic 挑战下再点一次就是取消选中
-            if _cell_selected(c):
-                clicked.append(c)
-                continue
-            ok_click = False
-            for _try in range(2):
-                try:
-                    bf.locator("td").nth(c - 1).evaluate("el => el.click()")
-                except Exception:
+        def _click_cells(group, bucket):
+            # 点一组格子，把真正生效的记进 bucket；已选中的一律跳过
+            for c in group:
+                if c in bucket:
+                    continue
+                # 已选中的格子绝对不能再点：dynamic 挑战下再点一次就是取消选中
+                if _cell_selected(c):
+                    bucket.append(c)
+                    continue
+                ok_click = False
+                for _try in range(2):
                     try:
-                        bf.locator("td").nth(c - 1).click(timeout=4000)
-                    except Exception as e:
-                        log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
-                page.wait_for_timeout(320)
-                ok_click = _cell_selected(c)
+                        bf.locator("td").nth(c - 1).evaluate("el => el.click()")
+                    except Exception:
+                        try:
+                            bf.locator("td").nth(c - 1).click(timeout=4000)
+                        except Exception as e:
+                            log.append("cell_click_err_%d:%s" % (c, str(e)[:60]))
+                    page.wait_for_timeout(320)
+                    ok_click = _cell_selected(c)
+                    if ok_click:
+                        break
                 if ok_click:
-                    break
-            if ok_click:
-                clicked.append(c)
-            else:
-                log.append("cell_click_unconfirmed_%d" % c)
+                    bucket.append(c)
+                else:
+                    log.append("cell_click_unconfirmed_%d" % c)
+
+        clicked = []
+        _click_cells(cells, clicked)
+
+        # dynamic 挑战补充：这类挑战点选后会把 tile 换成新图，新图里可能又出现
+        # 目标物体，必须继续点，直到「一格都不剩」再 verify。
+        # 2026-11-10 实测：三轮 clicked_confirmed 都非空（点击完全正常）但 token
+        # 恒为 0，就是点完第一批就立刻 verify，漏掉了替换出来的新目标。
+        for _extra in range(2):
+            page.wait_for_timeout(900)
+            try:
+                tgt2 = read_target(bf) or target
+            except Exception:
+                tgt2 = target
+            if not tgt2:
+                break
+            more = None
+            if not FORCE_MANUAL:
+                more = judge_cells_stitched(bf, n_td, tgt2, log, rnd)
+            if not more:
+                break
+            more = [c for c in more if c not in clicked]
+            if not more:
+                log.append({"round": rnd, "extra": "none_new"})
+                break
+            log.append({"round": rnd, "extra_click": more})
+            _click_cells(more, clicked)
         log.append({"round": rnd, "clicked_confirmed": clicked})
         try:
             btn = bf.locator("#recaptcha-verify-button")

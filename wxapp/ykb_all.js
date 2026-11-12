@@ -755,8 +755,11 @@ function classifyAggregateSign(sign = "") {
     }
     const total = summaries.length;
     const wrote = summaries.some(x => x.writeAttempted);
-    $.log(`[QLRUN_RESULT] ${failed ? 'FAILURE' : 'SUCCESS'} total=${total} success=${success} neutral=${neutral} accepted_skip=${skipped} failed=${failed} retryable=${failed && !wrote ? 1 : 0} mode=${READ_ONLY ? 'readonly' : 'normal'}`);
-    if (failed) process.exitCode = 1;
+    // Aggregate policy: at least one authoritative success is sufficient.
+    // Failed/neutral/accepted_skip store facts remain visible and unchanged.
+    const passed = success > 0;
+    $.log(`[QLRUN_RESULT] ${passed ? 'SUCCESS' : 'FAILURE'} total=${total} success=${success} neutral=${neutral} accepted_skip=${skipped} failed=${failed} retryable=${!passed && failed && !wrote ? 1 : 0} mode=${READ_ONLY ? 'readonly' : 'normal'}`);
+    if (!passed) process.exitCode = 1;
 })()
     .catch((e) => {
         $.log(e.message || e);

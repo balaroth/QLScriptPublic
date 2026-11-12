@@ -65,6 +65,10 @@ function businessUnavailable(e) {
     if (code === '400' && message === '线上商城服务已到期') return 'service_expired';
     return '';
 }
+function nestedGatewayFailure(e) {
+    return String(e?.raw?.ResponseStatus?.ErrorCode) === '1000000' &&
+        /请求业务API系统服务无法访问\[(?:502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout)\]/.test(String(e?.raw?.ResponseStatus?.Message || ''));
+}
 function safeError(e) {
     return String(e?.raw?.ResponseStatus?.Message || e?.message || e).replace(/eyJ[\w.-]+/g, '<jwt>').replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, '<phone>').slice(0, 150);
 }
@@ -376,8 +380,7 @@ class Task {
                 const e = new Error(`${responseStatus.Message || 'business error'}(${responseStatus.ErrorCode})`); e.raw = result; e.http = status;
                 // Read-only nested gateway failures use HTTP 200 but are still transient.
                 // Never replay Submit/ReceiveTask/ReceiveTaskRewards or authentication POST.
-                const nestedGateway = String(responseStatus.ErrorCode) === '1000000' &&
-                    /请求业务API系统服务无法访问\[(?:502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout)\]/.test(String(responseStatus.Message || ''));
+                const nestedGateway = nestedGatewayFailure(e);
                 if (i + 1 < tries && nestedGateway) { await sleep(500 * (i + 1)); continue; }
                 throw e;
             }
@@ -403,6 +406,9 @@ class Task {
         } catch (e) {
             const unavailable = businessUnavailable(e);
             const configSkip = !!e?.rewardConfigEvidence && rewardConfigUnavailable(e.rewardConfigEvidence);
+            // Only an exact exhausted gateway read with zero business writes may
+            // enter the aggregate's second pass. Never retry unknown writes.
+            this.summary.recoverableRead = !this.writeAttempted && nestedGatewayFailure(e);
             this.summary.status = configSkip ? 'accepted_skip' : (unavailable ? "neutral" : "failed");
             this.summary.sign = configSkip ? 'reward_config_unavailable（未签到，按用户口径跳过）' : (unavailable || safeError(e));
         }
@@ -694,6 +700,31 @@ class Task {
     }
 }
 
+async function runPlan(plan) {
+    const summaries = [], deferred = [];
+    for (const { app, accounts } of plan) {
+        $.log(`\n========== ${app.name} (${app.ck}) ==========`);
+        let index = 1;
+        for (const account of accounts) {
+            const task = new Task(app, account, index++);
+            const result = await task.run();
+            const slot = summaries.length;
+            summaries.push(result);
+            if (result.status === 'failed' && result.recoverableRead && !result.writeAttempted) {
+                deferred.push({ app, account, index: task.index, slot });
+            }
+        }
+    }
+    // Finish unaffected stores first. Then exactly one targeted fresh instance
+    // rechecks authentication and authority under the existing durable write lock.
+    // No global replay, no state deletion, no retry of a prior business write.
+    for (const entry of deferred) {
+        $.log(`[${entry.app.name}] 精确网关读取失败，全部门店首轮结束后恢复一次`);
+        summaries[entry.slot] = await new Task(entry.app, entry.account, entry.index).run();
+    }
+    return summaries;
+}
+
 function classifyAggregateSign(sign = "") {
     // Legacy callers cannot promote a log sentence into an authoritative result.
     return "failed";
@@ -710,14 +741,7 @@ function classifyAggregateSign(sign = "") {
         return;
     }
 
-    const summaries = [];
-    for (const { app, accounts } of plan) {
-        $.log(`\n========== ${app.name} (${app.ck}) ==========`);
-        let index = 1;
-        for (const account of accounts) {
-            summaries.push(await new Task(app, account, index++).run());
-        }
-    }
+    const summaries = await runPlan(plan);
 
     $.log("\n========== 执行汇总 ==========");
     let success = 0, neutral = 0, failed = 0, skipped = 0;

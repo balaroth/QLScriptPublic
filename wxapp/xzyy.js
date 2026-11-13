@@ -1,226 +1,34 @@
 /*
-------------------------------------------
-@Description: 小紫有约 - 微信小程序静默登录 + 每日签到
+@Description: 小紫有约公众号普通积分每日签到
 cron: 35 8 * * *
-------------------------------------------
-变量名：xzyy
-变量值：wx_server 里的 openid/账号标识，多账号用 & 或换行分隔（可加 #备注）
-
-依赖变量：
-wx_server_url  默认 http://192.168.31.196:8787
-wx_auth        必填，wx_server 鉴权值
-------------------------------------------
-契约（appid wx3db193ecdebd3fea，host sxkyziqidonglai.cn）：
-（迁移自 YYB-GO 系脚本，原脚本已 code 登录）
-
-登录  GET /api/platform/wechatAuthenticate?code&channelCode&siteId&deviceHash
-        -> success && status==200，data.sessionId；session 放 cookie: SESSION=<id>
-        （msg「请用手机号登录完善用户信息」= 未做手机号注册，签到会 401 身份校验失败）
-用户  POST /api/mobile/eShop/eshopVipUser/getUserInfo (form) {siteId} -> status200，data.phone/balance；401=未登录/未注册
-签到  POST /api/mobile/activity-v2/activity/launchByValidater (json) {actCode, siteId}
-        -> status==200 成功；status==412 且含「已完成签到」= 已签
-actCode：按月生成候选 SG{YY}{上月}{0-9} 逐个探测（原脚本机制，每月缓存）。
-------------------------------------------
+变量 xzyy：wx_server 设备账号 ql，可加 #备注；依赖 wx_server_url、wx_auth。
+OAuth专用桥 /wx/xzyy-session：仅固定官网，过期自动恢复，blank状态精确恢复。
+XZYY_READ_ONLY=1：认证/活动/记录查询，零签到/cache/state/lock写。
+当月活动由官网只读配置解析，不再通过签到写接口试活动码。
 */
-
-const { Env } = require("../tools/env.js");
-const $ = new Env("小紫有约签到");
-const axios = require("axios");
-const fs = require("fs");
-const path = require("path");
-const WeChatServer = require("./wcs.js");
-
-const ckName = "xzyy";
-const MINI_APP_ID = "wx3db193ecdebd3fea";
-const HOST = "sxkyziqidonglai.cn";
-const BASE = `https://${HOST}`;
-const CHANNEL_CODE = "WXjxriol8e8293wezu";
-const DEVICE_HASH = "lkmtJuKGKQ0_S6Oem6ZIv3YoiHYGgoMf";
-const SITE_ID = "SITE_33254242630091515087";
-const SESSION_CACHE_FILE = path.join(__dirname, "xzyy_token_cache.json");
-const ACTCODE_CACHE_FILE = path.join(__dirname, "xzyy_actcode_cache.json");
-const UA = "Mozilla/5.0 (Linux; Android 12; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.0.0 Mobile Safari/537.36 MicroMessenger/8.0.5 MiniProgramEnv/android";
-
-const API_WX_AUTH = "/api/platform/wechatAuthenticate";
-const API_USER_INFO = "/api/mobile/eShop/eshopVipUser/getUserInfo";
-const API_SIGN = "/api/mobile/activity-v2/activity/launchByValidater";
-
-const wechat = new WeChatServer({
-    url: process.env.wx_server_url || "http://192.168.31.196:8787",
-    appid: MINI_APP_ID,
-    auth: process.env.wx_auth || "",
-});
-
-function readCache(file) {
-    try {
-        if (!fs.existsSync(file)) return {};
-        return JSON.parse(fs.readFileSync(file, "utf8")) || {};
-    } catch (e) {
-        return {};
-    }
+'use strict';
+const {Env}=require('../tools/env.js');const $=new Env('小紫有约签到');
+const fs=require('fs'),path=require('path'),crypto=require('crypto'),https=require('https'),axios=require('axios');
+const READ_ONLY=process.env.XZYY_READ_ONLY==='1';$.done=async()=>{if($.sendMsg)await $.sendMsg()};
+const APPID='wx3db193ecdebd3fea',BASE='https://sxkyziqidonglai.cn',SITE='SITE_33254242630091515087',CHANNEL='WXjxriol8e8293wezu';
+const EP_PROFILE='/api/mobile/eShop/eshopVipUser/getUserInfo',EP_DISCOVER='/api/mobile/activity-v2/activity/getSkillDTO',EP_PAGE='/api/mobile/activity-v2/activity/launchPage',EP_SIGN='/api/mobile/activity-v2/activity/launchByValidater';
+const agent=new https.Agent({family:4,keepAlive:true,maxSockets:2});const sleep=ms=>new Promise(r=>setTimeout(r,ms));const day=()=>new Date(Date.now()+8*3600000).toISOString().slice(0,10);
+function atomic(file,value){const b=Buffer.from(JSON.stringify(value)),tmp=file+'.tmp.'+process.pid+'.'+crypto.randomBytes(6).toString('hex');const f=fs.openSync(tmp,'wx',0o600);try{let o=0;while(o<b.length){const n=fs.writeSync(f,b,o,b.length-o);if(!Number.isInteger(n)||n<=0||n>b.length-o)throw Error('short state write');o+=n}fs.fsyncSync(f)}finally{fs.closeSync(f)}fs.renameSync(tmp,file);const d=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(d)}finally{fs.closeSync(d)}if(!fs.readFileSync(file).equals(b))throw Error('state readback failed')}
+function readState(file){if(!fs.existsSync(file))return{entries:{}};const d=JSON.parse(fs.readFileSync(file,'utf8'));if(!d||!d.entries||typeof d.entries!=='object'||Array.isArray(d.entries))throw Error('invalid state');for(const e of Object.values(d.entries)){if(!e||!Number.isInteger(e.attempts)||e.attempts<0||e.attempts>2||!['attempting','unknown','failed','success'].includes(e.outcome))throw Error('invalid state entry')}return d}
+function activityLinks(config){if(!config||!Array.isArray(config.moduleList))throw Error('invalid official activity page');const codes=[];for(const m of config.moduleList){if(m.show!==true)continue;for(const item of m.list||[]){const jump=item.jump;if(jump?.type!=='LINK'||typeof jump.data!=='string')continue;let u;try{u=new URL(jump.data)}catch(_){continue}if(u.origin===BASE&&u.pathname==='/activity/signIn'&&u.searchParams.get('siteId')===SITE&&u.searchParams.get('channelCode')===CHANNEL){const code=u.searchParams.get('actCode');if(!code||!/^[A-Za-z0-9_-]{1,100}$/.test(code))throw Error('invalid official actCode');codes.push(code)}}}const unique=[...new Set(codes)];if(unique.length!==1)throw Error('current daily sign activity not uniquely confirmed');return unique[0]}
+function safe(e){return String(e?.message||e).replace(/eyJ[\w.-]+/g,'<jwt>').replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g,'<phone>').slice(0,160)}
+function pageInfo(d,act){const a=d?.activityInfo,s=d?.signInfo;if(!a||a.actCode!==act||a.siteId!==SITE||!Number.isInteger(a.activityId)||a.activityType!=='SIGNIN'||a.activityStatus!==1||d.activityStatus!==1||!s||s.activityId!==a.activityId||s.rewardType!=='VOUCHER'||s.exchangeProduct!==0||!Array.isArray(s.signRecordVoList))throw Error('invalid current sign authority');const today=day(),start=String(a.startDate||'').slice(0,10),end=String(a.endDate||'').slice(0,10);if(!/^\d{4}-\d{2}-\d{2}$/.test(start)||!/^\d{4}-\d{2}-\d{2}$/.test(end)||today<start||today>end)throw Error('activity outside current date');for(const r of s.signRecordVoList)if(!r||r.activityId!==a.activityId||!Number.isInteger(r.id)||typeof r.signDate!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(r.signDate))throw Error('invalid sign record');const records=s.signRecordVoList.filter(r=>r.signDate===today);if(records.length>1)throw Error('ambiguous today records');return{signed:records.length===1,activityId:a.activityId,name:a.activityName,signInfo:s}}
+class Task{
+ constructor(raw){this.index=$.userIdx++;this.account=String(raw).split('#')[0].trim();this.session='';this.identity='';this.wrote=false;this.act='';this.activityId=0}
+ log(s){$.log(`账号[${this.index}] ${s}`)}
+ stateFile(){return path.join(__dirname,'xzyy_actions_'+crypto.createHash('sha256').update(this.account).digest('hex')+'.json')}
+ async request(ep,data,read=true,form=false){for(let i=0;i<(read?3:1);i++){try{const r=await axios.request({url:BASE+ep,method:'POST',data:form?new URLSearchParams(data).toString():data,headers:{Cookie:'SESSION='+this.session,'Content-Type':form?'application/x-www-form-urlencoded':'application/json',Origin:BASE,Referer:BASE+'/mall/personal?siteId='+SITE+'&channelCode='+CHANNEL},httpsAgent:agent,timeout:18000,maxRedirects:0,validateStatus:()=>true});const d=r.data;if(r.status!==200||!d||typeof d!=='object'||d.success!==true||d.status!==200){const e=Error('HTTP '+r.status+' business '+String(d?.status)+' request rejected');e.auth=r.status===401||d?.status===401||d?.status===4001;e.transient=[408,429,500,502,503,504].includes(r.status);throw e}return d.data}catch(e){if(['ECONNRESET','ECONNABORTED','ETIMEDOUT','ENETUNREACH','EAI_AGAIN','ECONNREFUSED'].includes(e.code))e.transient=true;if(read&&i<2&&e.transient){await sleep(500*(i+1));continue}throw e}}}
+ async login(){if(this.account!=='ql')throw Error('dedicated OAuth only supports configured ql device');if(!process.env.wx_server_url||!process.env.wx_auth)throw Error('wx_server configuration missing');const r=await axios.post(process.env.wx_server_url.replace(/\/$/,'')+'/wx/xzyy-session',{appid:APPID,openid:this.account,refresh:false},{headers:{auth:process.env.wx_auth},timeout:130000,maxRedirects:0});const d=r.data?.data;if(r.data?.status!==true||typeof d?.session!=='string'||!d.session||typeof d.identity!=='string'){const e=Error('official OAuth session unavailable; no sign request made');e.transient=true;throw e}this.session=d.session;this.identity=d.identity;const p=await this.request(EP_PROFILE,{siteId:SITE},true,true);if(p?.wxOpenId!==this.identity||typeof p.balance!=='number'||!Number.isFinite(p.balance))throw Error('official member identity invalid');this.balance=p.balance;this.log('公众号会话与会员身份确认')}
+ async discover(){const site=await this.request('/api/mobile/eShop/site/getBySiteId',{siteId:SITE},true,true);if(site?.siteId!==SITE||typeof site.viewJson!=='string')throw Error('official site configuration invalid');const view=JSON.parse(site.viewJson),nav=(view.configNav||[]).filter(n=>n.isShow===true&&n.navText==='活动'&&n.event?.type==='MICRO_PAGE');if(nav.length!==1)throw Error('official activity navigation not unique');const id=nav[0].event.data?.microPage?.id;if(!Number.isInteger(id)||id<1)throw Error('official micro page id invalid');const cipher=crypto.createCipheriv('aes-128-ecb',Buffer.from('T3MU9ZCSJDFH4ZG3'),null),encoded=Buffer.concat([cipher.update(String(id)),cipher.final()]).toString('base64');const micro=await this.request('/api/mobile/eShop/siteView/getMicroPageDetail',{siteId:SITE,id:encoded},true,true);if(micro?.siteId!==SITE||micro.id!==id||typeof micro.json!=='string')throw Error('official activity page identity invalid');this.act=activityLinks(JSON.parse(micro.json));const d=await this.request(EP_PAGE,{actCode:this.act,siteId:SITE});const p=pageInfo(d,this.act);this.activityId=p.activityId;return p}
+ async authority(){const p=pageInfo(await this.request(EP_PAGE,{actCode:this.act,siteId:SITE}),this.act);if(p.activityId!==this.activityId)throw Error('activity changed during sign');return p.signed}
+ async run(){await this.login();const current=await this.discover();if(READ_ONLY){this.log('只读权威状态：'+(current.signed?'已签':'未签')+'，零业务写');return}const file=this.stateFile(),lock=file+'.lock',fd=fs.openSync(lock,'wx',0o600);try{const s=readState(file),key=day()+'::'+this.activityId;const signed=await this.authority();if(signed){if(s.entries[key]){s.entries[key].outcome='success';atomic(file,s)}this.log('今日已签到（权威确认）');return}const old=s.entries[key];if(old){if(old.attempts>=2)throw Error('daily attempts exhausted');const at=Date.parse(old.attemptedAt);if(!Number.isFinite(at)||Date.now()-at<300000)throw Error('unknown write cooling; no replay');await sleep(500);if(await this.authority()){old.outcome='success';atomic(file,s);return}}
+ s.entries[key]={...(old||{}),attempts:(old?.attempts||0)+1,outcome:'attempting',attemptedAt:new Date().toISOString(),activityId:this.activityId};atomic(file,s);this.wrote=true;let error;try{await this.request(EP_SIGN,{actCode:this.act,siteId:SITE},false)}catch(e){error=e}
+ for(let i=0;i<3;i++){let signed;try{signed=await this.authority()}catch(_){}if(signed===true){s.entries[key].outcome='success';atomic(file,s);this.log('签到成功（服务端当日记录确认）');return}if(i<2)await sleep(700*(i+1))}s.entries[key].outcome='unknown';atomic(file,s);throw Error('sign write unconfirmed; no replay'+(error?' '+safe(error):''))
+ }finally{fs.closeSync(fd);fs.unlinkSync(lock)}}
 }
-function writeCache(file, cache) {
-    try {
-        fs.writeFileSync(file, JSON.stringify(cache, null, 2), "utf8");
-    } catch (e) {
-        $.log(`写入缓存失败: ${e.message || e}`);
-    }
-}
-function parseAccount(raw = "") {
-    const [id, remark] = String(raw).split("#").map((s) => (s || "").trim());
-    return { openid: id, remark: remark || "" };
-}
-function short(v, n = 200) {
-    const t = typeof v === "string" ? v : JSON.stringify(v);
-    return !t ? "" : t.length > n ? `${t.slice(0, n)}...` : t;
-}
-function commonHeaders(session) {
-    const h = {
-        "User-Agent": UA,
-        accept: "application/json, text/plain, */*",
-        "content-type": "application/json",
-        origin: BASE,
-        referer: `${BASE}/mall/personal?siteId=${SITE_ID}&channelCode=${CHANNEL_CODE}`,
-        "x-requested-with": "com.tencent.mm",
-    };
-    if (session) h.cookie = `SESSION=${session}`;
-    return h;
-}
-/** actCode 候选：SG + 两位年 + 上个月 + 0..9（原脚本机制） */
-function generateCandidates() {
-    const now = new Date();
-    let lm = now.getMonth(); // getMonth 是 0..11，即“当前月-1”正好是上个月的月份数
-    let year = now.getFullYear();
-    if (lm === 0) { lm = 12; year -= 1; }
-    const y2 = String(year % 100).padStart(2, "0");
-    return Array.from({ length: 10 }, (_, i) => `SG${y2}${lm}${i}`);
-}
-function monthKey() {
-    const now = new Date();
-    return `${now.getFullYear()}-${now.getMonth() + 1}`;
-}
-
-class Task {
-    constructor(raw) {
-        this.index = $.userIdx++;
-        this.account = parseAccount(raw);
-        this.session = "";
-    }
-    log(text) {
-        $.log(`账号[${this.index}]${this.account.remark ? `[${this.account.remark}]` : ""} ${text}`);
-    }
-    async getCode() {
-        const { data } = await wechat.getCode(this.account.openid);
-        if (data && data.status === false) throw new Error(`wx_server 取code失败: ${data.message || short(data)}`);
-        const code = data?.data?.code || data?.code;
-        if (!code || typeof code !== "string") throw new Error(`wx_server 未返回 code: ${short(data)}`);
-        return code;
-    }
-    async login() {
-        const code = await this.getCode();
-        const res = await axios.request({
-            method: "GET", url: `${BASE}${API_WX_AUTH}`,
-            params: { code, channelCode: CHANNEL_CODE, siteId: SITE_ID, deviceHash: DEVICE_HASH },
-            headers: commonHeaders(), timeout: 20000, validateStatus: () => true,
-        });
-        const d = res.data || {};
-        if (!(d.success && Number(d.status) === 200) || !(d.data || {}).sessionId) {
-            throw new Error(`登录失败: ${d.msg || short(d)}`);
-        }
-        this.session = d.data.sessionId;
-        // 「请用手机号登录完善用户信息」= 未做手机号注册
-        this.unregistered = /请用手机号登录|完善用户信息/.test(String(d.msg || ""));
-        const cache = readCache(SESSION_CACHE_FILE);
-        cache[this.account.openid] = { session: this.session, updatedAt: new Date().toISOString() };
-        writeCache(SESSION_CACHE_FILE, cache);
-        this.log(`登录成功${this.unregistered ? "（该微信号未做手机号注册）" : ""}`);
-    }
-    async checkUser() {
-        const res = await axios.request({
-            method: "POST", url: `${BASE}${API_USER_INFO}`,
-            data: `siteId=${encodeURIComponent(SITE_ID)}`,
-            headers: { ...commonHeaders(this.session), "content-type": "application/x-www-form-urlencoded" },
-            timeout: 20000, validateStatus: () => true,
-        });
-        const rs = res.data || {};
-        if (Number(rs.status) === 200) return { ok: true, phone: (rs.data || {}).phone, balance: (rs.data || {}).balance };
-        return { ok: false, msg: rs.msg };
-    }
-    async trySign(actCode) {
-        const res = await axios.request({
-            method: "POST", url: `${BASE}${API_SIGN}`, data: { actCode, siteId: SITE_ID },
-            headers: commonHeaders(this.session), timeout: 20000, validateStatus: () => true,
-        });
-        const rs = res.data || {};
-        const status = Number(rs.status);
-        const msg = String(rs.msg || "");
-        if (rs.success || status === 200) return { done: true, already: false, msg };
-        if (status === 412 && /已完成签到/.test(msg)) return { done: true, already: true, msg };
-        return { done: false, status, msg };
-    }
-    /** 取本月缓存的 actCode，没有则用候选逐个探测 */
-    async resolveActCodeAndSign() {
-        const cache = readCache(ACTCODE_CACHE_FILE);
-        const mk = monthKey();
-        if (cache.month === mk && cache.actCode) {
-            const r = await this.trySign(cache.actCode);
-            if (r.done) return r;
-            // 缓存失效则重新探测
-        }
-        const candidates = generateCandidates();
-        this.log(`探测 actCode（${candidates[0]}..${candidates[candidates.length - 1]}）`);
-        let lastMsg = "";
-        for (const act of candidates) {
-            const r = await this.trySign(act);
-            lastMsg = r.msg;
-            if (r.done) {
-                writeCache(ACTCODE_CACHE_FILE, { month: mk, actCode: act });
-                return r;
-            }
-            // 身份校验失败=账号未注册，无需继续探测
-            if (Number(r.status) === 401) return { done: false, status: 401, msg: r.msg };
-            await $.wait(1200, 2000);
-        }
-        return { done: false, msg: lastMsg || "未找到有效 actCode" };
-    }
-    async sign() {
-        const u = await this.checkUser();
-        if (!u.ok || this.unregistered) {
-            return this.log(`⚠️ 该微信号还没在小紫有约做手机号注册（${u.msg || "未登录"}），先在小程序里手机号登录一次再跑`);
-        }
-        const r = await this.resolveActCodeAndSign();
-        if (r.done && r.already) return this.log(`✅ 今日已签到（${r.msg}）`);
-        if (r.done) return this.log(`✅ 签到成功`);
-        if (Number(r.status) === 401) return this.log(`⚠️ 身份校验失败（${r.msg}），该微信号可能未完成注册`);
-        this.log(`❌ 签到失败: ${r.msg}`);
-    }
-    async ensureLogin() {
-        const cached = readCache(SESSION_CACHE_FILE)[this.account.openid] || {};
-        if (!this.session && cached.session) {
-            this.session = cached.session;
-            // 用 getUserInfo 校验缓存 session 是否仍有效
-            const u = await this.checkUser();
-            if (u.ok) { this.log("使用缓存session"); return; }
-            this.session = "";
-        }
-        if (!this.session) await this.login();
-    }
-    async run() {
-        if (!this.account.openid) { this.log("跳过：变量值里没有 openid"); return; }
-        try {
-            await this.ensureLogin();
-            await this.sign();
-        } catch (e) {
-            this.log(`执行失败: ${e.message || e}`);
-        }
-    }
-}
-
-!(async () => {
-    $.checkEnv(ckName);
-    if (!$.userCount) { $.log(`未找到变量 ${ckName}`); return; }
-    for (let i = 0; i < $.userList.length; i++) {
-        await new Task($.userList[i]).run();
-        if (i < $.userList.length - 1) await $.wait(1500, 3000);
-    }
-})().catch((e) => $.log(e.message || e)).finally(() => $.done());
+!(async()=>{$.checkEnv('xzyy');if(!$.userList?.length)throw Error('no configured accounts');let failed=0,wrote=false,retryable=true;for(const raw of $.userList){const t=new Task(raw);try{await t.run()}catch(e){failed++;retryable=retryable&&!!e.transient;t.log('未完成：'+safe(e))}wrote=wrote||t.wrote}$.log(`[QLRUN_RESULT] ${failed?'FAILURE':'SUCCESS'} accounts=${$.userList.length} failed=${failed} retryable=${failed&&!wrote&&retryable?1:0} mode=${READ_ONLY?'readonly':'normal'}`);if(failed)process.exitCode=1})().catch(e=>{$.log(safe(e));$.log('[QLRUN_RESULT] FAILURE reason=script_error retryable=0');process.exitCode=1}).finally(async()=>{try{await $.done()}finally{agent.destroy()}});

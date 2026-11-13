@@ -10,6 +10,10 @@ CAMPARI_READ_ONLY=1：仅认证及权威查询，零签到/cache/state/lock写�
 'use strict';
 const {Env}=require('../tools/env.js');const $=new Env('金巴厘杯中空间签到');
 const fs=require('fs'),path=require('path'),crypto=require('crypto'),axios=require('axios');
+const {Agent,fetch:businessFetch}=require('undici');
+// Explicit direct IPv4 connector, paired with its own fetch ABI. Keeps TLS
+// verification and avoids both the shared fetch pool and gateway POST replay.
+const businessAgent=new Agent({connect:{family:4,timeout:18000}});
 const READ_ONLY=process.env.CAMPARI_READ_ONLY==='1';
 $.done=async()=>{if($.sendMsg)await $.sendMsg()};
 const APPID='wx059d0e2508ab7045',BASE='https://camparicrm.81680.cn';
@@ -36,7 +40,7 @@ class Task{
   const tries=read?3:1;
   for(let i=0;i<tries;i++){
    try{
-    const r=await fetch(BASE+api,{method:'POST',headers:{'Content-Type':'application/json',Referer:`https://servicewechat.com/${APPID}/70/page-frame.html`,...(auth?{Authorization:'Bearer '+this.session.token}:{})},body:JSON.stringify(data),signal:AbortSignal.timeout(18000),redirect:'error'});
+    const r=await businessFetch(BASE+api,{dispatcher:businessAgent,method:'POST',headers:{'Content-Type':'application/json',Referer:`https://servicewechat.com/${APPID}/70/page-frame.html`,...(auth?{Authorization:'Bearer '+this.session.token}:{})},body:JSON.stringify(data),signal:AbortSignal.timeout(18000),redirect:'error'});
     const text=await r.text();let v;try{v=JSON.parse(text)}catch(_){const e=Error('HTTP '+r.status+' invalid JSON');e.transient=r.status>=500;throw e}
     if(r.status!==200||v?.code!==200){const e=Error('HTTP '+r.status+' business '+String(v?.code)+' '+String(v?.msg||'request rejected').slice(0,100));e.auth=r.status===401||v?.code===401;e.transient=[408,429,500,502,503,504].includes(r.status);throw e}
     return v;
@@ -73,7 +77,7 @@ class Task{
  }
 }
 !(async()=>{
- $.checkEnv('campari');if(!$.userList?.length)throw Error('no configured accounts');let failed=0,wrote=false;
- for(const account of $.userList){const t=new Task(account);try{await t.run()}catch(e){failed++;t.log('未完成：'+safe(e))}wrote=wrote||t.wrote}
- $.log(`[QLRUN_RESULT] ${failed?'FAILURE':'SUCCESS'} accounts=${$.userList.length} failed=${failed} retryable=0 mode=${READ_ONLY?'readonly':'normal'}`);if(failed)process.exitCode=1;
-})().catch(e=>{$.log(safe(e));$.log('[QLRUN_RESULT] FAILURE reason=script_error retryable=0');process.exitCode=1}).finally(()=>$.done());
+ $.checkEnv('campari');if(!$.userList?.length)throw Error('no configured accounts');let failed=0,wrote=false,retryable=true;
+ for(const account of $.userList){const t=new Task(account);try{await t.run()}catch(e){failed++;retryable=retryable&&transient(e);t.log('未完成：'+safe(e))}wrote=wrote||t.wrote}
+ $.log(`[QLRUN_RESULT] ${failed?'FAILURE':'SUCCESS'} accounts=${$.userList.length} failed=${failed} retryable=${failed&&!wrote&&retryable?1:0} mode=${READ_ONLY?'readonly':'normal'}`);if(failed)process.exitCode=1;
+})().catch(e=>{$.log(safe(e));$.log('[QLRUN_RESULT] FAILURE reason=script_error retryable=0');process.exitCode=1}).finally(async()=>{try{await $.done()}finally{await businessAgent.close()}});

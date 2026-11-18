@@ -43,9 +43,51 @@ const USER_AGENT =
 
 const EP_LOGIN = "/api/index/get_openid";
 const EP_HOME = "/api/checkin/home";
-const EP_PREPARE = "/api/checkin/ad/prepare";
+const READ_ONLY = process.env.JYK_READ_ONLY === "1" || process.env.QL_READ_ONLY === "1";
+const WRITE_STATE_FILE = path.join(__dirname, ".jyk_write_state.json");
+const crypto = require("crypto");
+function writeKey(alias) {
+    return crypto.createHash("sha256").update(String(alias)).digest("hex") + "|" + new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+}
+function readWriteState() {
+    let raw;
+    try { raw = fs.readFileSync(WRITE_STATE_FILE, "utf8"); }
+    catch (e) { if (e.code === "ENOENT") return {}; throw e; }
+    const state = JSON.parse(raw);
+    if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("写状态损坏");
+    return state;
+}
+function acquireWriteLock(alias) {
+    const file = WRITE_STATE_FILE + ".lock";
+    const fd = fs.openSync(file, "wx", 0o600);
+    fs.closeSync(fd);
+    return () => fs.unlinkSync(file);
+}
+function persistWriteState(key, entry) {
+    const state = readWriteState(); state[key] = entry;
+    const data = Buffer.from(JSON.stringify(state));
+    const tmp = WRITE_STATE_FILE + ".tmp." + process.pid;
+    let fd = -1;
+    try {
+        fd = fs.openSync(tmp, "wx", 0o600);
+        let offset = 0;
+        while (offset < data.length) {
+            const n = fs.writeSync(fd, data, offset, data.length - offset);
+            if (!Number.isInteger(n) || n <= 0 || n > data.length - offset) throw new Error("状态短写失败");
+            offset += n;
+        }
+        fs.fsyncSync(fd); fs.closeSync(fd); fd = -1;
+        fs.renameSync(tmp, WRITE_STATE_FILE);
+        const dfd = fs.openSync(path.dirname(WRITE_STATE_FILE), "r");
+        try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
+        if (!fs.readFileSync(WRITE_STATE_FILE).equals(data)) throw new Error("状态回读不一致");
+    } catch (e) {
+        if (fd >= 0) { try { fs.closeSync(fd); } catch {} }
+        try { fs.unlinkSync(tmp); } catch {}
+        throw e;
+    }
+}
 const EP_SIGN = "/api/checkin/sign";
-const EP_AD_SIGN = "/api/checkin/ad/sign";
 
 const wechat = new WeChatServer({
     url: process.env.wx_server_url || "http://192.168.31.196:8787",
@@ -62,6 +104,7 @@ function readCache() {
     }
 }
 function writeCache(cache) {
+    if (READ_ONLY) return;
     try {
         fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
     } catch (e) {
@@ -105,9 +148,9 @@ class Task {
             timeout: 20000,
             validateStatus: () => true,
         });
-        if (res.status !== 200) {
-            if (res.data && typeof res.data === "object") return res.data;
-            throw new Error(`${apiPath} HTTP ${res.status}: ${short(res.data)}`);
+        if (res.status !== 200) throw new Error(`${apiPath} HTTP ${res.status}`);
+        if (!res.data || typeof res.data !== "object" || Array.isArray(res.data) || !Object.prototype.hasOwnProperty.call(res.data, "errno")) {
+            throw new Error(`${apiPath} 响应信封无效`);
         }
         return res.data;
     }
@@ -135,64 +178,49 @@ class Task {
         if (Number(res?.errno) !== 0) throw new Error(`home失败: ${res?.errmsg || short(res)}`);
         return res.data || {};
     }
-    async sign() {
-        const signed = await this.request("POST", EP_SIGN, {});
-        if (Number(signed?.errno) === 0) {
-            const d = signed.data || {};
-            return this.log(`✅ 签到成功${d.score !== undefined ? `，获得 ${d.score} 积分` : ""}${d.integral !== undefined ? `，积分 ${d.integral}` : ""}`);
-        }
-        if (/已签|签到过|重复|已完成/.test(String(signed?.errmsg || signed?.msg || ""))) return this.log(`✅ 今日已签到（${signed.errmsg || signed.msg}）`);
-        this.log(`❌ 签到失败: ${signed?.errmsg || signed?.msg || short(signed)}`);
-    }
-    async prepareAndSign() {
-        const prepared = await this.request("POST", EP_PREPARE);
-        if (Number(prepared?.errno) !== 0) return this.log(`❌ 广告签到 prepare 失败: ${short(prepared)}`);
-        const adToken = String((prepared.data || {}).ad_token || "");
-        if (!adToken) return this.log("❌ 广告签到 prepare 未返回 ad_token");
-        await $.wait(10 * 1000)
-        const signed = await this.request("POST", EP_AD_SIGN, { ad_token: adToken });
-        if (Number(signed?.errno) === 0) {
-            const d = signed.data || {};
-            this.log(`✅ 广告签到成功${d.score !== undefined ? `，获得 ${d.score} 积分` : ""}${d.integral !== undefined ? `，积分 ${d.integral}` : ""}`);
-            await $.wait(30 * 1000)
-            await this.checkin_sign('ad');
-            return
-        }
-        if (/已签|签到过|重复|已完成/.test(String(signed?.errmsg || signed?.msg || ""))) return this.log(`✅ 今日已签到（${signed.errmsg || signed.msg}）`);
-        this.log(`❌ 广告签到失败: ${signed?.errmsg || signed?.msg || short(signed)}`);
-    }
-    async checkin_sign(type) {
+    async checkin_sign() {
         let home;
-        try {
+        try { home = await this.home(); }
+        catch (e) {
+            if (!/token|登录|未授权|失效|过期|401/i.test(String(e.message))) throw e;
+            this.token = "";
+            await this.login();
             home = await this.home();
-        } catch (e) {
-            if (/token|登录|未授权|失效|过期|401/i.test(String(e.message))) {
-                this.token = "";
-                await this.login();
-                home = await this.home();
-            } else throw e;
         }
-        this.log(`可用积分：${home.integral}`)
-        if (type == 'ad') {
-            if (home.ad && home.ad.today_count < home.ad.daily_limit) {
-                await this.prepareAndSign();
-            } else {
-                this.log("✅ 今日广告签到已完成签到或不可签")
-            }
-            
-        } else {
-            if (!home.enabled) return this.log("普通签到未开启");
-            if (home.today_signed || !home.can_sign) {
-                this.log("✅ 今日普通签到已签到或不可签")
-            } else {
-                await this.sign();
-            }
-            if (home.ad && home.ad.today_count < home.ad.daily_limit) {
-                await this.prepareAndSign();
-            } else {
-                this.log("✅ 今日广告签到已完成签到或不可签")
-            }
+        this.log(`可用积分：${home.integral}`);
+        /* Only a complete, explicit server state can authorize a skip or POST. */
+        if (typeof home.enabled !== "boolean" || typeof home.today_signed !== "boolean" || typeof home.can_sign !== "boolean") {
+            throw new Error("签到权威字段缺失或类型错误");
         }
+        if (home.today_signed) return { ok: true, reason: "already_signed", wrote: 0 };
+        if (home.enabled === false && home.can_sign === false) {
+            this.log("普通签到未开启（服务端明确关闭）；不执行广告签到");
+            return { ok: true, reason: "ordinary_checkin_disabled", wrote: 0, adEnabled: home.ad?.enabled === true };
+        }
+        if (!home.enabled || !home.can_sign) throw new Error("签到资格不可用且不是明确关闭状态");
+        if (READ_ONLY) return { ok: true, reason: "read_only_unsigned", wrote: 0 };
+        const lock = acquireWriteLock(this.account.openid);
+        try {
+            const second = await this.home();
+            if (typeof second.today_signed !== "boolean" || second.enabled !== true || second.can_sign !== true && !second.today_signed) throw new Error("写前权威状态不可确认");
+            if (second.today_signed) return { ok: true, reason: "already_signed", wrote: 0 };
+            const stateKey = writeKey(this.account.openid);
+            const prev = readWriteState()[stateKey];
+            if (prev) throw new Error("当日已有写入记录，禁止自动重放");
+            persistWriteState(stateKey, { status: "attempting", attemptedAt: Date.now(), attempts: 1 });
+            let response;
+            try { response = await this.request("POST", EP_SIGN, {}); }
+            catch { /* Only the subsequent authority read decides business success. */ }
+            let after;
+            try { after = await this.home(); } catch {}
+            if (after?.today_signed === true) {
+                persistWriteState(stateKey, { status: "success", attempts: 1, confirmedAt: Date.now() });
+                this.log("普通签到成功（服务端确认）");
+                return { ok: true, reason: "signed", wrote: 1 };
+            }
+            persistWriteState(stateKey, { status: "unknown", attempts: 1, checkedAt: Date.now() });
+            return { ok: false, reason: "write_unconfirmed", retryable: 0, wrote: 1 };
+        } finally { lock(); }
     }
     async ensureLogin() {
         const cached = readCache()[this.account.openid] || {};
@@ -200,21 +228,35 @@ class Task {
         if (!this.token) await this.login();
     }
     async run() {
-        if (!this.account.openid) { this.log("跳过：变量值里没有 openid"); return; }
+        if (!this.account.openid) return { ok: false, reason: "no_account", retryable: 0 };
         try {
             await this.ensureLogin();
-            await this.checkin_sign();
+            return await this.checkin_sign();
         } catch (e) {
             this.log(`执行失败: ${e.message || e}`);
+            return { ok: false, reason: "execution_failed", retryable: 0 };
         }
     }
 }
 
+async function finish(code) {
+    const exit = process.exit.bind(process);
+    process.exit = () => {};
+    try { await $.done(); } finally { process.exit = exit; }
+    exit(code);
+}
 !(async () => {
     $.checkEnv(ckName);
-    if (!$.userCount) { $.log(`未找到变量 ${ckName}`); return; }
+    const results = [];
+    if (!$.userCount) results.push({ ok: false, reason: "no_env", retryable: 0 });
     for (let i = 0; i < $.userList.length; i++) {
-        await new Task($.userList[i]).run();
+        results.push(await new Task($.userList[i]).run());
         if (i < $.userList.length - 1) await $.wait(1500, 3000);
     }
-})().catch((e) => $.log(e.message || e)).finally(() => $.done());
+    const ok = results.length > 0 && results.every(r => r.ok);
+    console.log(`[QLRUN_RESULT] ${ok ? "SUCCESS" : "FAILURE"} ${JSON.stringify({ script: "jyk.js", accounts: $.userCount, failed: results.filter(r => !r.ok).length, retryable: 0, mode: READ_ONLY ? "read_only" : "normal", results })}`);
+    await finish(ok ? 0 : 1);
+})().catch(async () => {
+    console.log('[QLRUN_RESULT] FAILURE {"script":"jyk.js","reason":"exception","retryable":0}');
+    await finish(1);
+});

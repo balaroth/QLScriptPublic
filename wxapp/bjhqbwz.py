@@ -10,6 +10,8 @@
 #cron 15 9 * * *
 
 import base64
+import fcntl
+import tempfile
 import hashlib
 import hmac
 import json
@@ -54,7 +56,12 @@ MEMBER_IDENTITIES = ("NORMAL_MEMBER", "ANNUAL_CARD_MEMBER")
 POOL_GATE_HINT = "奖池"
 # 奖池自动选择(用户授权): ticket1=指定日门票5折 / ticket2=门票+优速通套餐5折 /
 # hotel=酒店5折。默认 ticket2(门票+优速通)。置空或 none/off 关闭自动选。
-POOL_CHOICE = os.getenv("bjhqbwz_pool", "ticket2").strip().lower()
+# No implicit prize selection. Local account settings are never committed.
+try:
+    _settings = json.loads(Path(__file__).with_name(".bjhqbwz_settings.json").read_text())
+except FileNotFoundError:
+    _settings = {}
+POOL_CHOICE = os.getenv("bjhqbwz_pool", _settings.get("pool", "")).strip().lower()
 POOL_LABELS = {
     "ticket1": "指定日门票5折优惠券",
     "ticket2": "门票+环球优速通套餐5折优惠券",
@@ -108,6 +115,8 @@ def read_token_cache():
 
 
 def write_token_cache(cache):
+    if READ_ONLY:
+        return
     try:
         TOKEN_CACHE_PATH.write_text(
             json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -259,19 +268,37 @@ def is_member(entity):
 def login(account_id):
     """wx.login code -> user/login (postNoAuth, 无 ArrowAuthorization) -> entity。
 
-    源码逻辑: 200 时若 data.entity.id 存在则为会员实体, 否则视为未注册
-    (NONMEMBER, id=-1)。未注册用户需在小程序内经手机号授权 (wechatLogin) 注册,
-    属于手机号 PII 前置条件, 本脚本不自动触发, 仅识别并如实上报。
+    无有效会员实体时，通过同一 runtime 的标准手机号授权包恢复既有会员会话。
+    空 data 不是“从未注册”的证据；恢复失败明确报错，不包装为成功。
     """
     code = get_wx_code(account_id)
     body = {"code": code, "registerSource": "", "activityCode": ACTIVITY_CODE}
     # 登录接口 postNoAuth: 仍签名, 但不带 ArrowAuthorization/userId
     resp = api_post(f"{PATH_PREFIX}/ubr/user/login", body)
-    if resp_code(resp) != SUCCESS_CODE:
-        raise RuntimeError(f"登录失败: {resp.get('message') or resp.get('msg') or resp}")
+    if resp_code(resp) not in (SUCCESS_CODE, 50001):
+        raise RuntimeError(f"登录失败 code={resp_code(resp)}")
     entity = envelope_entity(resp)
-    if not entity or str(entity.get("id", "-1")) == "-1":
-        entity = {"id": "-1", "uid": "", "identity": "NONMEMBER"}
+    # An empty response does not establish that an existing member is unregistered.
+    # Use the official, same-runtime phone/login bundle to renew membership.
+    if not is_member(entity):
+        bundle = session.post(f"{WX_SERVER_URL}/wx/phone-login-bundle",
+                              json={"appid": MINI_APP_ID, "openid": account_id},
+                              headers={"auth": WX_AUTH}, timeout=90)
+        bundle.raise_for_status()
+        package = bundle.json()
+        data = package.get("data") or {}
+        fresh = data.get("loginCode") or package.get("loginCode")
+        phone = data.get("phoneCode") or package.get("phoneCode")
+        if package.get("status") is not True or not fresh or not phone:
+            raise RuntimeError("member_session_restore_failed")
+        restored = api_post(f"{PATH_PREFIX}/ubr/user/wechatLogin",
+                            {"code": fresh, "acceptPushProvisions": False,
+                             "activityCode": ACTIVITY_CODE, "phoneCode": phone,
+                             "id": str(entity.get("id", "-1"))},
+                            token=entity.get("token", ""), user_id=entity.get("id", "-1"))
+        entity = envelope_entity(restored)
+        if resp_code(restored) != SUCCESS_CODE or not is_member(entity) or not entity.get("token"):
+            raise RuntimeError("member_session_restore_rejected")
     return entity
 
 
@@ -343,118 +370,119 @@ def already_signed_today(record_resp):
     return False
 
 
-def run_account(account_id, index):
-    lines = [f"【账号 {index}】"]
+READ_ONLY = os.getenv("BJHQBWZ_READ_ONLY") == "1" or os.getenv("QL_READ_ONLY") == "1"
+WRITE_STATE_PATH = Path(__file__).with_name(".bjhqbwz_write_state.json")
+LOCK_PATH = Path(__file__).with_name(".bjhqbwz_write.lock")
 
-    entity = get_entity_for_account(account_id, index)
-
-    # 前置条件: 未注册会员 (无手机号授权) 无法签到; 如实上报, 不自动触发手机号授权
-    if not is_member(entity):
-        msg = "该账号尚未注册, 需先在小程序「北京环球度假区互动福利站→签到」完成手机号授权注册后才能签到"
-        print(f"⚠️ 账号 {index} {msg}")
-        lines.append(f"⚠️ {msg}")
-        return "\n".join(lines), False
-
-    token = entity.get("token")
-    user_id = entity.get("id")
-    if not token:
-        msg = "登录未返回会话凭证 (token), 需在小程序内重新登录一次以生成会话后再运行"
-        print(f"⚠️ 账号 {index} {msg}")
-        lines.append(f"⚠️ {msg}")
-        return "\n".join(lines), False
-
-    # 拉取任务详情 (首个鉴权调用); 会话失效则强制重登重试一次
-    detail = activity_detail(token, user_id)
-    if resp_code(detail) in SESSION_CODES:
-        print(f"账号 {index} 会话失效, 重新登录...")
-        remove_cached_entity(account_id)
-        entity = get_entity_for_account(account_id, index, force=True)
-        token, user_id = entity.get("token"), entity.get("id")
-        detail = activity_detail(token, user_id)
-
-    dcode = resp_code(detail)
-    if dcode in (NEED_GOV_CODE, NEED_CERT_CODE):
-        msg = "需先在小程序内完成实名/身份证信息后才能签到"
-        print(f"⚠️ 账号 {index} {msg} (code={dcode})")
-        lines.append(f"⚠️ {msg}")
-        return "\n".join(lines), False
-    if dcode != SUCCESS_CODE:
-        msg = detail.get("message") or detail.get("msg") or f"获取活动详情失败 code={dcode}"
-        print(f"❌ 账号 {index} {msg}")
-        lines.append(f"❌ {msg}")
-        return "\n".join(lines), False
-
-    template_id = find_sign_in_template_id(detail)
-    if not template_id:
-        msg = "未找到签到任务(SIGN_IN), 活动可能已结束"
-        print(f"⚠️ 账号 {index} {msg}")
-        lines.append(f"⚠️ {msg}")
-        return "\n".join(lines), False
-
-    # 幂等预检: 今日是否已签到
-    month = bj_now().strftime("%Y-%m")
+def read_write_state():
     try:
-        record = sign_in_record(token, user_id, month)
-        if resp_code(record) == SUCCESS_CODE and already_signed_today(record):
-            msg = "今日已签到, 无需重复"
-            print(f"✅ 账号 {index} {msg}")
-            lines.append(f"✅ {msg}")
-            return "\n".join(lines), True
-    except Exception as e:
-        print(f"账号 {index} 签到记录预检失败(忽略, 继续签到): {e}")
+        data = json.loads(WRITE_STATE_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise RuntimeError("write_state_invalid")
+    return data
 
-    result = complete_quest(token, user_id, template_id)
-    rcode = resp_code(result)
+def persist_write_state(key, entry):
+    state = read_write_state()
+    state[key] = entry
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode()
+    fd, tmp = tempfile.mkstemp(dir=str(WRITE_STATE_PATH.parent), prefix=WRITE_STATE_PATH.name + ".tmp.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            if f.write(payload) != len(payload):
+                raise RuntimeError("state_short_write")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, WRITE_STATE_PATH)
+        dfd = os.open(str(WRITE_STATE_PATH.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        if WRITE_STATE_PATH.read_bytes() != payload:
+            raise RuntimeError("state_readback_failed")
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
-    # 奖池门槛: 首签前需选一个抽奖奖池。按用户授权(bjhqbwz_pool)自动选定一次后重试;
-    # 未授权(置空)则如实上报, 由用户在小程序内手动选。选池是一次性动作, 不触发抽奖。
-    if rcode != SUCCESS_CODE and POOL_GATE_HINT in (result.get("message") or result.get("msg") or ""):
-        if POOL_CHOICE in POOL_LABELS:
-            label = POOL_LABELS[POOL_CHOICE]
-            print(f"账号 {index} 检测到奖池门槛, 按授权自动选定奖池「{label}」...")
-            sel = select_surprise5_pool(token, user_id, POOL_CHOICE)
-            if resp_code(sel) == SUCCESS_CODE:
-                print(f"账号 {index} 奖池已选定「{label}」, 重试签到...")
-                lines.append(f"已选定奖池「{label}」")
-                result = complete_quest(token, user_id, template_id)
-                rcode = resp_code(result)
-            else:
-                smsg = sel.get("message") or sel.get("msg") or f"code={resp_code(sel)}"
-                print(f"⚠️ 账号 {index} 选择奖池失败: {smsg}")
-                lines.append(f"⚠️ 选择奖池失败({smsg})。{POOL_GATE_MSG}")
-                return "\n".join(lines), False
-        else:
-            print(f"⚠️ 账号 {index} {POOL_GATE_MSG}")
-            lines.append(f"⚠️ {POOL_GATE_MSG}")
-            return "\n".join(lines), False
+def authority(entity):
+    r = sign_in_record(entity["token"], entity["id"], bj_now().strftime("%Y-%m"))
+    if resp_code(r) != SUCCESS_CODE:
+        raise RuntimeError("sign_record_unavailable")
+    rows = envelope_entity(r).get("signInInfos")
+    if not isinstance(rows, list):
+        raise RuntimeError("sign_record_fields_invalid")
+    today = bj_now().strftime("%Y-%m-%d")
+    current = [x for x in rows if isinstance(x, dict) and x.get("day") == today]
+    if len(current) != 1 or not isinstance(current[0].get("signIn"), bool):
+        raise RuntimeError("sign_record_today_invalid")
+    return current[0]["signIn"]
 
-    if rcode in (NEED_GOV_CODE, NEED_CERT_CODE):
-        msg = "需先在小程序内完成实名/身份证信息后才能签到"
-        print(f"⚠️ 账号 {index} {msg} (code={rcode})")
-        lines.append(f"⚠️ {msg}")
-        return "\n".join(lines), False
-    if rcode != SUCCESS_CODE:
-        raw_msg = result.get("message") or result.get("msg") or ""
-        if POOL_GATE_HINT in raw_msg:            # 选池后仍报门槛(异常), 转为可读上报
-            print(f"⚠️ 账号 {index} {POOL_GATE_MSG}")
-            lines.append(f"⚠️ {POOL_GATE_MSG}")
-            return "\n".join(lines), False
-        msg = raw_msg or f"签到失败 code={rcode}"
-        print(f"❌ 账号 {index} {msg}")
-        lines.append(f"❌ {msg}")
-        return "\n".join(lines), False
-
-    rentity = envelope_entity(result)
-    total = rentity.get("signInTotal")
-    chances = rentity.get("chanceList") or []
-    msg = "签到成功"
-    if total is not None:
-        msg += f", 连续签到 {total} 天"
-    if chances:
-        msg += f", 获得 {len(chances)} 次抽奖机会(请在小程序内手动抽奖)"
-    print(f"🎉 账号 {index} {msg}")
-    lines.append(f"🎉 {msg}")
-    return "\n".join(lines), True
+def run_account(account_id, index):
+    entity = get_entity_for_account(account_id, index)
+    if not is_member(entity) or not entity.get("token"):
+        raise RuntimeError("member_session_unavailable")
+    detail = activity_detail(entity["token"], entity["id"])
+    if resp_code(detail) in SESSION_CODES:
+        entity = get_entity_for_account(account_id, index, force=True)
+        detail = activity_detail(entity["token"], entity["id"])
+    if resp_code(detail) != SUCCESS_CODE:
+        raise RuntimeError("activity_detail_rejected")
+    template = find_sign_in_template_id(detail)
+    if not template:
+        raise RuntimeError("sign_template_missing")
+    if authority(entity):
+        return f"【账号 {index}】今日已签到（服务端确认）", True
+    if READ_ONLY:
+        return f"【账号 {index}】只读：今日未签，零业务写", True
+    fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if authority(entity):
+            return f"【账号 {index}】今日已签（写前确认）", True
+        key = hashlib.sha256(account_id.encode()).hexdigest() + "|" + bj_now().strftime("%Y-%m-%d") + "|" + str(template)
+        previous = read_write_state().get(key) or {}
+        attempts = previous.get("attempts", 0)
+        if not isinstance(attempts, int) or attempts < 0 or attempts >= 2:
+            return f"【账号 {index}】写入次数上限或状态错误", False
+        if previous:
+            if previous.get("status") not in ("unknown", "attempting") or time.time() - previous.get("at", time.time()) < 600:
+                return f"【账号 {index}】已有写记录或冷却未结束，不自动重放", False
+            # This is the second independent authority read after cooldown.
+            if authority(entity):
+                return f"【账号 {index}】已签（恢复前权威确认）", True
+        pool = api_post(f"{PATH_PREFIX}/business/surpriseFivePhase/detail", {"userId": entity["id"]}, token=entity["token"], user_id=entity["id"])
+        data = pool.get("data") or {}
+        if resp_code(pool) != SUCCESS_CODE or not isinstance(data.get("selectedPrize"), list):
+            raise RuntimeError("pool_state_unavailable")
+        if data.get("phaseState") == 1 and not data["selectedPrize"]:
+            if POOL_CHOICE not in POOL_LABELS:
+                raise RuntimeError("pool_choice_required")
+            poolKey = hashlib.sha256(account_id.encode()).hexdigest() + "|pool|" + str(data.get("phaseNo"))
+            if read_write_state().get(poolKey):
+                raise RuntimeError("pool_write_unconfirmed_no_replay")
+            persist_write_state(poolKey, {"status": "attempting", "choice": POOL_CHOICE, "at": time.time()})
+            select_surprise5_pool(entity["token"], entity["id"], POOL_CHOICE)
+            check = api_post(f"{PATH_PREFIX}/business/surpriseFivePhase/detail", {"userId": entity["id"]}, token=entity["token"], user_id=entity["id"])
+            if resp_code(check) != SUCCESS_CODE or (check.get("data") or {}).get("selectedPrize") != [POOL_CHOICE]:
+                raise RuntimeError("pool_selection_unconfirmed")
+            persist_write_state(poolKey, {"status": "success", "choice": POOL_CHOICE, "at": time.time()})
+        if authority(entity):
+            return f"【账号 {index}】今日已签（选池后确认）", True
+        persist_write_state(key, {"status": "attempting", "attempts": attempts + 1, "at": time.time()})
+        try:
+            complete_quest(entity["token"], entity["id"], template)
+        except Exception:
+            pass
+        try:
+            signed = authority(entity)
+        except Exception:
+            signed = False
+        persist_write_state(key, {"status": "success" if signed else "unknown", "attempts": attempts + 1, "authorityConfirmed": signed, "at": time.time()})
+        return f"【账号 {index}】" + ("签到成功（服务端确认）" if signed else "签到未获权威确认，不自动重放"), signed
+    finally:
+        os.close(fd)
 
 
 def main():
@@ -462,11 +490,11 @@ def main():
     accounts = [x.strip() for x in raw.replace("&", "\n").splitlines() if x.strip()]
 
     if not accounts:
-        print("❌ 未检测到账号信息(环境变量 bjhqbwz), 退出。")
-        return
+        print('[QLRUN_RESULT] FAILURE {"script":"bjhqbwz.py","reason":"no_env","retryable":0}')
+        return 1
     if not WX_AUTH:
-        print("❌ 未配置 wx_auth, 无法获取 code, 退出。")
-        return
+        print('[QLRUN_RESULT] FAILURE {"script":"bjhqbwz.py","reason":"no_wx_auth","retryable":0}')
+        return 1
 
     print("=============== 北京环球 签到开始 ===============")
     summaries = []
@@ -492,6 +520,8 @@ def main():
     except Exception as e:
         print(f"⚠️ 通知发送失败: {e}")
 
+    print('[QLRUN_RESULT] ' + ('SUCCESS ' if ok_count == len(accounts) else 'FAILURE ') + json.dumps({"script": "bjhqbwz.py", "accounts": len(accounts), "failed": len(accounts) - ok_count, "retryable": 0, "mode": "read_only" if READ_ONLY else "normal"}))
+    return 0 if ok_count == len(accounts) else 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

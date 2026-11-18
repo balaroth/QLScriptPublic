@@ -50,6 +50,36 @@ const MAX_RECOVER_TOTAL = 1;
 const COOLDOWN_MS = 10 * 60 * 1000;
 function nowMs() { return Date.now(); }
 const LOGIN_MAX_ATTEMPTS = 2;
+const SESSION_CACHE_FILE = path.join(__dirname, ".fhxmh_session_cache.json");
+
+/* Session cache is optional authentication data, never a write-attempt ledger.
+   Every reused token is checked against the real member API before any action. */
+function loadSession(alias) {
+    try {
+        const cache = JSON.parse(fs.readFileSync(SESSION_CACHE_FILE, "utf8"));
+        return typeof cache?.[accountKey(alias)]?.token === "string" ? cache[accountKey(alias)].token : "";
+    } catch { return ""; }
+}
+function saveSession(alias, token) {
+    if (READ_ONLY) return;
+    let cache = {};
+    try { cache = JSON.parse(fs.readFileSync(SESSION_CACHE_FILE, "utf8")); } catch {}
+    if (!cache || typeof cache !== "object" || Array.isArray(cache)) cache = {};
+    cache[accountKey(alias)] = { token, validatedAt: Date.now() };
+    const tmp = SESSION_CACHE_FILE + ".tmp." + process.pid;
+    let fd = -1;
+    try {
+        fd = fs.openSync(tmp, "w", 0o600);
+        fs.writeFileSync(fd, JSON.stringify(cache));
+        fs.fsyncSync(fd); fs.closeSync(fd); fd = -1;
+        fs.renameSync(tmp, SESSION_CACHE_FILE);
+        fs.chmodSync(SESSION_CACHE_FILE, 0o600);
+    } catch {
+        if (fd >= 0) { try { fs.closeSync(fd); } catch {} }
+        try { fs.unlinkSync(tmp); } catch {}
+        /* Cache failure cannot turn an observed business success into a failure. */
+    }
+}
 
 function short(value, max = 220) {
     if (value === undefined || value === null) return "";
@@ -232,9 +262,26 @@ class FeiheMom {
     }
 
     async login() {
+        const cached = loadSession(this.openid);
+        if (cached) {
+            this.token = cached;
+            try {
+                await this.query();
+                return true;
+            } catch {
+                /* Invalid or unverifiable cache: authenticate with a fresh code.
+                   No business POST has occurred at this point. */
+                this.token = "";
+            }
+        }
         let lastErr;
         for (let i = 0; i < LOGIN_MAX_ATTEMPTS; i++) {
-            try { return await this.loginOnce(); }
+            try {
+                await this.loginOnce();
+                await this.query();
+                saveSession(this.openid, this.token);
+                return true;
+            }
             catch (e) {
                 lastErr = e;
                 if (e.unregistered) throw e;

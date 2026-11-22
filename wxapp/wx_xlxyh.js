@@ -6,6 +6,7 @@
 本版本只运行每日签到及权威回读，不自动抽奖、点赞、补签、答题或模拟阅读/视频计时。
 签到GET按副作用写处理：耐久attempting、并发锁、写后权威确认、未知禁止同进程重放；
 冷却10分钟后连续两次权威未签才允许一次最后恢复写，当日总上限2。
+签到前先完成官方签到动作上报，失败则禁止发signIn，不重放其他互动。
 */
 'use strict';
 const {Env}=require('../tools/env.js');
@@ -20,7 +21,7 @@ const CACHE=path.join(__dirname,'wx_xlxyh_token_cache.json');
 const STATE=path.join(__dirname,'.wx_xlxyh_write_state.json');
 const LOCK=path.join(__dirname,'.wx_xlxyh_write.lock');
 const READ_ONLY=process.env.WX_XLXYH_READ_ONLY==='1'||process.env.QL_READ_ONLY==='1';
-const LOGIN='/api/user/getOpenId',INFO='/api/user/info',LIST='/api/user/signList',SIGN='/api/user/signIn';
+const LOGIN='/api/user/getOpenId',INFO='/api/user/info',LIST='/api/user/signList',SIGN='/api/user/signIn',CLICK='/api/buryPointApp/save';
 const UA='Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/119.0.0.0 Mobile Safari/537.36 MicroMessenger/8.0.49 MiniProgramEnv/android';
 function today(){const d=new Date(Date.now()+8*3600000);return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;}
 function object(d){return !!d&&typeof d==='object'&&!Array.isArray(d);}
@@ -58,9 +59,10 @@ class Task{
     }
     log(s){$.log(s);}
     async api(endpoint,method='GET',data={},auth=true){
-        if(![LOGIN,INFO,LIST,SIGN].includes(endpoint))throw Error('endpoint_out_of_scope');
-        if(READ_ONLY&&endpoint===SIGN)throw Error('read_only_business_write_blocked');
-        if(endpoint===SIGN&&(method!=='GET'||this.writeAttempted!==1))throw Error('sign_without_durable_attempt');
+        if(![LOGIN,INFO,LIST,SIGN,CLICK].includes(endpoint))throw Error('endpoint_out_of_scope');
+        if(READ_ONLY&&[SIGN,CLICK].includes(endpoint))throw Error('read_only_business_write_blocked');
+        if([SIGN,CLICK].includes(endpoint)&&this.writeAttempted!==1)throw Error('sign_without_durable_attempt');
+        if(endpoint===CLICK&&(method!=='POST'||data.eventNameEn!=='MPClick'||data.elementName!=='每日签到'||data.urlPath!=='pages/task-center/index'))throw Error('non_sign_click_out_of_scope');
         const body=joinJson(data),rid=requestId(),ts=String(Date.now());
         const headers={'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','User-Agent':UA,Referer:`https://servicewechat.com/${APP}/${PAGE_VERSION}/page-frame.html`,userId:auth?String(this.session.userId):'0',sessionKey:auth?this.session.sessionKey:'',openId:auth?this.session.openId:'',timestamp:ts,requestId:rid,sign:crypto.createHash('md5').update(body+rid+ts).digest('hex')};
         const url=BASE+endpoint+(method==='GET'&&body?'?'+body:'');
@@ -93,6 +95,10 @@ class Task{
     async authority(){const date=today(),d=dataOf(await this.api(LIST,'GET',{userId:this.session.userId}),LIST),a=signRecord(d,date);if(today()!==date)throw Error('date_changed_during_authority');return a;}
     key(date){return crypto.createHash('sha256').update((this.legacy?String(this.session.userId):this.id)+'|'+this.session.userId).digest('hex')+'|'+date;}
     reconcile(key){const old=readJson(STATE)[key];if(!old)return;if(!entryValid(old))throw Error('persistent_entry_invalid');record(key,{...old,status:'success',authorityConfirmed:true,confirmedAt:Date.now()});}
+    async signClick(){
+        const r=await this.api(CLICK,'POST',{userId:this.session.userId,openId:this.session.openId,activitySource:'Xcx_MeiRiRenWu',urlPath:'pages/task-center/index',urlName:'任务中心',elementName:'每日签到',elementType:'页面',eventNameEn:'MPClick'});
+        dataOf(r,CLICK);
+    }
     async sign(){
         let a=await this.authority();if(READ_ONLY)return {already:Number(a.signed),writeAttempted:0};
         if(this.writeAttempted&&!a.signed)throw Error('same_process_write_no_replay');
@@ -104,9 +110,10 @@ class Task{
             if(hasOld){const b=await this.authority();if(b.date!==a.date)throw Error('date_changed_before_recovery');if(b.signed){this.reconcile(key);return {already:1,writeAttempted:0};}}
             if(today()!==a.date)throw Error('date_changed_before_write');
             record(key,{status:'attempting',attempts:attempts+1,at:Date.now()});this.writeAttempted=1;
-            let http=null;try{http=(await this.api(SIGN,'GET',{userId:this.session.userId})).status;}catch(e){/* any sent write may have succeeded; converge by read only */}
+            try{await this.signClick();}catch(e){record(key,{status:'unknown',attempts:attempts+1,at:Date.now(),authorityConfirmed:false,signSent:false,reason:'sign_click_unconfirmed'});throw Error('sign_click_unconfirmed_no_sign_sent');}
+            let http=null,businessCode=null;try{const r=await this.api(SIGN,'GET',{userId:this.session.userId});http=r.status;businessCode=String(r.data?.code??'');}catch(e){/* any sent write may have succeeded; converge by read only */}
             let confirmed=false;for(let i=0;i<2;i++){try{const b=await this.authority();if(b.date===a.date&&b.signed){confirmed=true;break;}}catch(e){/* unknown fail closed */}}
-            record(key,{status:confirmed?'success':'unknown',attempts:attempts+1,at:Date.now(),authorityConfirmed:confirmed,responseHttp:http});
+            record(key,{status:confirmed?'success':'unknown',attempts:attempts+1,at:Date.now(),authorityConfirmed:confirmed,responseHttp:http,responseCode:businessCode,signSent:true});
             if(!confirmed)throw Error('sign_unconfirmed_no_replay');this.log('签到成功（服务端当日记录确认）');return {already:0,writeAttempted:1};
         }finally{fs.rmdirSync(LOCK);}
     }
@@ -119,4 +126,4 @@ async function main(){
     const valid=$.userCount>0&&success===$.userCount;console.log('[QLRUN_RESULT] '+(valid?'SUCCESS ':'FAILURE ')+JSON.stringify({script:'wx_xlxyh.js',accounts:$.userCount,failed:$.userCount-success,already,writeAttempted:writes,retryable:0,mode:READ_ONLY?'read_only':'normal'}));process.exitCode=valid?0:1;
 }
 if(require.main===module)main().catch(e=>{console.error(e.message);console.log('[QLRUN_RESULT] FAILURE {"script":"wx_xlxyh.js","retryable":0,"reason":"unexpected_error"}');process.exitCode=1;});
-module.exports={Task,main,today,readJson,persist,record,signRecord,completeSession,dataOf,joinJson,requestId,CACHE,STATE,LOCK,BASE,LOGIN,INFO,LIST,SIGN};
+module.exports={Task,main,today,readJson,persist,record,signRecord,completeSession,dataOf,joinJson,requestId,CACHE,STATE,LOCK,BASE,LOGIN,INFO,LIST,SIGN,CLICK};

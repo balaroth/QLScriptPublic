@@ -42,8 +42,24 @@ class Task{
   const cached=objectFile(CACHE,{})[this.account];if(cached?.identity)this.identity=cached.identity;
   if(cached?.token){this.token=cached.token;try{await this.profile();return}catch(e){if(!e.auth)throw e;this.token=''}}
   if(!process.env.wx_auth||!process.env.wx_server_url)throw Error('wx_server configuration missing');
-  const r=await axios.post(process.env.wx_server_url.replace(/\/$/,'')+'/wx/shengongshe-session',{appid:APPID,openid:this.account,refresh:!!cached?.token},{headers:{auth:process.env.wx_auth},timeout:150000});
-  const d=r.data?.data;if(r.data?.status!==true||typeof d?.token!=='string'||!d.token||typeof d.identity!=='string'||!d.identity)throw Error('official OAuth session unavailable');
+  // Expiry of the Qinglong token does not invalidate a verified official device session.
+  // Let the fixed-origin bridge validate storage first and recover OAuth only when needed.
+  let response;const deadline=Date.now()+140000;
+  for(let attempt=0;attempt<3;attempt++){
+   try{
+    const remaining=deadline-Date.now();if(remaining<1000)throw Error('official OAuth recovery deadline');
+    const r=await axios.post(process.env.wx_server_url.replace(/\/$/,'')+'/wx/shengongshe-session',{appid:APPID,openid:this.account,refresh:false},{headers:{auth:process.env.wx_auth},timeout:Math.min(110000,remaining)});
+    if(r.data?.status===true){response=r.data;break}
+    const e=Error('official OAuth session unavailable');
+    e.transient=r.status===200&&r.data?.status===false&&r.data?.message==='official OAuth session not confirmed; no sign request made';throw e;
+   }catch(e){
+    const status=e.response?.status;
+    if(['ECONNRESET','ETIMEDOUT','ECONNABORTED','EAI_AGAIN'].includes(e.code)||[408,429,500,502,503,504].includes(status))e.transient=true;
+    if(!e.transient||attempt===2)throw e;
+    await sleep(500*(attempt+1));
+   }
+  }
+  const d=response?.data;if(typeof d?.token!=='string'||!d.token||typeof d.identity!=='string'||!d.identity)throw Error('official OAuth session invalid');
   if(this.identity&&this.identity!==d.identity)throw Error('OAuth account identity mismatch');this.token=d.token;this.identity=d.identity;await this.profile();this.saveCache();this.log('公众号会话已确认');
  }
  async authority(){

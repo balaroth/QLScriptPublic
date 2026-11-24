@@ -27,6 +27,13 @@ wx_auth        必填，wx_server 鉴权值
 const { Env } = require("../tools/env.js");
 const $ = new Env("毛铺草本荟");
 const axios = require("axios");
+const { request: nativeRequest } = require('undici');
+// 同签名对照证明 d4 网关路径超时、d3 直连正常。业务请求单发，不走网关重试。
+const directHttp={request:async o=>{
+    const r=await nativeRequest(o.url,{method:o.method,headers:o.headers,body:JSON.stringify(o.data),headersTimeout:o.timeout,bodyTimeout:o.timeout,maxRedirections:0});
+    const text=await r.body.text();let data;try{data=JSON.parse(text)}catch(e){data=text}
+    return {status:r.statusCode,data};
+}};
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -119,14 +126,21 @@ function readStateFileStrict(file) {
 function writeJsonFileAtomic(file, obj) {
     const dir = path.dirname(file);
     const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+    const b=Buffer.from(JSON.stringify(obj,null,2));let fd=null;
     try {
         fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { encoding: "utf8", mode: 0o600 });
+        fd=fs.openSync(tmp,'wx',0o600);let offset=0;
+        while(offset<b.length){const n=fs.writeSync(fd,b,offset,b.length-offset);if(!Number.isInteger(n)||n<=0||n>b.length-offset)throw Error('short_write');offset+=n}
+        fs.fsyncSync(fd);fs.closeSync(fd);fd=null;
         fs.renameSync(tmp, file);
+        const dfd=fs.openSync(dir,'r');try{fs.fsyncSync(dfd)}finally{fs.closeSync(dfd)}
+        if(!fs.readFileSync(file).equals(b))throw Error('state_readback');
         return true;
     } catch (e) {
-        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
         return false;
+    } finally {
+        if(fd!==null){try{fs.closeSync(fd)}catch(e){}}
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
     }
 }
 
@@ -140,7 +154,7 @@ class Task {
         this.account = parseAccount(raw);
         this.index = options.index ?? 1;
         this.logger = options.logger || console;
-        this.http = options.http || axios;
+        this.http = options.http || directHttp;
         this.wechat = options.wechat;
         this.wait = options.wait || ((ms) => new Promise((r) => setTimeout(r, ms)));
         this.now = options.now || (() => Date.now());
@@ -210,8 +224,7 @@ class Task {
             throw e;
         }
         if (res.status !== 200) {
-            if (res.data && typeof res.data === "object") return res.data;
-            throw new ApiError(`${apiPath} HTTP ${res.status}: ${short(res.data)}`, { retryable: isTransientStatus(res.status), transient: isTransientStatus(res.status) });
+            throw new ApiError(`${apiPath} HTTP ${res.status}: response rejected`, { retryable: isTransientStatus(res.status), transient: isTransientStatus(res.status) });
         }
         return res.data;
     }
@@ -237,7 +250,7 @@ class Task {
         if (!token) throw new ApiError(`登录未返回 access_token: ${short(res)}`, { retryable: false });
         this.token = token;
         // 防自覆盖：仅非空 token 才原子合并回写（保留其他账户）
-        this.writeCacheEntry({ [this.account.openid]: { token, updatedAt: new Date(this.now()).toISOString() } });
+            if(!this.readOnly)this.writeCacheEntry({ [this.account.openid]: { token, updatedAt: new Date(this.now()).toISOString() } });
         this.log(`登录成功${d.name ? `: ${d.name}` : ""}`);
     }
 
@@ -254,9 +267,10 @@ class Task {
             }
             if (isAuthError(res)) throw new ApiError("SESSION_INVALID:登录态无效", { retryable: false });
             const d = (res && res.data) || null;
-            const t = Number(d && d.sign_in_today);
-            // 权威门控：code=0 + sign_in_today 为有限数字，否则读未知
-            if (codeOf(res) !== 0 || !Number.isFinite(t) || !d || typeof d !== "object") {
+            const validSignValue=d&&typeof d.sign_in_today==='number'&&Number.isFinite(d.sign_in_today);
+            const t=validSignValue?d.sign_in_today:NaN;
+            // 只接受服务端实测的数字类型，缺失/null/字符串不是未签证据。
+            if (codeOf(res) !== 0 || !validSignValue || !d || typeof d !== "object") {
                 lastErr = new ApiError(`READ_UNCERTAIN:状态读非权威(code=${codeOf(res)})`, { retryable: true, transient: true });
                 if (isTransientStatus(res && res.httpStatus) && attempt < this.maxRetries) { await this.wait(this.confirmDelayMs * (attempt + 1)); continue; }
                 return { authoritative: false, signedToday: false, point: null, days: null, raw: res };
@@ -300,7 +314,7 @@ class Task {
         const todayStr = today();
         if (!all[k] || all[k].date !== todayStr) return { date: todayStr, outcome: null, attempts: 0 };
         const cur = Object.assign({}, all[k]);
-        cur.attempts = Number(cur.attempts || (cur.outcome ? 1 : 0));
+        cur.attempts = Number(cur.attempts);
         return cur;
     }
     recordState(entry) {
@@ -310,7 +324,11 @@ class Task {
         if (!rel) throw new WriteUnknownError("共享状态文件锁竞争，已阻止写请求（保留他人锁）");
         try {
             const fresh = this.stateAll();
-            fresh[k] = Object.assign({}, fresh[k] || {}, entry, { date: today() });
+            const old=fresh[k]?.date===today()?fresh[k]:{};
+            fresh[k] = Object.assign({}, old, entry, { date: today() });
+            if(entry.outcome==='attempting'||entry.outcome==='unknown'||entry.outcome==='failed'){
+                delete fresh[k].confirmedAt;delete fresh[k].source;
+            }
             if (!writeJsonFileAtomic(this.writeStateFile, fresh)) throw new WriteUnknownError("防重放状态落盘失败，已阻止写请求");
             const back = (readStateFileStrict(this.writeStateFile))[k];
             if (!back || back.date !== fresh[k].date || back.outcome !== fresh[k].outcome || Number(back.attempts || 0) !== Number(fresh[k].attempts || 0)) {
@@ -377,15 +395,18 @@ class Task {
             try { res = await fn(); }
             catch (e) {
                 // 出网已发起：任何异常（含非2xx/非JSON/网络瞬态）一律 unknown retryable=0
+                this.recordState({outcome:'unknown',attempts:attemptNo,lastAttemptAt:startedAt});
                 throw new WriteUnknownError(`签到写第${attemptNo}次发起后结果未知（${short(e.message || e)}），未在本进程重复发起`);
             }
-            if (codeOf(res) === 0) {
-                this.recordState({ outcome: "success", attempts: attemptNo, lastAttemptAt: startedAt, confirmedAt: new Date(this.now()).toISOString() });
-                return { ok: true, res };
+            // 任意已发出的POST都先以权威状态确认，文案或code不能替代落账。
+            const authority=await this.readSignState().catch(()=>({authoritative:false}));
+            if(authority.authoritative&&authority.signedToday){
+                this.recordState({outcome:'success',attempts:attemptNo,lastAttemptAt:startedAt,confirmedAt:new Date(this.now()).toISOString(),source:'authoritative-after-write'});
+                return {ok:true,res};
             }
-            if (isAlreadyDone(msgOf(res))) {
-                this.recordState({ outcome: "success", attempts: attemptNo, lastAttemptAt: startedAt, confirmedAt: new Date(this.now()).toISOString(), source: "business-already" });
-                return { ok: true, already: true, res };
+            if (codeOf(res) === 0 || isAlreadyDone(msgOf(res)) || !authority.authoritative) {
+                this.recordState({outcome:'unknown',attempts:attemptNo,lastAttemptAt:startedAt});
+                throw new WriteUnknownError('签到响应未由服务端今日记录确认');
             }
             if (codeOf(res) === NEED_PROFILE) {
                 // 账号态硬门槛：明确失败，不重试，不伪装成功
@@ -417,6 +438,7 @@ class Task {
     }
 
     async sign() {
+        if(this.readOnly){const info=await this.readSignState();if(!info.authoritative)throw new ApiError('READ_UNCERTAIN',{retryable:false});this.outcome=info.signedToday?'already':'readonly';this.log(info.signedToday?'🔒 只读确认今日已签':'🔒 只读确认今日未签');return;}
         const lock = this.acquireLock();
         if (!lock) { this.outcome = "unknown"; this.retryable = 0; this.log("❗检测到同账户签到进程在运行（锁竞争），本次不发写、不删未知进程锁"); return; }
         try { await this._signLocked(); } finally { this.releaseLock(lock); }
@@ -443,7 +465,7 @@ class Task {
             const t0 = Date.parse(raw.lastAttemptAt || "");
             const lastIsToday = Number.isFinite(t0) && cstDayOf(t0) === cstDayOf(this.now());
             if (lastIsToday) {
-                this.recordState({ outcome: "success", attempts: Number(raw.attempts || 1), lastAttemptAt: raw.lastAttemptAt, confirmedAt: raw.confirmedAt || new Date(this.now()).toISOString(), source: "authoritative-converge" });
+                this.recordState({ outcome: "success", attempts: raw.attempts, lastAttemptAt: raw.lastAttemptAt, confirmedAt: new Date(this.now()).toISOString(), source: "authoritative-converge" });
             } else if (!raw.date || raw.date !== today()) {
                 this.recordState({ outcome: "success", attempts: 0, confirmedAt: new Date(this.now()).toISOString(), source: "authoritative-read" });
             }
@@ -476,7 +498,7 @@ class Task {
             const a2 = await this.readSignState().catch(() => ({ authoritative: false }));
             if (!a1.authoritative || !a2.authoritative || a1.signedToday || a2.signedToday) {
                 this.outcome = "unknown"; this.retryable = 0;
-                if (a1.signedToday || a2.signedToday) { this.recordState({ outcome: "success", attempts, confirmedAt: new Date(this.now()).toISOString(), source: "authoritative-log" }); this.log("✅ 未知写入已由服务端记录确认"); }
+                if (a1.signedToday || a2.signedToday) { this.recordState({ outcome: "success", attempts, confirmedAt: new Date(this.now()).toISOString(), source: "authoritative-log" }); this.outcome='already';this.log("✅ 未知写入已由服务端记录确认"); }
                 else this.log("❗冷却期后权威状态未能连续确认，未重复发起");
                 return;
             }
@@ -507,7 +529,7 @@ class Task {
             if (e instanceof WriteUnknownError) {
                 this.outcome = "unknown"; this.retryable = 0;
                 const converged = await this.convergeAfterUnknown();
-                if (converged) { this.outcome = "already"; this.log("✅ 写后经服务端记录确认今日已签"); }
+                if (converged) { const st=this.stateFor();this.recordState({outcome:'success',attempts:st.attempts,confirmedAt:new Date(this.now()).toISOString(),source:'authoritative-converge'});this.outcome = "already"; this.log("✅ 写后经服务端记录确认今日已签"); }
                 else this.log(`❗ ${e.message}`);
                 return;
             }
@@ -563,7 +585,7 @@ if (require.main === module) {
         }
         let failed = 0; const retr = new Set();
         for (let i = 0; i < $.userList.length; i++) {
-            const t = new Task($.userList[i], { index: i + 1, logger: $, http: axios, wechat });
+            const t = new Task($.userList[i], { index: i + 1, logger: $, http: directHttp, wechat });
             await t.run();
             if (t.outcome === "failed" || t.outcome === "unknown") failed++;
             if (t.retryable) retr.add(1);

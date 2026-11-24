@@ -79,7 +79,12 @@ class Task {
         const url=new URL(BASE+endpoint);
         if(method==='GET')for(const [k,v] of Object.entries(data))url.searchParams.set(k,String(v));
         const r=await directRequest(url,{method,headers,maxRedirections:0,headersTimeout:20000,bodyTimeout:20000,...(method==='GET'?{}:{body:JSON.stringify(data)})});
-        let body;try {body=await r.body.json();}catch(error) {throw new Error('endpoint_non_json:'+endpoint);}
+        // Expired sessions may return HTTP 401 with plain text instead of JSON.
+        const raw=await r.body.text();let body;
+        try{body=JSON.parse(raw)}catch(error){
+            if(r.statusCode===401&&endpoint!==SIGN)return{status:401,data:null};
+            throw new Error('endpoint_non_json:'+endpoint+':http_'+r.statusCode);
+        }
         return {status:r.statusCode,data:body};
     }
     async bridge(endpoint) {

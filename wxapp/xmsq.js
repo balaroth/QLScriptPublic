@@ -143,6 +143,8 @@ class Task {
         this.readOnly = options.readOnly ?? boolEnv("XMSQ_READ_ONLY", false);
         this.maxRetries = options.maxRetries ?? intEnv("XMSQ_MAX_RETRIES", 2, 0, 5);
         this.timeout = options.timeout || intEnv("XMSQ_HTTP_TIMEOUT", 8000, 3000, 60000);
+        // 登录恢复端点有110秒预算；不能用业务请求的8秒预算截断恢复。
+        this.loginTimeout = options.loginTimeout ?? intEnv('XMSQ_LOGIN_TIMEOUT_MS',120000,3000,150000);
         this.bridgeTimeoutMs = options.bridgeTimeoutMs ?? intEnv("XMSQ_BRIDGE_TIMEOUT_MS", 20000, 3000, 120000);
         this.unknownCooldownMs = options.unknownCooldownMs ?? intEnv("XMSQ_UNKNOWN_RETRY_AFTER_MS", 1800000, 300000, 43200000);
         this.confirmDelayMs = options.confirmDelayMs ?? intEnv("XMSQ_UNKNOWN_CONFIRM_DELAY_MS", 3000, 1000, 30000);
@@ -217,7 +219,7 @@ class Task {
         try {
             res = await this.http.request({
                 method, url, data, params, headers,
-                timeout: this.timeout, responseType: "text",
+                timeout: url.startsWith(ACCOUNT+'/')?this.loginTimeout:this.timeout, responseType: "text",
                 transformResponse: (r) => r, maxRedirects: allowRedirect ? 5 : 0, validateStatus: () => true,
             });
         } catch (e) {
@@ -239,6 +241,7 @@ class Task {
         // 1) code → wxSToken
         const r1 = await this.req("POST", `${ACCOUNT}/pass/sns/wxapp/v2/code`, { form: { code, appid: MINI_APP_ID, sid: SID, userInfo: "true", _locale: "zh_CN" } });
         const b1 = parseXiaomiJson(r1.data);
+        if(isTransientStatus(r1.status)||b1.code===408||b1.code===429||(b1.code>=500&&b1.code<600))throw new ApiError('LOGIN_TRANSIENT:小米设备会话登录暂不可用',{retryable:true,transient:true});
         if (b1.__raw || b1.code !== 0) throw new ApiError(`NO_ACCOUNT:微信换取小米登录票据失败(code=${b1.code}, ${b1.description || b1.desc || short(b1)})`, { retryable: !!b1.__raw, transient: !!b1.__raw });
         const wxSToken = b1.data && b1.data.wxSToken;
         if (!wxSToken) throw new ApiError(`NO_ACCOUNT:小米登录响应缺少 wxSToken: ${short(b1)}`, { retryable: false });
@@ -283,13 +286,28 @@ class Task {
         if (!ph) throw new ApiError("SESSION_INVALID:STS 未返回 wx_vip_ph", { retryable: false, sessionExpired: usedCached });
         this.ph = ph;
         // 新鲜会话（非缓存路径）原子合并回写（保留其他账户）；回写失败 → 阻写
-        if (!usedCached) {
+        if (!usedCached && !this.readOnly) {
             this.writeCacheEntry({ [this.account.openid]: { passToken: session.passToken, userId: session.userId, cUserId: session.cUserId, updatedAt: new Date().toISOString() } });
         }
         this.log("登录成功");
     }
 
+    async ensureDeviceSession(force=false) {
+        const url=this.wechat?.serverUrl;
+        if(!url)throw new ApiError('BRIDGE:缺少设备会话恢复地址',{retryable:false});
+        let r;
+        try{r=await this.http.post(`${url.replace(/\/$/,'')}/wx/minicookie`,{appid:MINI_APP_ID,force},{headers:{auth:this.wechat.auth},timeout:this.loginTimeout,validateStatus:()=>true});}
+        catch(e){throw new ApiError('LOGIN_TRANSIENT:设备Cookie恢复请求失败',{retryable:true,transient:true});}
+        if(r.status===401||r.status===403)throw new ApiError('DEVICE_AUTH:设备恢复鉴权失败',{retryable:false});
+        if(r.status>=500)throw new ApiError('LOGIN_TRANSIENT:设备恢复服务异常',{retryable:true,transient:true});
+        const d=r.data;
+        if(r.status!==200||d?.status!==true||!d.wx_vip_ph||!d.userId||!d.serviceToken||!d.cookie){
+            throw new ApiError('MINICOOKIE:设备会话未恢复，未执行签到',{retryable:false});
+        }
+        this.deviceSessionReady=true;
+    }
     async login() {
+        if(!this.deviceSessionReady)await this.ensureDeviceSession(false);
         try {
             await this.attemptLogin(true);
         } catch (e) {
@@ -299,6 +317,7 @@ class Task {
             if (!this.retriedLogin && e && e.sessionExpired) {
                 this.retriedLogin = true;
                 this.log("ℹ️ 缓存会话失效，有界恢复一次（bridge 重新取 code 正常登录）");
+                await this.ensureDeviceSession(true);
                 await this.attemptLogin(false);
                 return;
             }
@@ -496,6 +515,7 @@ class Task {
     }
 
     async sign() {
+        if(this.readOnly){const s=await this.readSignState();if(!s.authoritative)throw new ApiError('READ_UNCERTAIN:只读签到状态未确认',{retryable:false});this.outcome=s.already?'already':'readonly';this.log(s.already?'🔒 只读确认今日已签':'🔒 只读确认今日未签');return;}
         const lock = this.acquireLock();
         if (!lock) { this.outcome = "unknown"; this.retryable = 0; this.log("❗检测到同账户签到进程在运行（锁竞争），本次不发写、不删未知进程锁"); return; }
         try { await this._signLocked(); } finally { this.releaseLock(lock); }
